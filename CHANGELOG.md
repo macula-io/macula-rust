@@ -63,6 +63,11 @@ usually touches both, but their version numbers don't move in lockstep.
   whose session had ended, or whose turn to write didn't come in time, moves
   on to the next candidate, and its station may be tried again on a later
   pass. A call that was or may have been sent is returned as before.
+- **A CALL handler receives its caller.** A map payload reaches the handler
+  with the caller's 32-byte node id under `"caller"`, the caller the CALL's
+  signature was verified against, replacing any `"caller"` the sender put in
+  the payload. A payload that isn't a map reaches the handler unchanged and
+  carries no caller.
 - **A session direct dial dialed is shared until its last request is done.**
   A direct-dial request that finds it open uses it too, holding a lease of
   its own, and the session closes when the last lease is released instead

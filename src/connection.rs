@@ -38,6 +38,11 @@ pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T
 /// matching that module's own `safe_invoke_handler/4` mapping exactly
 /// (including sending no `detail` on a crash, since the reference
 /// doesn't either — it only logs locally).
+///
+/// A map payload arrives with the caller's 32-byte node id under
+/// `"caller"`: the caller the CALL's signature was verified against,
+/// replacing any `"caller"` the sender put in the payload. A payload that
+/// isn't a map arrives unchanged and carries no caller.
 pub type CallHandler =
     Arc<dyn Fn(Value) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
@@ -1235,6 +1240,30 @@ fn rpc_replied(
 /// per-request child only starting once the raw advertise mechanism
 /// already decided to dispatch to a real handler -- a UCAN-rejected or
 /// unadvertised-procedure CALL announces neither fact.
+/// The payload a CALL's handler receives: a map payload with `caller`, the
+/// node id the CALL's signature was verified against, under `"caller"`,
+/// replacing a `"caller"` the sender put there under a text or byte-string
+/// key; any other payload unchanged. Mirrors
+/// `macula_station_link:with_caller/2`.
+fn with_caller(payload: Value, caller: [u8; 32]) -> Value {
+    match payload {
+        Value::Map(mut fields) => {
+            fields.retain(|(key, _)| !is_caller_key(key));
+            fields.push((Value::text("caller"), Value::Bytes(caller.to_vec())));
+            Value::Map(fields)
+        }
+        other => other,
+    }
+}
+
+fn is_caller_key(key: &Value) -> bool {
+    match key {
+        Value::Text(text) => text == "caller",
+        Value::Bytes(bytes) => bytes.as_slice() == b"caller",
+        _ => false,
+    }
+}
+
 pub(crate) async fn build_call_reply<L, P>(
     call_info: frame::CallInfo,
     lookup: &L,
@@ -1277,7 +1306,7 @@ where
         ));
     }
 
-    let payload = call_info.payload;
+    let payload = with_caller(call_info.payload, call_info.caller);
     let outcome = tokio::spawn(async move { handler(payload).await }).await;
     match outcome {
         Ok(Ok(value)) => {
@@ -1436,6 +1465,65 @@ mod ucan_gating_tests {
             frame::parse_call_response(&reply),
             Ok(frame::CallResponse::Result { .. })
         ));
+    }
+
+    // A handler receives the verified caller in a map payload. The names
+    // match macula-go's.
+
+    async fn payload_seen_by_the_handler(payload: Value, caller: [u8; 32]) -> Value {
+        let info = frame::CallInfo {
+            payload,
+            caller,
+            ..call_info(Vec::new())
+        };
+        let reply = build_call_reply(
+            info,
+            &echo_lookup(),
+            &|_, _| Policy::open(),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+        match frame::parse_call_response(&reply) {
+            Ok(frame::CallResponse::Result { payload, .. }) => payload,
+            other => panic!("expected a RESULT, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inbound_call_threads_its_caller_into_the_payload() {
+        let caller = KeyPair::generate().node_id();
+        let payload = Value::Map(vec![(Value::text("n"), Value::Int(21))]);
+
+        let seen = payload_seen_by_the_handler(payload, caller).await;
+
+        assert_eq!(seen.get("caller"), Some(&Value::Bytes(caller.to_vec())));
+        assert_eq!(seen.get("n"), Some(&Value::Int(21)));
+    }
+
+    #[tokio::test]
+    async fn a_caller_the_sender_put_in_the_payload_is_replaced_by_the_verified_caller() {
+        let (caller, claimed) = (KeyPair::generate().node_id(), KeyPair::generate().node_id());
+        let payload = Value::Map(vec![
+            (Value::text("caller"), Value::Bytes(claimed.to_vec())),
+            (Value::Bytes(b"caller".to_vec()), Value::Bytes(claimed.to_vec())),
+        ]);
+
+        let seen = payload_seen_by_the_handler(payload, caller).await;
+
+        assert_eq!(
+            seen,
+            Value::Map(vec![(Value::text("caller"), Value::Bytes(caller.to_vec()))])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_map_payload_carries_no_caller() {
+        let caller = KeyPair::generate().node_id();
+
+        let seen = payload_seen_by_the_handler(Value::text("hello"), caller).await;
+
+        assert_eq!(seen, Value::text("hello"));
     }
 
     // The provider side of an inbound CALL: a gated policy accepts a token
