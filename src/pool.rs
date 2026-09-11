@@ -237,10 +237,9 @@ pub struct PooledLink {
     /// hostname-less, node_id-bearing row) where it differs per link.
     trust: Trust,
     /// Held only to read or swap the link's session, never across a round
-    /// trip: a caller clones the session handle out first. A caller whose
-    /// call failed marks the link disconnected only while it still holds
-    /// that same session ([`Pool::mark_disconnected`]), so a stale caller
-    /// can never clear a session a respawn installed in the meantime.
+    /// trip: a caller clones the session handle out first. Only the link's
+    /// own lifecycle ([`run_link_lifecycle`]) installs a session and clears
+    /// it when it ends; [`Pool::close`] takes it to close it.
     state: Mutex<LinkState>,
     connected: AtomicBool,
     /// Discovery-added links only: consecutive failed dial attempts, reset
@@ -248,23 +247,6 @@ pub struct PooledLink {
     /// retry forever regardless.
     consecutive_failures: AtomicU32,
     gave_up: AtomicBool,
-    /// Guards against two concurrent lifecycle tasks racing for the SAME
-    /// link — found by adversarial review, 2026-09-05: `Pool::call`/
-    /// `Pool::publish` can each independently observe the same dead
-    /// session (both hold+release `state`'s lock separately, one after
-    /// the other, before either calls `mark_disconnected`), so both can
-    /// call `mark_disconnected` for one link. Without this guard, both
-    /// would spawn their own respawn task, causing two concurrent dials
-    /// for one seed — whichever succeeds second silently drops (not
-    /// closes) the first's live `Session`, and a `Discovered` link's
-    /// `consecutive_failures` advances roughly 2x per real redial
-    /// interval, making [`should_give_up`] trigger far sooner than its
-    /// documented threshold implies. Only the task that wins the
-    /// false->true transition (see [`try_claim_redial`]) actually spawns;
-    /// the loser is a harmless no-op. Reset back to `false` exactly once,
-    /// when that task's own lifecycle future finishes (see
-    /// [`link_lifecycle_future`]).
-    redialing: AtomicBool,
 }
 
 impl PooledLink {
@@ -280,7 +262,6 @@ impl PooledLink {
             connected: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             gave_up: AtomicBool::new(false),
-            redialing: AtomicBool::new(false),
         })
     }
 
@@ -326,9 +307,10 @@ impl PoolStatus {
 pub enum PoolCallError {
     /// No link in the pool has completed its CONNECT/HELLO handshake.
     NoHealthyStation,
-    /// Every currently-connected link's `call` failed — carries the LAST
-    /// one's error.
-    AllFailed(CallError),
+    /// The failure that stopped the call, on the last link it was tried on.
+    /// The pool moves on to the next link only while a call fails before its
+    /// CALL was sent ([`CallError::not_sent`]), so no CALL runs twice.
+    Call(CallError),
 }
 
 impl std::fmt::Display for PoolCallError {
@@ -337,9 +319,7 @@ impl std::fmt::Display for PoolCallError {
             PoolCallError::NoHealthyStation => {
                 write!(f, "pool: no link has completed its CONNECT/HELLO handshake")
             }
-            PoolCallError::AllFailed(e) => {
-                write!(f, "pool: every connected link's call failed: {e}")
-            }
+            PoolCallError::Call(e) => write!(f, "pool: call failed: {e}"),
         }
     }
 }
@@ -452,9 +432,7 @@ impl Pool {
                 .try_lock()
                 .expect("no other task can hold this lock before Pool::connect returns");
             for link in bootstrap_links {
-                if try_claim_redial(&link) {
-                    tasks.spawn(link_lifecycle_future(pool.clone(), link));
-                }
+                tasks.spawn(run_link_lifecycle(pool.clone(), link));
             }
             if pool.options.station_discovery.enabled {
                 tasks.spawn(discover_stations_loop(pool.clone()));
@@ -464,52 +442,46 @@ impl Pool {
         pool
     }
 
-    /// Send a signed CALL, choosing among currently-connected links per
-    /// [`PoolOptions::link_selection`], trying each in order until one
-    /// answers (a transport-level failure marks that link disconnected and
-    /// triggers its respawn, then moves to the next candidate — a BOLT#4
-    /// ERROR response is still a successful `call` as far as this pool is
-    /// concerned, exactly like a bare [`Session::call`]). Pool calls publish
-    /// no RPC telemetry facts, as macula's pool doesn't.
+    /// Send a signed CALL on the currently-connected links, in the order
+    /// [`PoolOptions::link_selection`] gives them. The pool moves on to the
+    /// next link only when a call failed before its CALL was sent
+    /// ([`CallError::not_sent`]), so no CALL runs twice: a call that timed out
+    /// after its write started is returned as it is, and so is a BOLT#4 ERROR
+    /// reply, exactly like a bare [`Session::call`]. A link whose session
+    /// ends is dialed again by the pool. Pool calls publish no RPC telemetry
+    /// facts, as macula's pool doesn't.
     pub async fn call(
-        self: &Arc<Self>,
+        &self,
         procedure: &str,
         realm: [u8; 32],
         payload: crate::cbor::Value,
         deadline_ms: i128,
     ) -> Result<CallResponse, PoolCallError> {
-        let candidates = self.select_connected_links().await;
-        if candidates.is_empty() {
-            return Err(PoolCallError::NoHealthyStation);
-        }
-        let mut last_err = None;
-        for link in candidates {
-            // A handle, cloned out, so no lock is held across the round trip.
-            let Some(session) = link.state.lock().await.session.clone() else {
-                continue; // raced with a disconnect between selection and lock
-            };
-            let spec = CallSpec::new(
-                rand::random(),
-                procedure,
-                realm,
-                payload.clone(),
-                deadline_ms,
-                self.identity.node_id(),
-            );
-            match session
-                .link_call(&spec, &self.identity, self.options.call_timeout)
-                .await
-            {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    self.mark_disconnected(&link, &session).await;
-                    last_err = Some(e);
+        let calls = self
+            .select_connected_links()
+            .await
+            .into_iter()
+            .map(|link| {
+                let spec = CallSpec::new(
+                    rand::random(),
+                    procedure,
+                    realm,
+                    payload.clone(),
+                    deadline_ms,
+                    self.identity.node_id(),
+                );
+                async move {
+                    // A handle, cloned out, so no lock is held across the round trip.
+                    let session = link.state.lock().await.session.clone();
+                    let Some(session) = session else {
+                        return Err(link_not_connected(&link));
+                    };
+                    session
+                        .link_call(&spec, &self.identity, self.options.call_timeout)
+                        .await
                 }
-            }
-        }
-        Err(last_err
-            .map(PoolCallError::AllFailed)
-            .unwrap_or(PoolCallError::NoHealthyStation))
+            });
+        call_until_sent(calls).await
     }
 
     /// Send a signed PUBLISH, fanning out to up to
@@ -517,7 +489,7 @@ impl Pool {
     /// (ordered by [`PoolOptions::link_selection`]). Partial success counts
     /// as success, matching macula-ts/macula-dotnet's own publish-fanout
     /// contract.
-    pub async fn publish(self: &Arc<Self>, spec: &PublishSpec) -> Result<(), PoolPublishError> {
+    pub async fn publish(&self, spec: &PublishSpec) -> Result<(), PoolPublishError> {
         let candidates = self.select_connected_links().await;
         if candidates.is_empty() {
             return Err(PoolPublishError::NoHealthyStation);
@@ -532,9 +504,8 @@ impl Pool {
             let Some(session) = link.state.lock().await.session.clone() else {
                 continue;
             };
-            match session.publish(spec, &self.identity).await {
-                Ok(()) => successes += 1,
-                Err(_) => self.mark_disconnected(&link, &session).await,
+            if session.publish(spec, &self.identity).await.is_ok() {
+                successes += 1;
             }
         }
         if successes > 0 {
@@ -605,65 +576,67 @@ impl Pool {
         );
         select_links(connected, resolved)
     }
+}
 
-    /// Marks `link` disconnected while it still holds `failed`, so a caller
-    /// that raced a respawn never clears the session that replaced it.
-    async fn mark_disconnected(self: &Arc<Self>, link: &Arc<PooledLink>, failed: &Session) {
-        let mut state = link.state.lock().await;
-        if !state
-            .session
-            .as_ref()
-            .is_some_and(|session| session.is_same_session(failed))
-        {
-            return;
+/// Runs `calls` in turn and moves on to the next only when a call failed
+/// before its CALL was sent ([`CallError::not_sent`]), so no CALL runs
+/// twice. Returns the first reply, a BOLT#4 ERROR reply included, else the
+/// failure that stopped it: a call that was or may have been sent, or the
+/// last one.
+async fn call_until_sent<F>(calls: impl IntoIterator<Item = F>) -> Result<CallResponse, PoolCallError>
+where
+    F: std::future::Future<Output = Result<CallResponse, CallError>>,
+{
+    let mut calls = calls.into_iter().peekable();
+    while let Some(call) = calls.next() {
+        match call.await {
+            // Never sent on this link, so the next one can't run it twice.
+            Err(e) if e.not_sent() && calls.peek().is_some() => {}
+            done => return done.map_err(PoolCallError::Call),
         }
-        state.session = None;
-        link.connected.store(false, Ordering::Release);
-        drop(state);
-        // Guarded: Pool::call/Pool::publish can each independently observe
-        // the same dead session and both reach this point for the SAME
-        // link (see PooledLink::redialing's own doc) -- only the task that
-        // wins try_claim_redial's CAS actually spawns a respawn task.
-        if try_claim_redial(link) {
-            self.tasks
-                .lock()
-                .await
-                .spawn(link_lifecycle_future(self.clone(), link.clone()));
-        }
+    }
+    Err(PoolCallError::NoHealthyStation)
+}
+
+/// The failure of a call on a link that lost its session after it was
+/// selected, which never sent anything.
+fn link_not_connected(link: &PooledLink) -> CallError {
+    CallError::SessionEnded {
+        reason: crate::connection::SessionEndReason::StreamFailed(format!(
+            "link to {}:{} is not connected",
+            link.seed.host, link.seed.port
+        )),
+        write_started: false,
     }
 }
 
-/// Attempts to claim the right to run a lifecycle task for `link`, via a
-/// false->true compare-exchange on [`PooledLink::redialing`]. Returns
-/// `true` only for the ONE caller that wins the race — see that field's
-/// own doc for why this exists. A caller that loses must NOT spawn
-/// anything; the winner's own task is already responsible for this link.
-fn try_claim_redial(link: &PooledLink) -> bool {
-    link.redialing
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+/// Marks `link` disconnected if it still holds `ended`: [`Pool::close`] may
+/// have taken the session already.
+async fn mark_disconnected(link: &PooledLink, ended: &Session) {
+    let mut state = link.state.lock().await;
+    if state
+        .session
+        .as_ref()
+        .is_some_and(|session| session.is_same_session(ended))
+    {
+        state.session = None;
+        link.connected.store(false, Ordering::Release);
+    }
 }
 
-/// Builds the future [`try_claim_redial`]'s winner spawns onto
-/// [`Pool`]'s own `tasks` [`JoinSet`] — wraps [`run_link_lifecycle`] with
-/// the one thing every exit path (normal completion, give-up, or a hard
-/// abort from [`Pool::close`]) must do exactly once: release the
-/// `redialing` claim, so a LATER disconnect of this same link can spawn
-/// a fresh lifecycle task again. An abort drops this future without
-/// running the line after `.await`, which is fine — [`Pool::close`]
-/// never spawns anything after calling `shutdown`, so a claim left
-/// `true` forever after an abort has no observable effect.
-async fn link_lifecycle_future(pool: Arc<Pool>, link: Arc<PooledLink>) {
-    run_link_lifecycle(&pool, &link).await;
-    link.redialing.store(false, Ordering::Release);
+/// Resolves once the pool is stopping, or gone.
+async fn pool_stopping(stop_rx: &mut watch::Receiver<bool>) {
+    let _ = stop_rx.wait_for(|stopped| *stopped).await;
 }
 
-/// Dial (or redial) `link` until it connects, then return — this task's
-/// job ends at a successful handshake; it does not keep running
-/// afterward (the link's session runs its own reader). [`Pool::mark_disconnected`] spawns a
-/// fresh instance of this same function whenever a link goes down, so
-/// respawn is just "run this again", not a separate mechanism.
-async fn run_link_lifecycle(pool: &Arc<Pool>, link: &Arc<PooledLink>) {
+/// Runs `link` for as long as the pool does: dials it, keeps it connected
+/// until its session ends, and dials it again after
+/// [`PoolOptions::respawn_delay`]. A failed dial is retried after the same
+/// delay, and a discovery-added link whose dial fails
+/// [`DISCOVERY_LINK_MAX_RESPAWN_ATTEMPTS`] times in a row gives up. Each link
+/// has exactly one of these, spawned when the link is added, so a link is
+/// never dialed twice at once.
+async fn run_link_lifecycle(pool: Arc<Pool>, link: Arc<PooledLink>) {
     let mut stop_rx = pool.stop_tx.subscribe();
     loop {
         if *stop_rx.borrow() {
@@ -674,28 +647,29 @@ async fn run_link_lifecycle(pool: &Arc<Pool>, link: &Arc<PooledLink>) {
             Ok(session) => {
                 let node_id = session.station.node_id;
                 let mut state = link.state.lock().await;
-                state.session = Some(session);
+                state.session = Some(session.clone());
                 state.peer_node_id = Some(node_id);
                 drop(state);
                 link.connected.store(true, Ordering::Release);
                 link.consecutive_failures.store(0, Ordering::Release);
-                return;
+                // Pool::close closes the session itself.
+                tokio::select! {
+                    _ = session.ended() => {}
+                    () = pool_stopping(&mut stop_rx) => return,
+                }
+                mark_disconnected(&link, &session).await;
             }
-            Err(_e) => {
+            Err(_) => {
                 let failures = link.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
                 if should_give_up(link.origin, failures) {
                     link.gave_up.store(true, Ordering::Release);
                     return;
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(pool.options.respawn_delay) => {}
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
-                            return;
-                        }
-                    }
-                }
             }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(pool.options.respawn_delay) => {}
+            () = pool_stopping(&mut stop_rx) => return,
         }
     }
 }
@@ -981,12 +955,10 @@ async fn spawn_seed_link_if_absent(pool: &Arc<Pool>, seed: Seed, trust: Trust) {
     let link = PooledLink::new(seed, LinkOrigin::Discovered, trust);
     links.push(link.clone());
     drop(links);
-    if try_claim_redial(&link) {
-        pool.tasks
-            .lock()
-            .await
-            .spawn(link_lifecycle_future(pool.clone(), link));
-    }
+    pool.tasks
+        .lock()
+        .await
+        .spawn(run_link_lifecycle(pool.clone(), link));
 }
 
 fn now_ms() -> i128 {
@@ -1000,6 +972,7 @@ fn now_ms() -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control_channel::fake_station::{call, connect, reply_text, WAIT};
 
     fn row(fields: Vec<(&str, crate::cbor::Value)>) -> crate::cbor::Value {
         crate::cbor::Value::Map(
@@ -1148,19 +1121,58 @@ mod tests {
         assert_eq!(count_occupied_discovery_slots(&links), 1);
     }
 
-    #[test]
-    fn try_claim_redial_only_lets_one_caller_win() {
-        let link = synthetic_link(LinkOrigin::Discovered, false);
-        assert!(try_claim_redial(&link));
-        assert!(
-            !try_claim_redial(&link),
-            "a second claim must fail while the first is outstanding"
+    #[tokio::test]
+    async fn call_falls_through_to_next_connected_link() {
+        let (gone, gone_station, gone_ended) = connect();
+        drop(gone_station);
+        tokio::time::timeout(WAIT, gone_ended).await.unwrap().unwrap();
+        let (live, mut station, _ended) = connect();
+        let identity = KeyPair::generate();
+        let (first, second) = (call("app/echo"), call("app/echo"));
+
+        let (called, ()) = tokio::join!(
+            call_until_sent([
+                gone.call(&first, &identity, WAIT, None),
+                live.call(&second, &identity, WAIT, None),
+            ]),
+            async {
+                let sent = station.next("call").await;
+                station.reply(&sent, "echoed").await;
+            }
         );
-        link.redialing.store(false, Ordering::Release);
+
+        assert_eq!(reply_text(called.unwrap()), "echoed");
+    }
+
+    #[tokio::test]
+    async fn a_pool_call_that_timed_out_after_its_write_started_is_not_tried_on_another_link() {
+        let (stalled, stalled_station, _stalled_ended) = connect();
+        let (other, mut other_station, _other_ended) = connect();
+        stalled_station.stall_session_writes();
+        let identity = KeyPair::generate();
+        let (first, second) = (call("app/echo"), call("app/echo"));
+
+        let called = call_until_sent([
+            stalled.call(&first, &identity, Duration::from_millis(100), None),
+            other.call(&second, &identity, WAIT, None),
+        ])
+        .await;
+
         assert!(
-            try_claim_redial(&link),
-            "releasing the claim must allow a fresh one"
+            matches!(
+                called,
+                Err(PoolCallError::Call(CallError::Timeout {
+                    write_started: true
+                }))
+            ),
+            "{called:?}"
         );
+        assert!(
+            other_station
+                .nothing_sent_within(Duration::from_millis(300))
+                .await
+        );
+        stalled_station.resume_session_writes();
     }
 
     #[test]

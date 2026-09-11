@@ -115,6 +115,15 @@ usually touches both, but their version numbers don't move in lockstep.
 - **`Pool::call` publishes no RPC facts.** A pooled call goes through the
   link's session without the `rpc.sent_v1` and `rpc.completed_v1` facts
   that `Session::call` publishes.
+- **Breaking: `Pool::call` tries another link only when the CALL was not
+  sent.** It moves on to the next connected link only while a call fails
+  before its CALL was written, so no CALL runs twice. A call that timed out
+  after its write started, and an ERROR reply, are returned as they are.
+  `PoolCallError::AllFailed` is replaced by `PoolCallError::Call`, the
+  failure that stopped the call.
+- **A pool link is dialed again when its session ends**, instead of when a
+  call or publish on it fails, so a call that times out on a link that is
+  still up no longer drops that link.
 
 ### [0.3.0] - 2026-09-05
 
