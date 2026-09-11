@@ -163,7 +163,7 @@ impl StreamHandle {
     /// `server_stream`/`bidi`) or [`send_data`](Self::send_data) (for
     /// `client_stream`/`bidi`) next, depending on `mode`.
     pub async fn open(
-        session: &mut Session,
+        session: &Session,
         procedure: &str,
         realm: [u8; 32],
         mode: StreamMode,
@@ -217,7 +217,7 @@ impl StreamHandle {
     /// the parsed [`frame::StreamOpenInfo`] (check its `procedure` if
     /// this session advertised more than one).
     pub async fn accept(
-        session: &mut Session,
+        session: &Session,
         timeout: Duration,
     ) -> Result<(Self, frame::StreamOpenInfo), AcceptError> {
         let mut stream = tokio::time::timeout(timeout, session.accept_dedicated_stream())

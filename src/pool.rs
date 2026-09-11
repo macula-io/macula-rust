@@ -4,17 +4,10 @@
 //! [`Pool::publish`] a choice of which connected one to use, instead of a
 //! caller managing a single [`Session`] by hand.
 //!
-//! **Call/Publish only — no pooled Subscribe.** [`Session::run_subscriber`]'s
-//! own doc (and [`Session::call`]'s) already say a control stream can't
-//! safely serve an in-flight Call's response-wait and an ongoing Subscribe
-//! EVENT loop at once — each discards frames it doesn't recognize, so they'd
-//! steal each other's frames. Building a pool-wide Subscribe fan-out
-//! properly would need either a second `Session` per link dedicated to it,
-//! or a real frame-demultiplexing layer on top of `Session` (dispatch by
-//! `call_id`/frame-type to whichever waiter wants it) — genuinely new
-//! infrastructure, out of scope here. A caller that needs Subscribe still
-//! uses a bare [`Session::subscribe`]/[`Session::run_subscriber`] directly,
-//! unpooled, exactly as before this module existed.
+//! **Call/Publish only — no pooled Subscribe.** A caller that needs
+//! Subscribe uses [`Session::subscribe`]/[`Session::run_subscriber`] on a
+//! session directly, unpooled. Each link's [`Session`] runs its own reader,
+//! so calls and publishes on one link run at the same time.
 //!
 //! Ported from the same station-discovery/link-rotation design already
 //! shipped in `macula-go` (`pool/discovery.go`, v0.7.0) and `macula-dotnet`
@@ -44,7 +37,7 @@
 //! carries a node_id at all (true of essentially every row), falling back
 //! to hostname/WebPki only when `host_advertised` itself is missing; that
 //! trades away TLS-layer MITM resistance for the common case, not just the
-//! no-DNS one. Here, [`dial_target_from_station_row`] prefers `hostname`
+//! no-DNS one. Here, `dial_target_from_station_row` prefers `hostname`
 //! unconditionally — `Trust::Pinned` is chosen only when a row has NO
 //! usable hostname at all, so a normal Let's-Encrypt-backed station still
 //! dials WebPki exactly as it always has; only a genuine no-DNS station
@@ -62,7 +55,7 @@ use tokio::task::JoinSet;
 
 use crate::connection::{self, CallError, Session};
 use crate::dht;
-use crate::frame::{CallResponse, PublishSpec};
+use crate::frame::{CallResponse, CallSpec, PublishSpec};
 use crate::identity::KeyPair;
 use crate::transport::Trust;
 
@@ -144,7 +137,7 @@ fn select_links(
 /// fallback if discovery never succeeds, retried forever on failure, never
 /// replaced. Discovery only ADDS links — a station missing from a later
 /// refresh does NOT tear down an existing link. A DISCOVERY-added link that
-/// fails to dial [`DISCOVERY_LINK_MAX_RESPAWN_ATTEMPTS`] times in a row
+/// fails to dial `DISCOVERY_LINK_MAX_RESPAWN_ATTEMPTS` (5) times in a row
 /// gives up and frees its slot (so a future refresh can try a different
 /// station instead) — unlike a bootstrap seed, which never gives up. Go's
 /// and dotnet's ports of this same feature have no such give-up mechanism
@@ -243,21 +236,11 @@ pub struct PooledLink {
     /// see [`Pool`]'s module-level doc for the one case (a discovered,
     /// hostname-less, node_id-bearing row) where it differs per link.
     trust: Trust,
-    /// **Correctness depends on `tokio::sync::Mutex`'s documented FIFO
-    /// ordering** (queued lockers acquire in the exact order they queued)
-    /// — verified explicitly by adversarial review, 2026-09-05, tracing
-    /// the concurrent-`Pool::call`-vs-`Pool::call` race `redialing`
-    /// guards against: two callers racing the same dead session both
-    /// hold this lock for their own full network round-trip before
-    /// either calls `mark_disconnected`, and FIFO ordering is what
-    /// guarantees a STALE caller's own `mark_disconnected` can never run
-    /// after — and clobber — a session a freshly-spawned redial task
-    /// installed in the meantime (the redial task can only begin trying
-    /// to acquire this same lock once a real dial completes, which is
-    /// strictly later than any caller that was already queued before it
-    /// started). If this field's type ever changes to a non-fair lock,
-    /// that invariant needs re-deriving from scratch, not assumed to
-    /// still hold.
+    /// Held only to read or swap the link's session, never across a round
+    /// trip: a caller clones the session handle out first. A caller whose
+    /// call failed marks the link disconnected only while it still holds
+    /// that same session ([`Pool::mark_disconnected`]), so a stale caller
+    /// can never clear a session a respawn installed in the meantime.
     state: Mutex<LinkState>,
     connected: AtomicBool,
     /// Discovery-added links only: consecutive failed dial attempts, reset
@@ -486,7 +469,8 @@ impl Pool {
     /// answers (a transport-level failure marks that link disconnected and
     /// triggers its respawn, then moves to the next candidate — a BOLT#4
     /// ERROR response is still a successful `call` as far as this pool is
-    /// concerned, exactly like a bare [`Session::call`]).
+    /// concerned, exactly like a bare [`Session::call`]). Pool calls publish
+    /// no RPC telemetry facts, as macula's pool doesn't.
     pub async fn call(
         self: &Arc<Self>,
         procedure: &str,
@@ -500,25 +484,25 @@ impl Pool {
         }
         let mut last_err = None;
         for link in candidates {
-            let mut state = link.state.lock().await;
-            let Some(session) = state.session.as_mut() else {
+            // A handle, cloned out, so no lock is held across the round trip.
+            let Some(session) = link.state.lock().await.session.clone() else {
                 continue; // raced with a disconnect between selection and lock
             };
+            let spec = CallSpec::new(
+                rand::random(),
+                procedure,
+                realm,
+                payload.clone(),
+                deadline_ms,
+                self.identity.node_id(),
+            );
             match session
-                .call(
-                    procedure,
-                    realm,
-                    payload.clone(),
-                    deadline_ms,
-                    &self.identity,
-                    self.options.call_timeout,
-                )
+                .link_call(&spec, &self.identity, self.options.call_timeout)
                 .await
             {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    drop(state);
-                    self.mark_disconnected(&link).await;
+                    self.mark_disconnected(&link, &session).await;
                     last_err = Some(e);
                 }
             }
@@ -545,16 +529,12 @@ impl Pool {
         let attempted = targets.len();
         let mut successes = 0usize;
         for link in targets {
-            let mut state = link.state.lock().await;
-            let Some(session) = state.session.as_mut() else {
+            let Some(session) = link.state.lock().await.session.clone() else {
                 continue;
             };
             match session.publish(spec, &self.identity).await {
                 Ok(()) => successes += 1,
-                Err(_) => {
-                    drop(state);
-                    self.mark_disconnected(&link).await;
-                }
+                Err(_) => self.mark_disconnected(&link, &session).await,
             }
         }
         if successes > 0 {
@@ -626,8 +606,17 @@ impl Pool {
         select_links(connected, resolved)
     }
 
-    async fn mark_disconnected(self: &Arc<Self>, link: &Arc<PooledLink>) {
+    /// Marks `link` disconnected while it still holds `failed`, so a caller
+    /// that raced a respawn never clears the session that replaced it.
+    async fn mark_disconnected(self: &Arc<Self>, link: &Arc<PooledLink>, failed: &Session) {
         let mut state = link.state.lock().await;
+        if !state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_same_session(failed))
+        {
+            return;
+        }
         state.session = None;
         link.connected.store(false, Ordering::Release);
         drop(state);
@@ -671,8 +660,7 @@ async fn link_lifecycle_future(pool: Arc<Pool>, link: Arc<PooledLink>) {
 
 /// Dial (or redial) `link` until it connects, then return — this task's
 /// job ends at a successful handshake; it does not keep running
-/// afterward (no persistent reader is needed for a Call/Publish-only
-/// pool, see this module's own doc). [`Pool::mark_disconnected`] spawns a
+/// afterward (the link's session runs its own reader). [`Pool::mark_disconnected`] spawns a
 /// fresh instance of this same function whenever a link goes down, so
 /// respawn is just "run this again", not a separate mechanism.
 async fn run_link_lifecycle(pool: &Arc<Pool>, link: &Arc<PooledLink>) {
@@ -822,13 +810,11 @@ async fn resolve_list_stations_realm(pool: &Arc<Pool>) -> Option<[u8; 32]> {
     let link = links.iter().find(|l| l.is_connected())?.clone();
     drop(links);
 
-    let mut state = link.state.lock().await;
-    let session = state.session.as_mut()?;
+    let session = link.state.lock().await.session.clone()?;
     let records =
-        dht::find_records_by_type(session, &pool.identity, dht::TYPE_PROCEDURE_ADVERTISEMENT)
+        dht::find_records_by_type(&session, &pool.identity, dht::TYPE_PROCEDURE_ADVERTISEMENT)
             .await
             .ok()?;
-    drop(state);
 
     for record in records {
         if dht::verify(&record).is_err() {

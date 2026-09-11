@@ -71,6 +71,50 @@ usually touches both, but their version numbers don't move in lockstep.
   `Session::serve_one_call` and `serve_one_call_gated` drop a CALL whose
   signature doesn't verify against its `caller` field, without a reply and
   before any policy or handler runs, matching the Erlang station link.
+- **Breaking: a `Session` is a cloneable handle with one reader.** Its
+  methods take `&self`, so calls, subscriptions, publishing and serving on
+  one session run at the same time. A reader task routes each RESULT or
+  ERROR to its call by call id, each EVENT to the subscriptions it matches,
+  and each inbound CALL to a queue of 64 that `serve_one_call` and
+  `serve_one_call_gated` take from. A slow subscriber never delays a call's
+  reply. The functions in `dht`, `content`, `stream` and `direct_dial` take
+  `&Session` instead of `&mut Session`.
+- **Breaking: `Session::subscribe` returns a `Subscription`** with its own
+  queue of 256 events, read with `recv_event(timeout)` and ended with
+  `close()`. A topic matches segment by segment on `/`, where `*` is exactly
+  one segment, and the realm must be equal. Closing the last subscription
+  for a realm and topic sends UNSUBSCRIBE. A subscription that falls more
+  than 256 events behind returns its queued events and then
+  `RecvEventError::Overflow`, and stays subscribed at the station until it
+  is closed. `Session::recv_event`, `unsubscribe`, `recv_frame`,
+  `recv_frame_timeout` and `leftover_bytes` are removed, and
+  `run_subscriber` runs on a `Subscription`.
+- **Breaking: new error types.** `Session::call` and `call_with_ucan`
+  return `CallError`: `Timeout { write_started }`,
+  `SessionEnded { reason, write_started }`, `SendTimeout`, `Encode`,
+  `Write` or `MalformedReply`, where `not_sent()` tells whether the CALL
+  can safely be sent again. `publish`, `advertise`, `unadvertise` and
+  `subscribe` return `SendError`, `RecvEventError` is `Timeout`, `Overflow`
+  or `SessionEnded`, `serve_one_call` returns `ServeCallError`, and
+  `FrameStream`'s call error is renamed `StreamCallError`.
+- **Writes are bounded.** A caller waits for its turn to write no longer
+  than its deadline, a call's timeout or else 30 seconds. A write that
+  takes longer than 30 seconds ends the session. The reader never waits on
+  a write: an inbound CALL that finds the queue full is answered with
+  `temporary_relay_failure` through a separate queue of 64 frames, and
+  serving carries on.
+- **How a session ends.** A GOODBYE, a HELLO or CONNECT after the handshake,
+  a frame that doesn't decode, a stalled write or the end of the control
+  stream ends the session: its pending calls fail with `SessionEnded`, its
+  connection closes, direct dial no longer reuses it, and the end is logged
+  once through the `log` crate, as a warning when the station or connection
+  ended it and as info when it was closed here, with both node ids.
+  `Session::end_reason` and `ended` report it. Frames no route claims are
+  counted by type in `unrouted_frame_counts`, with a log line at most once
+  a minute.
+- **`Pool::call` publishes no RPC facts.** A pooled call goes through the
+  link's session without the `rpc.sent_v1` and `rpc.completed_v1` facts
+  that `Session::call` publishes.
 
 ### [0.3.0] - 2026-09-05
 
@@ -356,6 +400,13 @@ did, but the two have moved at different paces ever since).
   already has open to the provider's station under the same identity,
   instead of dialing a second one that would close it. `session` is absent
   when the stream runs on such a session; close it only when it is set.
+- **Breaking: `FfiSession::subscribe` returns an `FfiSubscription`**, read
+  with `recv_event(timeout_ms)` and ended with `close()`. Each subscription
+  has its own queue of 256 events and receives only the events its topic
+  and realm match. `FfiSession::recv_event` and `unsubscribe` are removed.
+- Methods on one `FfiSession` no longer wait for each other:
+  `serve_one_call`, `accept_stream`, calls and subscriptions on the same
+  session run at the same time.
 
 ### [ffi-0.3.1] - 2026-09-05
 

@@ -12,6 +12,7 @@ pub mod cert;
 pub mod cert_chain;
 pub mod connection;
 pub mod content;
+mod control_channel;
 pub mod dht;
 pub mod direct_dial;
 pub mod frame;

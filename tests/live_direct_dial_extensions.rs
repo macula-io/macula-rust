@@ -49,13 +49,13 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let mut provider_session =
+    let provider_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &provider_id)
             .await
             .expect("provider handshake should succeed");
 
     direct_dial::advertise_direct(
-        &mut provider_session,
+        &provider_session,
         &provider_id,
         realm,
         &procedure,
@@ -77,20 +77,20 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
     // frame had necessarily been fully processed peer-side.
     let accept_task = tokio::spawn(async move {
         let result = macula_rust::stream::StreamHandle::accept(
-            &mut provider_session,
+            &provider_session,
             Duration::from_secs(15),
         )
         .await;
         (result, provider_session)
     });
 
-    let mut resolver_session =
+    let resolver_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &resolver_id)
             .await
             .expect("resolver handshake should succeed");
 
     let opened = match direct_dial::open_stream_direct(
-        &mut resolver_session,
+        &resolver_session,
         &caller_id,
         realm,
         &procedure,
@@ -189,7 +189,7 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
     let announcer_id = KeyPair::generate_with_default_puzzle();
     let getter_id = KeyPair::generate_with_default_puzzle();
 
-    let mut resolver_session =
+    let resolver_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &resolver_id)
             .await
             .expect("resolver handshake should succeed");
@@ -197,7 +197,7 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
 
     let data = b"real bytes stored and fetched purely via direct-dial".to_vec();
     let mcid = match direct_dial::put_direct(
-        &mut resolver_session,
+        &resolver_session,
         &putter_id,
         station,
         &data,
@@ -224,7 +224,7 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
     // Publish the content_announcement ourselves, playing the
     // infrastructure role this crate's own leaf API deliberately can't --
     // see get_direct's doc.
-    let mut announcer_session =
+    let announcer_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &announcer_id)
             .await
             .expect("announcer handshake should succeed");
@@ -236,7 +236,7 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
         Duration::from_secs(3600),
     );
     let rec = macula_rust::dht::sign(rec, &announcer_id);
-    macula_rust::dht::put_record(&mut announcer_session, &announcer_id, &rec)
+    macula_rust::dht::put_record(&announcer_session, &announcer_id, &rec)
         .await
         .expect("publishing the content_announcement should succeed");
 
@@ -248,11 +248,11 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
     // get_direct correctly REFUSES an announcement whose claimed announcer
     // doesn't match who answers the dial, which is itself a real
     // correctness property worth confirming.
-    let mut getter_session =
+    let getter_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &getter_id)
             .await
             .expect("getter handshake should succeed");
-    match direct_dial::get_direct(&mut getter_session, &getter_id, mcid, Duration::from_secs(15)).await {
+    match direct_dial::get_direct(&getter_session, &getter_id, mcid, Duration::from_secs(15)).await {
         Err(direct_dial::GetDirectError::Dial(direct_dial::DialAndVerifyError::TrustViolation { resolved, dialed })) => {
             println!(
                 "OBSERVED: get_direct correctly refused a content_announcement whose claimed announcer ({}) doesn't match the station that actually answers the dial ({}) -- confirms the trust check fires, matching how put_direct's own data landed on the real station instead",

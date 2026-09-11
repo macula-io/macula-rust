@@ -3,21 +3,28 @@
 //! (`macula-io/macula`) — see `plans/PLAN_WIRE_PROTOCOL.md` §3.
 //!
 //! Only the client role's `connecting -> handshaking -> connected` path
-//! is implemented. [`FrameStream`] is the reusable "send/receive signed
-//! application frames on one QUIC stream" primitive — [`Session`] wraps
-//! one for the control stream, and [`Session::open_dedicated_stream`]
-//! hands out fresh ones for content transfer (§12) and streaming RPC
-//! (§13), which both run on dedicated streams rather than the control
-//! stream.
+//! is implemented. [`Session`] is the handshaked connection: one reader
+//! routes every frame on its control stream, so calls, subscriptions and
+//! serving run on it at the same time. [`FrameStream`] is the "send/receive
+//! signed application frames on one QUIC stream" primitive that
+//! [`Session::open_dedicated_stream`] hands out for content transfer (§12)
+//! and streaming RPC (§13), which both run on dedicated streams rather than
+//! the control stream.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::bolt4;
 use crate::cbor::Value;
+use crate::control_channel::{self, Channel};
 use crate::frame::{self, Decoded, HelloInfo};
 use crate::identity::KeyPair;
 use crate::transport::{self, ConnectError, Trust};
+
+pub use crate::control_channel::{
+    CallError, RecvEventError, SendError, SessionEndReason, Subscription,
+};
 
 /// A boxed, `'static` future — hand-rolled rather than pulling in the
 /// `futures` crate for one type alias.
@@ -53,9 +60,8 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_CHUNK: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------
-// FrameStream — send/receive signed application frames on one QUIC
-// stream. The control stream (inside Session) and every dedicated
-// stream (content transfer, streaming RPC) are each one of these.
+// FrameStream — send/receive signed application frames on one dedicated
+// QUIC stream (content transfer, streaming RPC).
 // ---------------------------------------------------------------------
 
 pub struct FrameStream {
@@ -104,35 +110,34 @@ impl std::fmt::Display for RecvFrameError {
 
 impl std::error::Error for RecvFrameError {}
 
+/// Why a CALL on a dedicated stream got no reply.
 #[derive(Debug)]
-pub enum CallError {
+pub enum StreamCallError {
     Send(SendFrameError),
     Recv(RecvFrameError),
 }
 
-impl std::fmt::Display for CallError {
+impl std::fmt::Display for StreamCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CallError::Send(e) => write!(f, "sending CALL: {e}"),
-            CallError::Recv(e) => write!(f, "awaiting RESULT/ERROR: {e}"),
+            StreamCallError::Send(e) => write!(f, "sending CALL: {e}"),
+            StreamCallError::Recv(e) => write!(f, "awaiting RESULT/ERROR: {e}"),
         }
     }
 }
 
-impl std::error::Error for CallError {}
+impl std::error::Error for StreamCallError {}
 
 impl FrameStream {
     fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        Self::with_buf(send, recv, Vec::new())
+        Self {
+            send,
+            recv,
+            buf: Vec::new(),
+        }
     }
 
-    fn with_buf(send: quinn::SendStream, recv: quinn::RecvStream, buf: Vec<u8>) -> Self {
-        Self { send, recv, buf }
-    }
-
-    /// Any bytes already read past the last decoded frame — for the
-    /// control stream specifically, this starts with whatever was left
-    /// over from the handshake itself.
+    /// Any bytes already read past the last decoded frame.
     pub fn leftover_bytes(&self) -> &[u8] {
         &self.buf
     }
@@ -176,16 +181,8 @@ impl FrameStream {
     }
 
     /// Send a signed CALL for `procedure` and wait for the matching
-    /// RESULT or ERROR, correlated by `call_id`.
-    ///
-    /// **Known v1 limitation (control stream only):** any frame that
-    /// arrives before the match (e.g. an EVENT from an active
-    /// SUBSCRIBE) is discarded, not queued or dispatched elsewhere —
-    /// correct for a client doing one thing at a time on the control
-    /// stream, not yet correct for CALL and PUBLISH/SUBSCRIBE used
-    /// concurrently on it. Harmless on a **dedicated** stream (content
-    /// transfer, streaming RPC), since nothing else ever arrives there
-    /// to discard.
+    /// RESULT or ERROR, correlated by `call_id`. A dedicated stream carries
+    /// only its own exchange, so a frame with another `call_id` is skipped.
     pub async fn call(
         &mut self,
         procedure: &str,
@@ -194,7 +191,7 @@ impl FrameStream {
         deadline_ms: i128,
         identity: &KeyPair,
         timeout: Duration,
-    ) -> Result<frame::CallResponse, CallError> {
+    ) -> Result<frame::CallResponse, StreamCallError> {
         let call_id: [u8; 16] = rand::random();
         let spec = frame::CallSpec::new(
             call_id,
@@ -205,11 +202,13 @@ impl FrameStream {
             identity.node_id(),
         );
         let signed = frame::sign(frame::call(&spec), identity);
-        self.send_frame(signed).await.map_err(CallError::Send)?;
+        self.send_frame(signed)
+            .await
+            .map_err(StreamCallError::Send)?;
 
         tokio::time::timeout(timeout, self.await_call_response(call_id))
             .await
-            .unwrap_or(Err(CallError::Recv(RecvFrameError::Timeout)))
+            .unwrap_or(Err(StreamCallError::Recv(RecvFrameError::Timeout)))
     }
 
     /// As [`call`](Self::call), additionally attaching `ucan_token` to the
@@ -234,7 +233,7 @@ impl FrameStream {
         identity: &KeyPair,
         timeout: Duration,
         ucan_token: Vec<u8>,
-    ) -> Result<frame::CallResponse, CallError> {
+    ) -> Result<frame::CallResponse, StreamCallError> {
         let call_id: [u8; 16] = rand::random();
         let mut spec = frame::CallSpec::new(
             call_id,
@@ -246,21 +245,23 @@ impl FrameStream {
         );
         spec.ucan_token = ucan_token;
         let signed = frame::sign(frame::call(&spec), identity);
-        self.send_frame(signed).await.map_err(CallError::Send)?;
+        self.send_frame(signed)
+            .await
+            .map_err(StreamCallError::Send)?;
 
         tokio::time::timeout(timeout, self.await_call_response(call_id))
             .await
-            .unwrap_or(Err(CallError::Recv(RecvFrameError::Timeout)))
+            .unwrap_or(Err(StreamCallError::Recv(RecvFrameError::Timeout)))
     }
 
     async fn await_call_response(
         &mut self,
         call_id: [u8; 16],
-    ) -> Result<frame::CallResponse, CallError> {
+    ) -> Result<frame::CallResponse, StreamCallError> {
         loop {
-            let value = self.recv_frame().await.map_err(CallError::Recv)?;
+            let value = self.recv_frame().await.map_err(StreamCallError::Recv)?;
             if frame::frame_call_id(&value) != Some(call_id) {
-                continue; // not ours — see call()'s doc on this limitation
+                continue;
             }
             if let Ok(response) = frame::parse_call_response(&value) {
                 return Ok(response);
@@ -273,32 +274,59 @@ impl FrameStream {
 }
 
 // ---------------------------------------------------------------------
-// Session — the handshaked connection, wrapping the control stream.
+// Session — the handshaked connection. One reader routes every frame on
+// its control stream, and writers take turns: see control_channel.rs.
 // ---------------------------------------------------------------------
 
-/// A completed, handshaked connection to a macula-station. Holds the
-/// open control stream (CONNECT/HELLO already exchanged) and the
-/// station's identity as verified by the HELLO frame's own signature.
+/// A completed, handshaked connection to a macula-station, and a handle to
+/// it: clones share the one connection. Calls, subscriptions and serving
+/// run on it at the same time, because one reader routes every frame on its
+/// control stream to whatever waits for it: a RESULT or ERROR to its call,
+/// an EVENT to each matching [`Subscription`], and an inbound CALL signed by
+/// its caller to a queue of 64. GOODBYE, HELLO or CONNECT after the
+/// handshake, a frame that can't be decoded, or a write that stalls past
+/// the 30 second send timeout ends the session; every later operation then
+/// reports [`SessionEndReason`], the connection closes, and the end is
+/// logged once through the `log` facade. Other frames nothing waits for are
+/// counted ([`unrouted_frame_counts`](Self::unrouted_frame_counts)).
 ///
-/// **Always call [`close`](Self::close) before this goes out of scope,
-/// not just after your own logic is done with it -- especially right
+/// **Always call [`close`](Self::close) before the last handle goes out of
+/// scope, not just after your own logic is done with it -- especially right
 /// after a send-then-return call like [`publish`](Self::publish) or
-/// [`serve_one_call`](Self::serve_one_call).** There is deliberately no
-/// `Drop` impl (flushing outstanding QUIC stream data needs `.await`,
-/// which `Drop` can't do), so a bare drop tears down the connection
-/// immediately with no guarantee the last write actually reached the
-/// peer -- see [`close`](Self::close)'s own doc for the mechanism, and
+/// [`serve_one_call`](Self::serve_one_call).** Dropping the last handle
+/// ends the session and tears the connection down at once (flushing
+/// outstanding QUIC stream data needs `.await`, which `Drop` can't do), with
+/// no guarantee the last write actually reached the peer -- see
+/// [`close`](Self::close)'s own doc for the mechanism, and
 /// [`serve_one_call`](Self::serve_one_call)'s for the specific,
 /// confirmed-live way this bites a spawned provider task.
+#[derive(Clone)]
 pub struct Session {
-    /// Held only weakly by `open_sessions`, where direct dial finds it to
-    /// open dedicated streams on, so dropping the session still drops the
-    /// connection.
-    connection: Arc<quinn::Connection>,
-    control: FrameStream,
-    /// The node id this session connected under.
-    identity: [u8; 32],
+    inner: Arc<SessionInner>,
     pub station: HelloInfo,
+}
+
+/// What every handle of one session shares.
+pub(crate) struct SessionInner {
+    /// Direct dial opens dedicated streams on it when it reuses this session.
+    connection: Arc<quinn::Connection>,
+    channel: Arc<Channel>,
+    hello: HelloInfo,
+}
+
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        // The last handle went without close: end the session, which stops
+        // its reader and writers, and close the connection at once.
+        self.channel.end(SessionEndReason::Closed, true);
+        self.connection.close(0u32.into(), b"dropped");
+    }
+}
+
+impl crate::open_sessions::Live for SessionInner {
+    fn is_live(&self) -> bool {
+        self.channel.end_reason().is_none() && self.connection.close_reason().is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -359,7 +387,8 @@ impl std::error::Error for HandshakeError {}
 /// Dial `host:port` and complete the full CONNECT/HELLO handshake:
 /// open a QUIC connection, open the control stream, send a signed
 /// CONNECT built from `identity`, and wait for a HELLO whose own
-/// signature verifies against the node_id it claims.
+/// signature verifies against the node_id it claims. The session's reader
+/// starts right after.
 ///
 /// `identity` **must** be puzzle-hardened
 /// ([`KeyPair::generate_with_puzzle`](crate::identity::KeyPair::generate_with_puzzle))
@@ -415,20 +444,43 @@ async fn connect_inner(
     }
 
     let connection = Arc::new(connection);
-    crate::open_sessions::live().register(identity.node_id(), station.node_id, &connection);
-    Ok(Session {
-        connection,
-        control: FrameStream::with_buf(send, recv, buf),
-        identity: identity.node_id(),
-        station,
-    })
+    let (identity_node, station_node) = (identity.node_id(), station.node_id);
+    // The session signs the frames it sends on its own account (replies its
+    // reader makes, UNSUBSCRIBE on a dropped subscription) with its own copy
+    // of the identity it connected under.
+    let own_identity = KeyPair::from_seed_bytes(identity.private_bytes());
+    let hello = station.clone();
+    let inner = Arc::new_cyclic(|this: &Weak<SessionInner>| {
+        let (this, ended_connection) = (this.clone(), connection.clone());
+        let channel = Channel::start(
+            Box::new(recv),
+            buf,
+            Box::new(send),
+            own_identity,
+            station_node,
+            control_channel::SEND_TIMEOUT,
+            Box::new(move |reason: &SessionEndReason, closed_here: bool| {
+                // A session whose control stream ended is no longer offered
+                // for reuse, and its connection closes.
+                crate::open_sessions::live().unregister_weak(identity_node, station_node, &this);
+                if !closed_here {
+                    ended_connection.close(0u32.into(), reason.to_string().as_bytes());
+                }
+            }),
+        );
+        SessionInner {
+            connection,
+            channel,
+            hello,
+        }
+    });
+    crate::open_sessions::live().register(identity_node, station_node, &inner);
+    Ok(Session { inner, station })
 }
 
 /// Read from `recv` until one complete frame has been decoded, returning
 /// it along with any leftover bytes already read that belong to the
-/// *next* frame (so a caller can carry them forward instead of losing
-/// them). Handshake-only — [`FrameStream::recv_frame`] is the
-/// post-handshake equivalent.
+/// *next* frame, which the session's reader starts from.
 async fn read_one_frame(recv: &mut quinn::RecvStream) -> Result<(Value, Vec<u8>), HandshakeError> {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; READ_CHUNK];
@@ -450,27 +502,90 @@ async fn read_one_frame(recv: &mut quinn::RecvStream) -> Result<(Value, Vec<u8>)
     }
 }
 
-/// Open a dedicated QUIC stream on `connection`: what
-/// [`Session::open_dedicated_stream`] does, for code that holds only the
-/// connection, such as direct dial reusing another session's.
-pub(crate) async fn dedicated_stream_on(
-    connection: &quinn::Connection,
-) -> Result<FrameStream, quinn::ConnectionError> {
-    let (send, recv) = connection.open_bi().await?;
-    Ok(FrameStream::new(send, recv))
+/// Errors from [`Session::serve_one_call`].
+#[derive(Debug)]
+pub enum ServeCallError {
+    /// No inbound CALL arrived within the requested timeout.
+    Timeout,
+    /// The session ended.
+    SessionEnded(SessionEndReason),
+    /// Sending the reply failed.
+    Send(SendError),
 }
 
+impl std::fmt::Display for ServeCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServeCallError::Timeout => write!(f, "timed out waiting for an inbound CALL"),
+            ServeCallError::SessionEnded(reason) => write!(f, "the session has ended: {reason}"),
+            ServeCallError::Send(e) => write!(f, "sending the reply: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ServeCallError {}
+
+/// Errors from [`Session::run_subscriber`].
+#[derive(Debug)]
+pub enum RunSubscriberError {
+    Subscribe(SendError),
+    Recv(RecvEventError),
+}
+
+impl std::fmt::Display for RunSubscriberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunSubscriberError::Subscribe(e) => write!(f, "subscribing: {e}"),
+            RunSubscriberError::Recv(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RunSubscriberError {}
+
 impl Session {
+    /// A handle to a session found open in this process's open sessions.
+    pub(crate) fn from_open(inner: Arc<SessionInner>) -> Session {
+        Session {
+            station: inner.hello.clone(),
+            inner,
+        }
+    }
+
+    /// Whether `other` is a handle to this same session.
+    pub(crate) fn is_same_session(&self, other: &Session) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// The remote address this session's connection is with.
     pub fn remote_address(&self) -> std::net::SocketAddr {
-        self.connection.remote_address()
+        self.inner.connection.remote_address()
+    }
+
+    /// Why this session ended, once it has.
+    pub fn end_reason(&self) -> Option<SessionEndReason> {
+        self.inner.channel.end_reason()
+    }
+
+    /// Resolves once this session has ended, with why.
+    pub async fn ended(&self) -> SessionEndReason {
+        self.inner.channel.ended().await
+    }
+
+    /// How many frames of each type the station sent that nothing on this
+    /// session was waiting for, such as the station's own advertise
+    /// broadcasts. They are dropped, and at most one log line per type per
+    /// minute reports them.
+    pub fn unrouted_frame_counts(&self) -> HashMap<String, u64> {
+        self.inner.channel.unrouted_frame_counts()
     }
 
     /// Open a new dedicated QUIC stream on this same connection, separate
     /// from the control stream — the mechanism content transfer (§12)
-    /// and streaming RPC (§13) both use instead of the control stream.
-    pub async fn open_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
-        dedicated_stream_on(&self.connection).await
+    /// and streaming RPC (§13), both use instead of the control stream.
+    pub async fn open_dedicated_stream(&self) -> Result<FrameStream, quinn::ConnectionError> {
+        let (send, recv) = self.inner.connection.open_bi().await?;
+        Ok(FrameStream::new(send, recv))
     }
 
     /// Accept the next dedicated stream the *peer* opens toward us —
@@ -491,35 +606,23 @@ impl Session {
     /// data at the transport layer regardless of whether or when the
     /// application starts reading, so nothing analogous to arm before
     /// read is needed on this side.
-    pub async fn accept_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
-        let (send, recv) = self.connection.accept_bi().await?;
+    pub async fn accept_dedicated_stream(&self) -> Result<FrameStream, quinn::ConnectionError> {
+        let (send, recv) = self.inner.connection.accept_bi().await?;
         Ok(FrameStream::new(send, recv))
     }
 
-    /// Any bytes already read past the HELLO frame during the handshake
-    /// (belonging to whatever the station sent next) that a caller
-    /// building further protocol handling on top of this `Session`
-    /// should treat as already-received.
-    pub fn leftover_bytes(&self) -> &[u8] {
-        self.control.leftover_bytes()
-    }
-
-    /// Read the next complete application frame from the control stream.
-    pub async fn recv_frame(&mut self) -> Result<Value, RecvFrameError> {
-        self.control.recv_frame().await
-    }
-
-    /// As [`recv_frame`](Self::recv_frame), bounded by `timeout`.
-    pub async fn recv_frame_timeout(&mut self, timeout: Duration) -> Result<Value, RecvFrameError> {
-        self.control.recv_frame_timeout(timeout).await
-    }
-
-    /// Send a signed CALL on the control stream and wait for the
-    /// matching RESULT or ERROR — see [`FrameStream::call`]. Announces
-    /// `rpc.sent_v1`/`rpc.completed_v1` around the call — see
-    /// `announce_rpc_sent` for why these are always on.
+    /// Send a signed CALL on the control stream and wait for the matching
+    /// RESULT or ERROR, correlated by `call_id`. Other calls, subscriptions
+    /// and serving on this session carry on meanwhile. `timeout` covers the
+    /// whole call, its turn to write included; when it runs out the call
+    /// returns [`CallError::Timeout`], and when the session ends first
+    /// [`CallError::SessionEnded`]. Both say whether the CALL may have
+    /// reached the station. Announces `rpc.sent_v1` once the CALL is written
+    /// and `rpc.completed_v1` when the call returns, through this session's
+    /// own writer, so the facts never cost the call time — see
+    /// `RPC_SENT_TOPIC` for why these are always on.
     pub async fn call(
-        &mut self,
+        &self,
         procedure: &str,
         realm: [u8; 32],
         payload: Value,
@@ -527,25 +630,29 @@ impl Session {
         identity: &KeyPair,
         timeout: Duration,
     ) -> Result<frame::CallResponse, CallError> {
-        let request_id: [u8; 16] = rand::random();
-        announce_rpc_sent(&mut *self, realm, identity, request_id).await;
-        let result = self
-            .control
-            .call(procedure, realm, payload, deadline_ms, identity, timeout)
-            .await;
-        announce_rpc_completed(&mut *self, realm, identity, request_id, &result).await;
-        result
+        let spec = frame::CallSpec::new(
+            rand::random(),
+            procedure,
+            realm,
+            payload,
+            deadline_ms,
+            identity.node_id(),
+        );
+        self.announced_call(&spec, identity, timeout).await
     }
 
     /// As [`call`](Self::call), attaching `ucan_token` (e.g. from
     /// [`crate::ucan::create`]) to the outgoing CALL — for invoking a
     /// procedure gated by a [`crate::ucan::Policy::required`] policy on
-    /// the provider side. See [`FrameStream::call_with_ucan`] for the
-    /// full contract. Announces `rpc.sent_v1`/`rpc.completed_v1` the same
-    /// way [`call`](Self::call) does.
+    /// the provider side. A procedure that isn't gated ignores the token;
+    /// one that is checks it before ever running its handler, so an
+    /// invalid or missing token comes back as a BOLT#4 `unauthorized` ERROR
+    /// frame, not a Rust error from this call. Announces
+    /// `rpc.sent_v1`/`rpc.completed_v1` the same way [`call`](Self::call)
+    /// does.
     #[allow(clippy::too_many_arguments)]
     pub async fn call_with_ucan(
-        &mut self,
+        &self,
         procedure: &str,
         realm: [u8; 32],
         payload: Value,
@@ -554,22 +661,52 @@ impl Session {
         timeout: Duration,
         ucan_token: Vec<u8>,
     ) -> Result<frame::CallResponse, CallError> {
+        let mut spec = frame::CallSpec::new(
+            rand::random(),
+            procedure,
+            realm,
+            payload,
+            deadline_ms,
+            identity.node_id(),
+        );
+        spec.ucan_token = ucan_token;
+        self.announced_call(&spec, identity, timeout).await
+    }
+
+    async fn announced_call(
+        &self,
+        spec: &frame::CallSpec,
+        identity: &KeyPair,
+        timeout: Duration,
+    ) -> Result<frame::CallResponse, CallError> {
         let request_id: [u8; 16] = rand::random();
-        announce_rpc_sent(&mut *self, realm, identity, request_id).await;
+        let sent = rpc_fact(
+            RPC_SENT_TOPIC,
+            spec.realm,
+            identity,
+            request_id_payload(request_id),
+        );
         let result = self
-            .control
-            .call_with_ucan(
-                procedure,
-                realm,
-                payload,
-                deadline_ms,
-                identity,
-                timeout,
-                ucan_token,
-            )
+            .inner
+            .channel
+            .call(spec, identity, timeout, Some(sent))
             .await;
-        announce_rpc_completed(&mut *self, realm, identity, request_id, &result).await;
+        self.inner
+            .channel
+            .hand_off(rpc_completed(spec.realm, identity, request_id, &result));
         result
+    }
+
+    /// A CALL on this session without RPC telemetry facts, for a pool
+    /// calling on its links, as macula's pool calls through
+    /// `macula_station_link:call`.
+    pub(crate) async fn link_call(
+        &self,
+        spec: &frame::CallSpec,
+        identity: &KeyPair,
+        timeout: Duration,
+    ) -> Result<frame::CallResponse, CallError> {
+        self.inner.channel.call(spec, identity, timeout, None).await
     }
 
     /// Send a signed PUBLISH, carrying the end-to-end `publisher_sig`
@@ -581,38 +718,32 @@ impl Session {
     /// Erlang reference SDK's own default (`pubsub_emit_publisher_sig`,
     /// true since macula 4.6.0). Fire-and-forget — no reply is expected
     /// on the wire; a subscriber (this session included, if subscribed
-    /// to the same topic/realm) receives an EVENT asynchronously, read
-    /// via [`recv_frame`](Self::recv_frame) /
-    /// [`recv_event`](Self::recv_event).
+    /// to the same topic/realm) receives an EVENT asynchronously, through
+    /// its [`Subscription`].
     pub async fn publish(
-        &mut self,
+        &self,
         spec: &frame::PublishSpec,
         identity: &KeyPair,
-    ) -> Result<(), SendFrameError> {
+    ) -> Result<(), SendError> {
         let unsigned = frame::publish(spec);
         let with_publisher_sig = frame::sign_publisher(unsigned, identity);
         let signed = frame::sign(with_publisher_sig, identity);
-        self.control.send_frame(signed).await
+        self.inner.channel.send(&signed).await
     }
 
-    /// Send a signed SUBSCRIBE. Fire-and-forget.
+    /// Starts a subscription with its own queue of 256 events. It receives
+    /// every EVENT whose realm is `spec`'s and whose topic matches `spec`'s
+    /// topic by the station's rule: both split on "/", equal segment counts,
+    /// and each segment equal or "*", which matches exactly one whole
+    /// segment. SUBSCRIBE goes to the station unless another subscription on
+    /// this session already holds that realm and topic, and closing or
+    /// dropping the last one sends UNSUBSCRIBE.
     pub async fn subscribe(
-        &mut self,
+        &self,
         spec: &frame::SubscribeSpec,
         identity: &KeyPair,
-    ) -> Result<(), SendFrameError> {
-        let signed = frame::sign(frame::subscribe(spec), identity);
-        self.control.send_frame(signed).await
-    }
-
-    /// Send a signed UNSUBSCRIBE. Fire-and-forget.
-    pub async fn unsubscribe(
-        &mut self,
-        spec: &frame::UnsubscribeSpec,
-        identity: &KeyPair,
-    ) -> Result<(), SendFrameError> {
-        let signed = frame::sign(frame::unsubscribe(spec), identity);
-        self.control.send_frame(signed).await
+    ) -> Result<Subscription, SendError> {
+        self.inner.channel.subscribe(spec, identity).await
     }
 
     /// Send a signed ADVERTISE (§6.9) — registers this connection as the
@@ -622,22 +753,22 @@ impl Session {
     /// [`accept_dedicated_stream`](Self::accept_dedicated_stream)) for
     /// that procedure back to this connection.
     pub async fn advertise(
-        &mut self,
+        &self,
         spec: &frame::AdvertiseSpec,
         identity: &KeyPair,
-    ) -> Result<(), SendFrameError> {
+    ) -> Result<(), SendError> {
         let signed = frame::sign(frame::advertise(spec), identity);
-        self.control.send_frame(signed).await
+        self.inner.channel.send(&signed).await
     }
 
     /// Send a signed UNADVERTISE. Fire-and-forget.
     pub async fn unadvertise(
-        &mut self,
+        &self,
         spec: &frame::UnadvertiseSpec,
         identity: &KeyPair,
-    ) -> Result<(), SendFrameError> {
+    ) -> Result<(), SendError> {
         let signed = frame::sign(frame::unadvertise(spec), identity);
-        self.control.send_frame(signed).await
+        self.inner.channel.send(&signed).await
     }
 
     /// Sends an ADVERTISE for `spec` immediately, then again every
@@ -654,18 +785,17 @@ impl Session {
     ///
     /// A failed tick is reported via `on_error` but does not stop the
     /// loop — it tries again at the next interval regardless. This cannot
-    /// detect or repair a dead session on its own; if the underlying
-    /// connection has actually gone down, every tick will keep failing
-    /// until `stop` resolves. See
+    /// repair a dead session on its own; if the session has ended, every
+    /// tick will keep failing until `stop` resolves. See
     /// [`crate::direct_dial::keep_advertised_direct`] for the direct-dial
     /// equivalent (same shape, same reasoning).
     pub async fn keep_advertised<F>(
-        &mut self,
+        &self,
         spec: &frame::AdvertiseSpec,
         identity: &KeyPair,
         interval: Duration,
         stop: F,
-        on_error: impl Fn(SendFrameError),
+        on_error: impl Fn(SendError),
     ) where
         F: std::future::Future<Output = ()>,
     {
@@ -683,46 +813,25 @@ impl Session {
         }
     }
 
-    /// Read the next frame and parse it as an EVENT, bounded by
-    /// `timeout`. Any non-EVENT frame received first is an error, not
-    /// silently skipped — unlike [`call`](Self::call)'s response wait,
-    /// a caller waiting specifically for a pubsub delivery has no reason
-    /// to expect anything else to legitimately arrive first.
-    pub async fn recv_event(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<frame::EventInfo, RecvEventError> {
-        let value = self
-            .control
-            .recv_frame_timeout(timeout)
-            .await
-            .map_err(RecvEventError::Recv)?;
-        frame::parse_event(&value).map_err(RecvEventError::Parse)
-    }
-
-    /// The provider role's counterpart to [`call`](Self::call): block
-    /// for the next inbound CALL frame on the control stream, bounded
-    /// by `timeout`, look it up via `lookup`, invoke the matching
-    /// handler, and send the resulting RESULT or ERROR back over this
-    /// same connection — see `plans/PLAN_WIRE_PROTOCOL.md` §6.9's
-    /// routing description and `macula_station_link.erl`'s
-    /// `handle_inbound_call/2`, which this mirrors field for field,
-    /// including its BOLT#4 error-code mapping.
+    /// The provider role's counterpart to [`call`](Self::call): wait for
+    /// the next inbound CALL, bounded by `timeout`, look it up via
+    /// `lookup`, invoke the matching handler, and send the resulting RESULT
+    /// or ERROR back over this same connection — see
+    /// `plans/PLAN_WIRE_PROTOCOL.md` §6.9's routing description and
+    /// `macula_station_link.erl`'s `handle_inbound_call/2`, which this
+    /// mirrors field for field, including its BOLT#4 error-code mapping.
     ///
-    /// Any non-CALL frame that arrives first (e.g. a stray EVENT from
-    /// an active [`subscribe`](Self::subscribe), or a RESULT/ERROR for
-    /// some other in-flight [`call`](Self::call)) is discarded, not
-    /// queued — the same "control stream, one thing at a time"
-    /// limitation [`call`](Self::call)'s own doc already carries. A
-    /// session that needs to serve CALLs and also act as a
-    /// caller/subscriber concurrently should use a second `Session`,
-    /// exactly like this crate's own streaming-provider live test does.
+    /// Inbound CALLs wait in this session's queue of 64 until served, while
+    /// calls and subscriptions on the same session carry on. A CALL that
+    /// doesn't fit gets `temporary_relay_failure` at once, and serving
+    /// carries on with the calls already queued. The reader queues only a
+    /// CALL whose signature verifies against the `caller` it names.
     ///
     /// A caller wanting a long-lived server loops on this:
     ///
     /// ```no_run
     /// # use std::time::Duration;
-    /// # async fn example(session: &mut macula_rust::connection::Session, identity: &macula_rust::identity::KeyPair, lookup: impl Fn(&[u8; 32], &str) -> Option<macula_rust::connection::CallHandler>) {
+    /// # async fn example(session: &macula_rust::connection::Session, identity: &macula_rust::identity::KeyPair, lookup: impl Fn(&[u8; 32], &str) -> Option<macula_rust::connection::CallHandler>) {
     /// loop {
     ///     if let Err(e) = session.serve_one_call(&lookup, identity, Duration::from_secs(30)).await {
     ///         // ServeCallError::Timeout just means nothing arrived -- keep looping.
@@ -732,26 +841,25 @@ impl Session {
     /// # }
     /// ```
     ///
-    /// **Do not let this `Session` drop right after this call returns --
-    /// call [`close`](Self::close) on it explicitly first.** This is the
-    /// single most common way to lose the RESULT/ERROR you just sent:
-    /// `serve_one_call` returning `Ok(())` only means the reply was
+    /// **Do not let the last handle to this `Session` drop right after this
+    /// call returns -- call [`close`](Self::close) on it explicitly first.**
+    /// This is the single most common way to lose the RESULT/ERROR you just
+    /// sent: `serve_one_call` returning `Ok(())` only means the reply was
     /// handed to quinn's own send-scheduling machinery, exactly like
     /// [`close`](Self::close)'s own doc explains for `write_all`/`finish`
-    /// -- a bare `Drop` (this type intentionally has none) does nothing
-    /// to wait for that to actually reach the peer before the underlying
-    /// resources are torn down, while `close` has a deliberate bounded
-    /// drain for precisely this. Confirmed live 2026-09-05 with the
-    /// single most natural-looking way to hit it: spawning this session
-    /// into its own `tokio::spawn` task with nothing following the
-    /// `.await` -- the task (and this `Session` with it) can complete
-    /// and drop within microseconds of the write, deterministically
-    /// under a multi-threaded runtime, losing the reply every time. Move
-    /// the session back out of the task and close it explicitly instead,
-    /// same as this crate's own `tests/live_station.rs` does for every
-    /// spawned provider role.
+    /// -- dropping the last handle does nothing to wait for that to reach
+    /// the peer before the connection is torn down, while `close` has a
+    /// deliberate bounded drain for precisely this. Confirmed live
+    /// 2026-09-05 with the single most natural-looking way to hit it:
+    /// spawning the only handle into its own `tokio::spawn` task with
+    /// nothing following the `.await` -- the task can complete and drop it
+    /// within microseconds of the write, deterministically under a
+    /// multi-threaded runtime, losing the reply every time. Keep a handle
+    /// outside the task and close it explicitly instead, same as this
+    /// crate's own `tests/live_station.rs` does for every spawned provider
+    /// role.
     pub async fn serve_one_call<L>(
-        &mut self,
+        &self,
         lookup: L,
         identity: &KeyPair,
         timeout: Duration,
@@ -781,11 +889,11 @@ impl Session {
     /// only).
     ///
     /// Before any policy runs, the CALL's signature must verify against the
-    /// `caller` it names; a CALL that doesn't is dropped with no reply, as
-    /// `macula_station_link.erl`'s `on_inbound_call/3` does, and this keeps
-    /// waiting for the next one.
+    /// `caller` it names; the session's reader drops a CALL that doesn't,
+    /// with no reply, as `macula_station_link.erl`'s `on_inbound_call/3`
+    /// does.
     pub async fn serve_one_call_gated<L, P>(
-        &mut self,
+        &self,
         lookup: L,
         policy: P,
         identity: &KeyPair,
@@ -795,42 +903,22 @@ impl Session {
         L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
         P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
     {
-        tokio::time::timeout(
-            timeout,
-            self.serve_one_call_gated_inner(lookup, policy, identity),
-        )
+        tokio::time::timeout(timeout, async {
+            let call = self
+                .inner
+                .channel
+                .next_inbound_call()
+                .await
+                .map_err(ServeCallError::SessionEnded)?;
+            let reply = build_call_reply(call, &lookup, &policy, identity, Some(self)).await;
+            self.inner
+                .channel
+                .send(&frame::sign(reply, identity))
+                .await
+                .map_err(ServeCallError::Send)
+        })
         .await
         .unwrap_or(Err(ServeCallError::Timeout))
-    }
-
-    async fn serve_one_call_gated_inner<L, P>(
-        &mut self,
-        lookup: L,
-        policy: P,
-        identity: &KeyPair,
-    ) -> Result<(), ServeCallError>
-    where
-        L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
-        P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
-    {
-        loop {
-            let value = self
-                .control
-                .recv_frame()
-                .await
-                .map_err(ServeCallError::Recv)?;
-            let Some(reply) =
-                reply_to_frame(&value, &lookup, &policy, identity, Some(&mut *self)).await
-            else {
-                continue; // not a CALL signed by its caller -- see this method's doc
-            };
-            let signed = frame::sign(reply, identity);
-            self.control
-                .send_frame(signed)
-                .await
-                .map_err(ServeCallError::Send)?;
-            return Ok(());
-        }
     }
 
     /// Bounds how long [`close`](Self::close) waits after its last write
@@ -845,7 +933,8 @@ impl Session {
     /// Close the control stream and connection gracefully with a GOODBYE
     /// frame, matching `macula_peering_conn.erl`'s `connected -> draining`
     /// transition (minus the full drain-timeout bookkeeping, since this
-    /// crate isn't holding a supervisor to clean up).
+    /// crate isn't holding a supervisor to clean up). Every handle to this
+    /// session sees it end.
     ///
     /// `write_all(...).await` and `finish()` both only guarantee the data
     /// was handed to quinn's own send-scheduling machinery, not that it
@@ -862,19 +951,13 @@ impl Session {
     /// background sender a bounded window before hard-closing the
     /// connection, mirrors the Erlang reference's own bounded-drain
     /// approach.
-    pub async fn close(mut self, reason: &str, detail: Option<&str>, identity: &KeyPair) {
-        crate::open_sessions::live().unregister(
-            self.identity,
-            self.station.node_id,
-            &self.connection,
-        );
+    pub async fn close(&self, reason: &str, detail: Option<&str>, identity: &KeyPair) {
         let goodbye = frame::sign(frame::goodbye(reason, detail), identity);
-        if let Ok(encoded) = frame::encode(&goodbye) {
-            let _ = self.control.send.write_all(&encoded).await;
-        }
-        let _ = self.control.send.finish();
+        self.inner.channel.close(&goodbye).await;
         tokio::time::sleep(Self::CLOSE_DRAIN).await;
-        self.connection.close(0u32.into(), reason.as_bytes());
+        self.inner
+            .connection
+            .close(0u32.into(), reason.as_bytes());
     }
 
     /// The supervised counterpart to the bare [`publish`](Self::publish)
@@ -895,11 +978,11 @@ impl Session {
     /// real cancellation in Rust; Erlang has to simulate that by killing a
     /// worker process.
     pub async fn run_publisher(
-        &mut self,
+        &self,
         spec: &frame::PublishSpec,
         identity: &KeyPair,
         announce: bool,
-    ) -> Result<(), SendFrameError> {
+    ) -> Result<(), SendError> {
         let publish_id: [u8; 16] = rand::random();
         if announce {
             let payload = Value::Map(vec![])
@@ -941,22 +1024,17 @@ impl Session {
         result
     }
 
-    /// The supervised counterpart to the bare
-    /// [`subscribe`](Self::subscribe)/[`recv_event`](Self::recv_event)
-    /// primitives, matching `macula_subscriber.erl` in spirit: subscribes
-    /// once, then dispatches every inbound EVENT to `handler` until `stop`
-    /// resolves. Unsubscribes on return, including on cancellation.
+    /// The supervised counterpart to a bare [`Subscription`], matching
+    /// `macula_subscriber.erl` in spirit: subscribes once, then hands every
+    /// matching EVENT to `handler` until `stop` resolves, instead of
+    /// requiring the caller to hand-roll a receive loop. Closes the
+    /// subscription on return, including on cancellation, which sends
+    /// UNSUBSCRIBE when no other subscription on the session holds that
+    /// realm and topic. Other frames on the session never reach this loop:
+    /// the session's reader routes each one to whatever waits for it.
     ///
-    /// Mirrors [`serve_one_call`](Self::serve_one_call)'s own frame loop,
-    /// not [`recv_event`](Self::recv_event): a shared control stream can
-    /// carry other frame types between one EVENT and the next, so a
-    /// wrong-frame-type parse failure is skipped and polling continues,
-    /// exactly like `serve_one_call` skips a non-"call" frame — it is NOT
-    /// treated as fatal the way `recv_event`'s own contract treats any
-    /// parse failure. Confirmed live in the Go port of this exact pattern
-    /// (`macula-go`'s `Session.RunSubscriber`): without this, a single
-    /// non-EVENT frame arriving on the control stream aborted the whole
-    /// subscriber loop.
+    /// Returns an error when the subscription falls behind
+    /// ([`RecvEventError::Overflow`]) or the session ends.
     ///
     /// No OTP pid to address a running subscriber by; `stop` plays that
     /// role — matches [`keep_advertised`](Self::keep_advertised)'s own
@@ -965,7 +1043,7 @@ impl Session {
     /// already established, where `on_error` can only report, not halt;
     /// stopping is always external, via `stop`.
     pub async fn run_subscriber<F>(
-        &mut self,
+        &self,
         spec: &frame::SubscribeSpec,
         identity: &KeyPair,
         stop: F,
@@ -974,7 +1052,8 @@ impl Session {
     where
         F: std::future::Future<Output = ()>,
     {
-        self.subscribe(spec, identity)
+        let mut subscription = self
+            .subscribe(spec, identity)
             .await
             .map_err(RunSubscriberError::Subscribe)?;
 
@@ -982,29 +1061,23 @@ impl Session {
         let result = loop {
             tokio::select! {
                 _ = &mut stop => break Ok(()),
-                frame_result = self.control.recv_frame() => {
-                    let value = match frame_result {
-                        Ok(v) => v,
-                        Err(e) => break Err(RunSubscriberError::Recv(e)),
-                    };
-                    let Ok(evt) = frame::parse_event(&value) else {
-                        continue; // not ours -- see this method's doc on the limitation
-                    };
-                    handler(evt);
-                }
+                received = subscription.recv_event(SUBSCRIBER_POLL_INTERVAL) => match received {
+                    Ok(event) => handler(event),
+                    Err(RecvEventError::Timeout) => {}
+                    Err(e) => break Err(RunSubscriberError::Recv(e)),
+                },
             }
         };
 
-        let _ = self
-            .unsubscribe(
-                &frame::UnsubscribeSpec::new(spec.topic.clone(), spec.realm, spec.subscriber),
-                identity,
-            )
-            .await;
-
+        subscription.close().await;
         result
     }
 }
+
+/// How long [`Session::run_subscriber`] waits on its subscription at a
+/// time. Not a wire timeout: nothing is sent when it runs out, the loop just
+/// waits again.
+const SUBSCRIBER_POLL_INTERVAL: Duration = Duration::from_secs(3600);
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1013,82 +1086,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[derive(Debug)]
-pub enum RecvEventError {
-    Recv(RecvFrameError),
-    Parse(frame::ParseEventError),
-}
-
-impl std::fmt::Display for RecvEventError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RecvEventError::Recv(e) => write!(f, "{e}"),
-            RecvEventError::Parse(e) => write!(f, "expected an EVENT frame: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for RecvEventError {}
-
-#[derive(Debug)]
-pub enum ServeCallError {
-    Recv(RecvFrameError),
-    Send(SendFrameError),
-    /// No inbound CALL arrived within the requested timeout.
-    Timeout,
-}
-
-impl std::fmt::Display for ServeCallError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServeCallError::Recv(e) => write!(f, "{e}"),
-            ServeCallError::Send(e) => write!(f, "sending the reply: {e}"),
-            ServeCallError::Timeout => write!(f, "timed out waiting for an inbound CALL"),
-        }
-    }
-}
-
-impl std::error::Error for ServeCallError {}
-
-/// Errors from [`Session::run_subscriber`].
-#[derive(Debug)]
-pub enum RunSubscriberError {
-    Subscribe(SendFrameError),
-    Recv(RecvFrameError),
-}
-
-impl std::fmt::Display for RunSubscriberError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunSubscriberError::Subscribe(e) => write!(f, "subscribing: {e}"),
-            RunSubscriberError::Recv(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl std::error::Error for RunSubscriberError {}
-
-/// Build the RESULT/ERROR reply for one inbound CALL — mirrors
-/// `macula_station_link.erl`'s `handle_inbound_call/2` +
-/// `safe_invoke_handler/4` exactly: `policy` is checked FIRST (a
-/// rejection is BOLT#4 `unauthorized`, and `lookup`/a handler never run
-/// at all); then a lookup miss is `unknown_next_peer`; the handler
-/// running to completion produces a RESULT (`Ok`) or `unknown_error` with
-/// `detail` (`Err`); a handler panic — caught via `tokio::spawn`, the
-/// same "one transient task per call" shape the reference's own "one
-/// process per call" uses — is `temporary_relay_failure`, with no
-/// `detail`, matching the reference not sending one on a crash either.
 // RPC telemetry auto-facts, matching `macula_request.erl` (caller side:
 // rpc.sent_v1/rpc.completed_v1) and `macula_response.erl` (provider side:
 // rpc.received_v1/rpc.replied_v1) exactly -- same topic names, same
 // `request_id` field (16 fresh random bytes per call, independent of the
 // wire CALL frame's own `call_id` -- the reference tracks its own request
 // lifecycle separately from the wire frame, and this does too), same realm
-// as the call itself, fire-and-forget (a fact-publish failure here never
-// fails the underlying `call`/`serve_one_call_gated`, matching
-// `macula_response.erl`'s own `_ = macula:publish(...), ok` and
-// `macula_request.erl`'s identical `publish/5` helper -- same pattern this
-// crate's own `run_publisher` already uses for its pubsub facts).
+// as the call itself, fire-and-forget: each fact goes to the session's own
+// writer, so it never costs the call or serve it describes any time and
+// never fails it, matching `macula_response.erl`'s own
+// `_ = macula:publish(...), ok` and `macula_request.erl`'s identical
+// `publish/5` helper. A fact is dropped when 64 frames already wait for that
+// writer.
 //
 // Always on, matching the reference's ACTUAL behavior on each side, not
 // just a blanket claim -- checked directly rather than assumed:
@@ -1113,14 +1122,10 @@ fn request_id_payload(request_id: [u8; 16]) -> Value {
     Value::Map(vec![]).with_field("request_id", Value::Bytes(request_id.to_vec()))
 }
 
-async fn announce_fact(
-    session: &mut Session,
-    realm: [u8; 32],
-    identity: &KeyPair,
-    topic: &str,
-    payload: Value,
-) {
-    let fact = frame::PublishSpec::new(
+/// A fact's PUBLISH, carrying its `publisher_sig`; the session's own writer
+/// signs the envelope when it sends it.
+fn rpc_fact(topic: &str, realm: [u8; 32], identity: &KeyPair, payload: Value) -> Value {
+    let spec = frame::PublishSpec::new(
         topic,
         realm,
         identity.node_id(),
@@ -1128,23 +1133,7 @@ async fn announce_fact(
         payload,
         now_ms(),
     );
-    let _ = session.publish(&fact, identity).await;
-}
-
-async fn announce_rpc_sent(
-    session: &mut Session,
-    realm: [u8; 32],
-    identity: &KeyPair,
-    request_id: [u8; 16],
-) {
-    announce_fact(
-        session,
-        realm,
-        identity,
-        RPC_SENT_TOPIC,
-        request_id_payload(request_id),
-    )
-    .await;
+    frame::sign_publisher(frame::publish(&spec), identity)
 }
 
 /// Matches `macula_request.erl`'s `outcome_fields/2`: `completed` (no Rust
@@ -1154,13 +1143,12 @@ async fn announce_rpc_sent(
 /// `call` has no cancellation concept independent of an ordinary
 /// error/timeout at this layer, so that outcome is not reachable here and
 /// is not fabricated (same reasoning Go's port already documented).
-async fn announce_rpc_completed(
-    session: &mut Session,
+fn rpc_completed(
     realm: [u8; 32],
     identity: &KeyPair,
     request_id: [u8; 16],
     result: &Result<frame::CallResponse, CallError>,
-) {
+) -> Value {
     let payload = request_id_payload(request_id);
     let payload = match result {
         Err(e) => payload
@@ -1173,23 +1161,7 @@ async fn announce_rpc_completed(
             payload.with_field("outcome", Value::text("completed"))
         }
     };
-    announce_fact(session, realm, identity, RPC_COMPLETED_TOPIC, payload).await;
-}
-
-async fn announce_rpc_received(
-    session: &mut Session,
-    realm: [u8; 32],
-    identity: &KeyPair,
-    request_id: [u8; 16],
-) {
-    announce_fact(
-        session,
-        realm,
-        identity,
-        RPC_RECEIVED_TOPIC,
-        request_id_payload(request_id),
-    )
-    .await;
+    rpc_fact(RPC_COMPLETED_TOPIC, realm, identity, payload)
 }
 
 /// Matches `macula_response.erl`'s `outcome_fields/2`: `replied` (`{ok,
@@ -1198,13 +1170,12 @@ async fn announce_rpc_received(
 /// crashing `Module:handle_request/2` crashes the whole per-request child
 /// before its own `publish_replied/2` call is ever reached, so
 /// `REQUEST_REPLIED` is never published for a crash there either.
-async fn announce_rpc_replied(
-    session: &mut Session,
+fn rpc_replied(
     realm: [u8; 32],
     identity: &KeyPair,
     request_id: [u8; 16],
     handler_err: Option<&str>,
-) {
+) -> Value {
     let payload = request_id_payload(request_id);
     let payload = match handler_err {
         Some(reason) => payload
@@ -1212,55 +1183,35 @@ async fn announce_rpc_replied(
             .with_field("reason", Value::text(reason)),
         None => payload.with_field("outcome", Value::text("replied")),
     };
-    announce_fact(session, realm, identity, RPC_REPLIED_TOPIC, payload).await;
+    rpc_fact(RPC_REPLIED_TOPIC, realm, identity, payload)
 }
 
-/// The reply to one inbound frame, or `None` when there is nothing to
-/// answer: the frame isn't a CALL, or its signature doesn't verify against
-/// the `caller` it names. Mirrors `macula_station_link.erl`'s
-/// `on_inbound_call/3`: a CALL that isn't signed by the caller it names
-/// never reaches policy or a handler, and gets no reply. Otherwise
-/// [`build_call_reply`].
-async fn reply_to_frame<L, P>(
-    value: &Value,
-    lookup: &L,
-    policy: &P,
-    identity: &KeyPair,
-    session: Option<&mut Session>,
-) -> Option<Value>
-where
-    L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
-    P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
-{
-    let call_info = frame::parse_call(value).ok()?;
-    frame::verify(value, &call_info.caller).ok()?;
-    Some(build_call_reply(call_info, lookup, policy, identity, session).await)
-}
-
-/// Fires `rpc.received_v1`/`rpc.replied_v1` around dispatch when `session`
-/// is `Some` -- `None` for the pure dispatch-logic unit tests in
-/// `ucan_gating_tests` below, which deliberately exercise this function
-/// with no network at all (mirrors `macula-go`'s identical
+/// Build the RESULT/ERROR reply for one inbound CALL — mirrors
+/// `macula_station_link.erl`'s `handle_inbound_call/2` +
+/// `safe_invoke_handler/4` exactly: `policy` is checked FIRST (a
+/// rejection is BOLT#4 `unauthorized`, and `lookup`/a handler never run
+/// at all); then a lookup miss is `unknown_next_peer`; the handler
+/// running to completion produces a RESULT (`Ok`) or `unknown_error` with
+/// `detail` (`Err`); a handler panic — caught via `tokio::spawn`, the
+/// same "one transient task per call" shape the reference's own "one
+/// process per call" uses — is `temporary_relay_failure`, with no
+/// `detail`, matching the reference not sending one on a crash either.
+///
+/// Announces `rpc.received_v1`/`rpc.replied_v1` around dispatch through
+/// `session`'s own writer when `session` is `Some` -- `None` for the pure
+/// dispatch-logic unit tests below, which deliberately exercise this
+/// function with no network at all (mirrors `macula-go`'s identical
 /// nil-session-safe `announceFact`). `rpc.received_v1` fires only after
 /// `policy` and `lookup` both pass, matching `macula_response.erl`'s own
 /// per-request child only starting once the raw advertise mechanism
 /// already decided to dispatch to a real handler -- a UCAN-rejected or
 /// unadvertised-procedure CALL announces neither fact.
-///
-/// `#[allow(needless_option_as_deref)]`: the lint is right that
-/// `Option<&mut Session>::as_deref_mut()`'s RETURN type is identical to
-/// its input type, but wrong that the call is needless here -- three
-/// separate call sites below each need their own short-lived reborrow
-/// from the same `session` local; using `session` directly at any one of
-/// them would move it out for the rest of the function, breaking the
-/// other two.
-#[allow(clippy::needless_option_as_deref)]
-async fn build_call_reply<L, P>(
+pub(crate) async fn build_call_reply<L, P>(
     call_info: frame::CallInfo,
     lookup: &L,
     policy: &P,
     identity: &KeyPair,
-    mut session: Option<&mut Session>,
+    session: Option<&Session>,
 ) -> Value
 where
     L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
@@ -1288,22 +1239,35 @@ where
     };
 
     let request_id: [u8; 16] = rand::random();
-    if let Some(s) = session.as_deref_mut() {
-        announce_rpc_received(s, call_info.realm, identity, request_id).await;
+    if let Some(session) = session {
+        session.inner.channel.hand_off(rpc_fact(
+            RPC_RECEIVED_TOPIC,
+            call_info.realm,
+            identity,
+            request_id_payload(request_id),
+        ));
     }
 
     let payload = call_info.payload;
     let outcome = tokio::spawn(async move { handler(payload).await }).await;
     match outcome {
         Ok(Ok(value)) => {
-            if let Some(s) = session.as_deref_mut() {
-                announce_rpc_replied(s, call_info.realm, identity, request_id, None).await;
+            if let Some(session) = session {
+                session
+                    .inner
+                    .channel
+                    .hand_off(rpc_replied(call_info.realm, identity, request_id, None));
             }
             frame::result(&frame::ResultSpec::new(call_info.call_id, value, self_pub))
         }
         Ok(Err(reason)) => {
-            if let Some(s) = session.as_deref_mut() {
-                announce_rpc_replied(s, call_info.realm, identity, request_id, Some(&reason)).await;
+            if let Some(session) = session {
+                session.inner.channel.hand_off(rpc_replied(
+                    call_info.realm,
+                    identity,
+                    request_id,
+                    Some(&reason),
+                ));
             }
             let mut spec =
                 frame::CallErrorSpec::new(call_info.call_id, bolt4::Code::UnknownError, self_pub);
@@ -1325,8 +1289,6 @@ mod ucan_gating_tests {
     //! `(CallInfo, lookup, policy, self_pub)`, so its dispatch/reply logic
     //! is fully testable in isolation. Mirrors `macula-go`'s own 4
     //! connection-level UCAN-gating unit tests (`serve_ucan_test.go`).
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
     use crate::identity::KeyPair;
     use crate::ucan::{self, Policy};
@@ -1447,22 +1409,11 @@ mod ucan_gating_tests {
         ));
     }
 
-    // The provider side of an inbound CALL: a CALL reaches policy and a
-    // handler only when its signature verifies against the caller it names,
-    // and a gated policy accepts a token only from the caller it was minted
-    // for. The names match macula-go's connection/serve_caller_test.go; the
-    // behaviour matches macula_station_link.erl's on_inbound_call/3.
-
-    fn call_frame(named_caller: &KeyPair) -> Value {
-        frame::call(&frame::CallSpec::new(
-            [3; 16],
-            "test.proc",
-            [0; 32],
-            Value::text("hello"),
-            0,
-            named_caller.node_id(),
-        ))
-    }
+    // The provider side of an inbound CALL: a gated policy accepts a token
+    // only from the caller it was minted for. The names match macula-go's
+    // connection/serve_caller_test.go. That a CALL reaches serving only when
+    // its signature verifies against the caller it names is checked by the
+    // session's reader; see control_channel.rs.
 
     fn call_info_from(caller: [u8; 32], ucan_token: Vec<u8>) -> frame::CallInfo {
         frame::CallInfo {
@@ -1482,101 +1433,11 @@ mod ucan_gating_tests {
         .unwrap()
     }
 
-    /// An echo handler that counts how often it ran.
-    fn counting_lookup(
-        invocations: Arc<AtomicUsize>,
-    ) -> impl Fn(&[u8; 32], &str) -> Option<CallHandler> {
-        move |_, _| {
-            let invocations = invocations.clone();
-            Some(Arc::new(move |payload: Value| {
-                invocations.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move { Ok(payload) })
-            }))
-        }
-    }
-
     fn is_unauthorized(reply: &Value) -> bool {
         matches!(
             frame::parse_call_response(reply),
             Ok(frame::CallResponse::Error { code, .. }) if code == bolt4::Code::Unauthorized as u8
         )
-    }
-
-    #[tokio::test]
-    async fn reply_to_frame_ignores_a_call_not_signed_by_its_caller() {
-        let (named, signer) = (KeyPair::generate(), KeyPair::generate());
-        let invocations = Arc::new(AtomicUsize::new(0));
-
-        let reply = reply_to_frame(
-            &frame::sign(call_frame(&named), &signer),
-            &counting_lookup(invocations.clone()),
-            &|_, _| Policy::open(),
-            &KeyPair::generate(),
-            None,
-        )
-        .await;
-
-        assert!(reply.is_none(), "{reply:?}");
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn reply_to_frame_ignores_an_unsigned_call() {
-        let invocations = Arc::new(AtomicUsize::new(0));
-
-        let reply = reply_to_frame(
-            &call_frame(&KeyPair::generate()),
-            &counting_lookup(invocations.clone()),
-            &|_, _| Policy::open(),
-            &KeyPair::generate(),
-            None,
-        )
-        .await;
-
-        assert!(reply.is_none(), "{reply:?}");
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn reply_to_frame_answers_a_call_signed_by_its_caller() {
-        let caller = KeyPair::generate();
-        let invocations = Arc::new(AtomicUsize::new(0));
-
-        let reply = reply_to_frame(
-            &frame::sign(call_frame(&caller), &caller),
-            &counting_lookup(invocations.clone()),
-            &|_, _| Policy::open(),
-            &KeyPair::generate(),
-            None,
-        )
-        .await
-        .expect("a CALL signed by its caller is answered");
-
-        assert!(matches!(
-            frame::parse_call_response(&reply),
-            Ok(frame::CallResponse::Result { .. })
-        ));
-        assert_eq!(invocations.load(Ordering::SeqCst), 1);
-    }
-
-    /// A `CallInfo` always carries a 32-byte caller, so a CALL without one
-    /// can't reach the policy at all: the frame itself is dropped.
-    #[tokio::test]
-    async fn reply_to_frame_ignores_a_call_without_caller() {
-        let caller = KeyPair::generate();
-        let invocations = Arc::new(AtomicUsize::new(0));
-
-        let reply = reply_to_frame(
-            &frame::sign(call_frame(&caller).without(&["caller"]), &caller),
-            &counting_lookup(invocations.clone()),
-            &|_, _| Policy::open(),
-            &KeyPair::generate(),
-            None,
-        )
-        .await;
-
-        assert!(reply.is_none(), "{reply:?}");
-        assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

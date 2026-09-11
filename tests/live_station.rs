@@ -185,7 +185,7 @@ async fn unhardened_identity_against_the_real_fleet_is_observed_not_assumed() {
 #[ignore = "requires network access to a live macula-station"]
 async fn call_round_trip_against_the_real_fleet() {
     let identity = KeyPair::generate_with_default_puzzle();
-    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+    let session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
         .await
         .expect("handshake should succeed");
 
@@ -241,7 +241,7 @@ fn now_ms() -> u64 {
 #[ignore = "requires network access to a live macula-station"]
 async fn pubsub_round_trip_against_the_real_fleet() {
     let identity = KeyPair::generate_with_default_puzzle();
-    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+    let session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
         .await
         .expect("handshake should succeed");
 
@@ -252,7 +252,7 @@ async fn pubsub_round_trip_against_the_real_fleet() {
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    session
+    let mut subscription = session
         .subscribe(
             &macula_rust::frame::SubscribeSpec::new(topic.clone(), realm, identity.node_id()),
             &identity,
@@ -275,7 +275,7 @@ async fn pubsub_round_trip_against_the_real_fleet() {
         .await
         .expect("PUBLISH should send without error");
 
-    match session.recv_event(std::time::Duration::from_secs(5)).await {
+    match subscription.recv_event(std::time::Duration::from_secs(5)).await {
         Ok(event) => {
             println!(
                 "OBSERVED: received our own EVENT back — topic={} seq={} delivered_via={} payload={:?}",
@@ -320,10 +320,10 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     // Independent watcher, subscribed to the fact topic BEFORE anything
     // publishes -- pubsub has no replay for a late subscriber.
     let watcher_id = KeyPair::generate_with_default_puzzle();
-    let mut watcher = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_id)
+    let watcher = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_id)
         .await
         .expect("watcher handshake should succeed");
-    watcher
+    let mut watcher_subscription = watcher
         .subscribe(
             &macula_rust::frame::SubscribeSpec::new(
                 "pubsub.publish_completed_v1",
@@ -336,7 +336,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
         .expect("watcher SUBSCRIBE should send without error");
 
     let sub_id = KeyPair::generate_with_default_puzzle();
-    let mut sub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_id)
+    let sub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_id)
         .await
         .expect("subscriber handshake should succeed");
 
@@ -356,7 +356,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let pub_id = KeyPair::generate_with_default_puzzle();
-    let mut pub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &pub_id)
+    let pub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &pub_id)
         .await
         .expect("publisher handshake should succeed");
     let spec = macula_rust::frame::PublishSpec::new(
@@ -400,17 +400,16 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
     );
     println!("OBSERVED: run_subscriber returned cleanly after its stop future resolved");
 
-    // recv_event's own contract treats any non-EVENT/wrong-topic frame as
-    // an error, not something to skip -- correct for a caller expecting
-    // exactly one specific thing, but this is a SHARED PUBLIC demo fleet
-    // with other real traffic on the wire, so a single call can genuinely
-    // catch something unrelated first. Retry past that within an overall
-    // deadline, same resilience macula-go's RPC-telemetry-facts test
-    // needed for the identical reason.
+    // The watcher's subscription only receives events for its own topic, under
+    // a realm nobody else uses; wait within an overall deadline for the fact
+    // to arrive.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut confirmed = false;
     while std::time::Instant::now() < deadline {
-        match watcher.recv_event(std::time::Duration::from_secs(2)).await {
+        match watcher_subscription
+            .recv_event(std::time::Duration::from_secs(2))
+            .await
+        {
             Ok(evt) if evt.topic == "pubsub.publish_completed_v1" => {
                 let outcome = evt.payload.get("outcome");
                 println!(
@@ -427,7 +426,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
                 );
             }
             Err(e) => {
-                println!("(watcher skipping a non-event frame or timeout: {e})");
+                println!("(watcher still waiting: {e})");
             }
         }
     }
@@ -460,7 +459,7 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
 #[ignore = "requires network access to a live macula-station"]
 async fn publish_survives_immediate_close_against_the_real_fleet() {
     let sub_identity = KeyPair::generate_with_default_puzzle();
-    let mut sub_session =
+    let sub_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_identity)
             .await
             .expect("handshake should succeed (subscriber)");
@@ -471,7 +470,7 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    sub_session
+    let mut subscription = sub_session
         .subscribe(
             &macula_rust::frame::SubscribeSpec::new(topic.clone(), realm, sub_identity.node_id()),
             &sub_identity,
@@ -488,7 +487,7 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
     // CLI/tool invocation uses.
     {
         let pub_identity = KeyPair::generate_with_default_puzzle();
-        let mut pub_session =
+        let pub_session =
             connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &pub_identity)
                 .await
                 .expect("handshake should succeed (publisher)");
@@ -511,10 +510,8 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
         pub_session.close("normal", None, &pub_identity).await;
     }
 
-    // Loop, not a single recv_event call: this is a real, shared, busy
-    // station, and unrelated live traffic interleaving on the control
-    // stream is expected, not a sign the race this test guards against
-    // has resurfaced.
+    // The subscription only receives events for its own topic, so the first
+    // one within the deadline is the EVENT this test waits for.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -523,16 +520,16 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
             "EVENT for our topic never arrived after a publish immediately followed by close \
              (this is the exact race this test exists to catch)"
         );
-        match sub_session.recv_event(remaining).await {
+        match subscription.recv_event(remaining).await {
             Ok(event) if event.topic == topic => break,
-            Ok(event) => println!("skipping unrelated live EVENT: topic={}", event.topic),
-            Err(connection::RecvEventError::Recv(connection::RecvFrameError::Timeout)) => {
+            Ok(event) => println!("skipping an unrelated EVENT: topic={}", event.topic),
+            Err(connection::RecvEventError::Timeout) => {
                 panic!(
                     "EVENT for our topic never arrived after a publish immediately followed by \
                      close (this is the exact race this test exists to catch)"
                 );
             }
-            Err(e) => println!("skipping a non-EVENT frame on this shared, busy station: {e}"),
+            Err(e) => panic!("the subscription ended before the EVENT arrived: {e}"),
         }
     }
 
@@ -550,12 +547,12 @@ async fn publish_survives_immediate_close_against_the_real_fleet() {
 #[ignore = "requires network access to a live macula-station"]
 async fn single_block_put_get_round_trip_against_the_real_fleet() {
     let identity = KeyPair::generate_with_default_puzzle();
-    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+    let session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
         .await
         .expect("handshake should succeed");
 
     let data: Vec<u8> = (0..4096).map(|_| rand::random::<u8>()).collect();
-    let mcid = macula_rust::content::put(&mut session, &data, "test-block", &identity)
+    let mcid = macula_rust::content::put(&session, &data, "test-block", &identity)
         .await
         .expect("put should succeed");
     assert!(
@@ -567,7 +564,7 @@ async fn single_block_put_get_round_trip_against_the_real_fleet() {
         hex::encode(mcid)
     );
 
-    let fetched = macula_rust::content::get(&mut session, mcid, &identity)
+    let fetched = macula_rust::content::get(&session, mcid, &identity)
         .await
         .expect("get should succeed for content this session just put");
     assert_eq!(
@@ -591,13 +588,13 @@ async fn single_block_put_get_round_trip_against_the_real_fleet() {
 #[ignore = "requires network access to a live macula-station"]
 async fn chunked_put_get_round_trip_against_the_real_fleet() {
     let identity = KeyPair::generate_with_default_puzzle();
-    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+    let session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
         .await
         .expect("handshake should succeed");
 
     let size = macula_rust::manifest::DEFAULT_CHUNK_SIZE * 2 + 12_345;
     let data: Vec<u8> = (0..size).map(|_| rand::random::<u8>()).collect();
-    let mcid = macula_rust::content::put(&mut session, &data, "test-chunked", &identity)
+    let mcid = macula_rust::content::put(&session, &data, "test-chunked", &identity)
         .await
         .expect("chunked put should succeed");
     assert!(
@@ -609,7 +606,7 @@ async fn chunked_put_get_round_trip_against_the_real_fleet() {
         hex::encode(mcid)
     );
 
-    let fetched = macula_rust::content::get(&mut session, mcid, &identity)
+    let fetched = macula_rust::content::get(&session, mcid, &identity)
         .await
         .expect("chunked get should succeed for content this session just put");
     assert_eq!(
@@ -629,14 +626,14 @@ async fn chunked_put_get_round_trip_against_the_real_fleet() {
 #[ignore = "requires network access to a live macula-station"]
 async fn get_of_an_unknown_block_reports_not_found_against_the_real_fleet() {
     let identity = KeyPair::generate_with_default_puzzle();
-    let mut session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
+    let session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &identity)
         .await
         .expect("handshake should succeed");
 
     let random_hash: [u8; 32] = rand::random();
     let mcid = macula_rust::manifest::block_mcid(&random_hash);
 
-    match macula_rust::content::get(&mut session, mcid, &identity).await {
+    match macula_rust::content::get(&session, mcid, &identity).await {
         Err(macula_rust::content::GetError::NotFound) => {
             println!("OBSERVED: not_found reported correctly for an unknown mcid");
         }
@@ -682,7 +679,7 @@ async fn client_stream_reply_round_trip_against_the_real_fleet() {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -690,7 +687,7 @@ async fn client_stream_reply_round_trip_against_the_real_fleet() {
     )
     .await
     .expect("provider handshake should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake should succeed");
@@ -717,7 +714,7 @@ async fn client_stream_reply_round_trip_against_the_real_fleet() {
 
     let accept_task = tokio::spawn(async move {
         let result = macula_rust::stream::StreamHandle::accept(
-            &mut provider_session,
+            &provider_session,
             std::time::Duration::from_secs(10),
         )
         .await;
@@ -725,7 +722,7 @@ async fn client_stream_reply_round_trip_against_the_real_fleet() {
     });
 
     let mut caller_handle = macula_rust::stream::StreamHandle::open(
-        &mut caller_session,
+        &caller_session,
         &procedure,
         realm,
         macula_rust::frame::StreamMode::ClientStream,
@@ -838,7 +835,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -846,7 +843,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
     )
     .await
     .expect("provider handshake should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake should succeed");
@@ -873,7 +870,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
 
     let accept_task = tokio::spawn(async move {
         let result = macula_rust::stream::StreamHandle::accept(
-            &mut provider_session,
+            &provider_session,
             std::time::Duration::from_secs(10),
         )
         .await;
@@ -881,7 +878,7 @@ async fn streaming_provider_round_trip_against_the_real_fleet() {
     });
 
     let mut caller_handle = macula_rust::stream::StreamHandle::open(
-        &mut caller_session,
+        &caller_session,
         &procedure,
         realm,
         macula_rust::frame::StreamMode::ServerStream,
@@ -962,7 +959,7 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -970,7 +967,7 @@ async fn unary_call_provider_round_trip_against_the_real_fleet() {
     )
     .await
     .expect("provider handshake should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake should succeed");
@@ -1103,7 +1100,7 @@ async fn unary_call_provider_round_trip_multi_thread_runtime() {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -1111,7 +1108,7 @@ async fn unary_call_provider_round_trip_multi_thread_runtime() {
     )
     .await
     .expect("provider handshake should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake should succeed");
@@ -1224,26 +1221,33 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
 
     // Watcher subscribes to all 4 topics BEFORE anything happens — pubsub
     // has no replay for a late subscriber.
-    let mut watcher =
+    let watcher =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_identity)
             .await
             .expect("watcher handshake should succeed");
+    let mut subscriptions = Vec::new();
     for topic in [
         "rpc.sent_v1",
         "rpc.completed_v1",
         "rpc.received_v1",
         "rpc.replied_v1",
     ] {
-        watcher
-            .subscribe(
-                &macula_rust::frame::SubscribeSpec::new(topic, realm, watcher_identity.node_id()),
-                &watcher_identity,
-            )
-            .await
-            .expect("watcher SUBSCRIBE should send without error");
+        subscriptions.push(
+            watcher
+                .subscribe(
+                    &macula_rust::frame::SubscribeSpec::new(
+                        topic,
+                        realm,
+                        watcher_identity.node_id(),
+                    ),
+                    &watcher_identity,
+                )
+                .await
+                .expect("watcher SUBSCRIBE should send without error"),
+        );
     }
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -1251,7 +1255,7 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
     )
     .await
     .expect("provider handshake should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake should succeed");
@@ -1335,20 +1339,19 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
     let mut seen = std::collections::HashSet::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while seen.len() < 4 && std::time::Instant::now() < deadline {
-        let Ok(value) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), watcher.recv_frame()).await
-        else {
-            continue;
-        };
-        let Ok(evt) = macula_rust::frame::parse_event(&value.expect("recv_frame should not error"))
-        else {
-            continue;
-        };
-        if seen.insert(evt.topic.clone()) {
-            println!(
-                "OBSERVED: {} fact landed with payload={:?}",
-                evt.topic, evt.payload
-            );
+        for subscription in subscriptions.iter_mut() {
+            let Ok(evt) = subscription
+                .recv_event(std::time::Duration::from_millis(250))
+                .await
+            else {
+                continue;
+            };
+            if seen.insert(evt.topic.clone()) {
+                println!(
+                    "OBSERVED: {} fact landed with payload={:?}",
+                    evt.topic, evt.payload
+                );
+            }
         }
     }
     assert_eq!(
@@ -1381,7 +1384,7 @@ async fn unary_call_provider_reports_unknown_next_peer_on_lookup_miss_against_th
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -1389,7 +1392,7 @@ async fn unary_call_provider_reports_unknown_next_peer_on_lookup_miss_against_th
     )
     .await
     .expect("provider handshake should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake should succeed");
@@ -1553,7 +1556,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -1561,7 +1564,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
     )
     .await
     .expect("provider handshake against Frankfurt should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(MILAN_HOST, MILAN_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake against Milan should succeed");
@@ -1589,7 +1592,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
 
     let accept_task = tokio::spawn(async move {
         let result = macula_rust::stream::StreamHandle::accept(
-            &mut provider_session,
+            &provider_session,
             std::time::Duration::from_secs(15),
         )
         .await;
@@ -1597,7 +1600,7 @@ async fn cross_station_streaming_round_trip_frankfurt_provider_milan_caller() {
     });
 
     let open_result = macula_rust::stream::StreamHandle::open(
-        &mut caller_session,
+        &caller_session,
         &procedure,
         realm,
         macula_rust::frame::StreamMode::Bidi,
@@ -1736,7 +1739,7 @@ async fn cross_station_unary_call_round_trip_frankfurt_provider_milan_caller() {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -1744,7 +1747,7 @@ async fn cross_station_unary_call_round_trip_frankfurt_provider_milan_caller() {
     )
     .await
     .expect("provider handshake against Frankfurt should succeed");
-    let mut caller_session =
+    let caller_session =
         connection::connect(MILAN_HOST, MILAN_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("caller handshake against Milan should succeed");
@@ -1865,7 +1868,7 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session =
+    let provider_session =
         connection::connect(MILAN_HOST, MILAN_PORT, Trust::WebPki, &provider_identity)
             .await
             .expect("provider handshake should succeed");
@@ -1873,7 +1876,7 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
     // does not need to be connected to the same station that ends up
     // serving the call. Dialing a DIFFERENT station than the provider's
     // own makes that claim meaningful rather than accidentally true.
-    let mut resolve_session =
+    let resolve_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("resolve-side handshake should succeed");
@@ -1885,7 +1888,7 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
     );
 
     macula_rust::direct_dial::advertise_direct(
-        &mut provider_session,
+        &provider_session,
         &provider_identity,
         realm,
         &procedure,
@@ -1924,7 +1927,7 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
 
     let payload = Value::Map(vec![(Value::text("n"), Value::Int(21))]);
     let response = macula_rust::direct_dial::call(
-        &mut resolve_session,
+        &resolve_session,
         &caller_identity,
         realm,
         &procedure,
@@ -1981,11 +1984,11 @@ async fn keep_advertised_direct_republishes_against_the_real_fleet() {
     let publisher_identity = KeyPair::generate_with_default_puzzle();
     let reader_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut reader_session =
+    let reader_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &reader_identity)
             .await
             .expect("reader handshake should succeed");
-    let mut loop_session = connection::connect(
+    let loop_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -2006,7 +2009,7 @@ async fn keep_advertised_direct_republishes_against_the_real_fleet() {
     let loop_procedure = procedure.clone();
     let loop_task = tokio::spawn(async move {
         macula_rust::direct_dial::keep_advertised_direct(
-            &mut loop_session,
+            &loop_session,
             &publisher_identity,
             realm,
             &loop_procedure,
@@ -2023,14 +2026,14 @@ async fn keep_advertised_direct_republishes_against_the_real_fleet() {
 
     // Give the first (immediate) tick time to land, then read it back.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let first = macula_rust::dht::find_record(&mut reader_session, &reader_identity, key)
+    let first = macula_rust::dht::find_record(&reader_session, &reader_identity, key)
         .await
         .expect("first tick should already be visible");
 
     // Wait past a second tick and confirm the record genuinely changed --
     // not a stale read of the same one.
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    let second = macula_rust::dht::find_record(&mut reader_session, &reader_identity, key)
+    let second = macula_rust::dht::find_record(&reader_session, &reader_identity, key)
         .await
         .expect("second tick should be visible");
     assert!(

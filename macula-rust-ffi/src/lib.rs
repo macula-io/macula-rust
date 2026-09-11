@@ -34,12 +34,11 @@
 //! `handler: impl FnMut`, neither of which crosses the UniFFI boundary,
 //! and a native long-lived receive loop fights mobile app-lifecycle
 //! management the same way a background timer does) — its full external
-//! behavior (subscribe once, receive resiliently, unsubscribe when done)
-//! is still achievable by composing the already-exposed
-//! [`FfiSession::subscribe`]/[`FfiSession::recv_event`]/
-//! [`FfiSession::unsubscribe`] on the foreign side, catching and retrying
-//! past a non-EVENT-frame error the way `run_subscriber` does internally
-//! — nothing is lost, only where that retry loop lives.
+//! behavior (subscribe once, receive until stopped, unsubscribe when done)
+//! is still achievable on the foreign side with [`FfiSession::subscribe`],
+//! [`FfiSubscription::recv_event`] in a loop that carries on past a
+//! timeout, and [`FfiSubscription::close`] — nothing is lost, only where
+//! that loop lives.
 //!
 //! [`FfiValue`] mirrors every variant [`macula_rust::cbor::Value`]
 //! has, including recursive list/map shapes (`Items`/`Fields`, via
@@ -843,12 +842,19 @@ impl FfiKeyPair {
 }
 
 /// A handshaked connection to a macula-station. Wraps
-/// [`macula_rust::connection::Session`] behind a mutex — UniFFI
-/// object methods take `&self`, but the wrapped methods need `&mut
-/// self`, so this crate's only job here is bridging that, not adding
-/// behavior.
+/// [`macula_rust::connection::Session`], a handle, behind a mutex that
+/// holds it until [`close`](Self::close). Each method works on a handle
+/// cloned out of it, so calls, subscriptions and serving on one session run
+/// at the same time.
 #[derive(uniffi::Object)]
 pub struct FfiSession(tokio::sync::Mutex<Option<macula_rust::connection::Session>>);
+
+impl FfiSession {
+    /// A handle to the session, cloned out so no lock is held while it works.
+    async fn session(&self) -> Result<macula_rust::connection::Session, FfiError> {
+        self.0.lock().await.clone().ok_or(FfiError::Closed)
+    }
+}
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiSession {
@@ -900,8 +906,8 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let deadline_ms = (now_ms() + timeout_ms) as i128;
 
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let response = session
             .call(
                 &procedure,
@@ -918,15 +924,10 @@ impl FfiSession {
         FfiCallResponse::try_from(response)
     }
 
-    /// The provider role's counterpart to [`call`](Self::call): block
-    /// for the next inbound CALL frame, bounded by `timeout_ms`, and
-    /// dispatch it to `handler` — see [`FfiCallHandler`].
-    ///
-    /// Same "control stream, one thing at a time" limitation
-    /// [`call`](Self::call) itself carries, and the same lock-holding
-    /// behavior [`accept_stream`](Self::accept_stream) already
-    /// documents: no other method on this `FfiSession` can run
-    /// concurrently while a call to this one is in flight.
+    /// The provider role's counterpart to [`call`](Self::call): wait for
+    /// the next inbound CALL, bounded by `timeout_ms`, and dispatch it to
+    /// `handler` — see [`FfiCallHandler`]. Calls, subscriptions and other
+    /// serving on this session carry on meanwhile.
     pub async fn serve_one_call(
         &self,
         handler: std::sync::Arc<dyn FfiCallHandler>,
@@ -952,8 +953,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let policy: macula_rust::ucan::Policy = policy.try_into()?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
 
         let lookup = move |realm: &[u8; 32], procedure: &str| {
             let handler = handler.clone();
@@ -996,7 +997,7 @@ impl FfiSession {
     /// Send a signed PUBLISH. Fire-and-forget — no reply is expected on
     /// the wire; a subscriber (this session included, if subscribed to
     /// the same topic/realm) receives it asynchronously via
-    /// [`recv_event`](Self::recv_event).
+    /// [`FfiSubscription::recv_event`].
     ///
     /// `seq` and `published_at_ms` are caller-supplied rather than
     /// tracked internally — unlike streaming RPC's per-stream counter,
@@ -1022,8 +1023,8 @@ impl FfiSession {
             payload.into(),
             published_at_ms,
         );
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         session
             .publish(&spec, &identity.0)
             .await
@@ -1032,43 +1033,29 @@ impl FfiSession {
             })
     }
 
-    /// Send a signed SUBSCRIBE. Fire-and-forget — deliveries arrive via
-    /// [`recv_event`](Self::recv_event).
+    /// Starts a subscription with its own queue of 256 events — see
+    /// [`macula_rust::connection::Session::subscribe`] for the topic rule.
+    /// Receive with [`FfiSubscription::recv_event`], and close it when done:
+    /// the session sends UNSUBSCRIBE once no other subscription on it holds
+    /// that realm and topic.
     pub async fn subscribe(
         &self,
         topic: String,
         realm: Vec<u8>,
         identity: &FfiKeyPair,
-    ) -> Result<(), FfiError> {
+    ) -> Result<std::sync::Arc<FfiSubscription>, FfiError> {
         let realm = to_32(realm)?;
         let spec = macula_rust::frame::SubscribeSpec::new(topic, realm, identity.0.node_id());
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        session
+        let session = self.session().await?;
+        let subscription = session
             .subscribe(&spec, &identity.0)
             .await
             .map_err(|e| FfiError::Send {
                 reason: e.to_string(),
-            })
-    }
-
-    /// Send a signed UNSUBSCRIBE. Fire-and-forget.
-    pub async fn unsubscribe(
-        &self,
-        topic: String,
-        realm: Vec<u8>,
-        identity: &FfiKeyPair,
-    ) -> Result<(), FfiError> {
-        let realm = to_32(realm)?;
-        let spec = macula_rust::frame::UnsubscribeSpec::new(topic, realm, identity.0.node_id());
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        session
-            .unsubscribe(&spec, &identity.0)
-            .await
-            .map_err(|e| FfiError::Send {
-                reason: e.to_string(),
-            })
+            })?;
+        Ok(std::sync::Arc::new(FfiSubscription(tokio::sync::Mutex::new(
+            Some(subscription),
+        ))))
     }
 
     /// Send a signed ADVERTISE (§6.9) — registers this session as the
@@ -1084,8 +1071,8 @@ impl FfiSession {
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
         let spec = macula_rust::frame::AdvertiseSpec::new(realm, procedure, identity.0.node_id());
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         session
             .advertise(&spec, &identity.0)
             .await
@@ -1103,8 +1090,8 @@ impl FfiSession {
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
         let spec = macula_rust::frame::UnadvertiseSpec::new(realm, procedure, identity.0.node_id());
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         session
             .unadvertise(&spec, &identity.0)
             .await
@@ -1130,8 +1117,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<FfiResolved, FfiError> {
         let realm = to_32(realm)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let resolved =
             macula_rust::direct_dial::resolve(session, &identity.0, realm, &procedure).await?;
         Ok(resolved.into())
@@ -1154,8 +1141,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<FfiCallResponse, FfiError> {
         let realm = to_32(realm)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let response = macula_rust::direct_dial::call(
             session,
             &identity.0,
@@ -1194,8 +1181,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         macula_rust::direct_dial::advertise_direct(
             session,
             &identity.0,
@@ -1221,8 +1208,8 @@ impl FfiSession {
     ) -> Result<FfiCallResponse, FfiError> {
         let realm = to_32(realm)?;
         let deadline_ms = (now_ms() + timeout_ms) as i128;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let response = session
             .call_with_ucan(
                 &procedure,
@@ -1267,8 +1254,8 @@ impl FfiSession {
             payload.into(),
             published_at_ms,
         );
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         session
             .run_publisher(&spec, &identity.0, announce)
             .await
@@ -1291,8 +1278,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<FfiResolved, FfiError> {
         let realm = to_32(realm)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let resolved = macula_rust::direct_dial::resolve_with_cert_chain(
             session,
             &identity.0,
@@ -1322,8 +1309,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<FfiCallResponse, FfiError> {
         let realm = to_32(realm)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let response = macula_rust::direct_dial::call_with_cert_chain(
             session,
             &identity.0,
@@ -1354,8 +1341,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<(), FfiError> {
         let realm = to_32(realm)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         macula_rust::direct_dial::advertise_direct_with_cert_chain(
             session,
             &identity.0,
@@ -1390,8 +1377,8 @@ impl FfiSession {
     ) -> Result<FfiOpenedDirectStream, FfiError> {
         let realm = to_32(realm)?;
         let deadline_ms = (now_ms() + timeout_ms) as i128;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let opened = macula_rust::direct_dial::open_stream_direct(
             session,
             &identity.0,
@@ -1429,8 +1416,8 @@ impl FfiSession {
     ) -> Result<FfiOpenedDirectStream, FfiError> {
         let realm = to_32(realm)?;
         let deadline_ms = (now_ms() + timeout_ms) as i128;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let opened = macula_rust::direct_dial::open_stream_direct_with_cert_chain(
             session,
             &identity.0,
@@ -1466,8 +1453,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<Vec<u8>, FfiError> {
         let station = to_32(station)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let mcid = macula_rust::direct_dial::put_direct(
             session,
             &identity.0,
@@ -1495,8 +1482,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<Vec<u8>, FfiError> {
         let mcid = to_mcid(mcid)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         macula_rust::direct_dial::get_direct(
             session,
             &identity.0,
@@ -1512,16 +1499,11 @@ impl FfiSession {
     /// Provider role: block for the next inbound STREAM_OPEN, bounded by
     /// `timeout_ms`. Only ever succeeds after
     /// [`advertise`](Self::advertise) has registered at least one
-    /// procedure — otherwise the station has nothing to route here.
-    ///
-    /// Holds this session's lock for as long as it waits: no other
-    /// method on this `FfiSession` can run concurrently while a call to
-    /// `accept_stream` is in flight, matching the core crate's own
-    /// `Session` (its control stream is single-owner by construction —
-    /// this isn't an extra restriction the FFI layer adds).
+    /// procedure — otherwise the station has nothing to route here. Other
+    /// methods on this `FfiSession` carry on while it waits.
     pub async fn accept_stream(&self, timeout_ms: u64) -> Result<FfiAcceptedStream, FfiError> {
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let (handle, info) = macula_rust::stream::StreamHandle::accept(
             session,
             std::time::Duration::from_millis(timeout_ms),
@@ -1536,22 +1518,6 @@ impl FfiSession {
         })
     }
 
-    /// Block for the next EVENT delivery, bounded by `timeout_ms`. Any
-    /// non-EVENT frame received first is an error, not silently skipped
-    /// — matches [`macula_rust::connection::Session::recv_event`]'s
-    /// own contract.
-    pub async fn recv_event(&self, timeout_ms: u64) -> Result<FfiEvent, FfiError> {
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let event = session
-            .recv_event(std::time::Duration::from_millis(timeout_ms))
-            .await
-            .map_err(|e| FfiError::Recv {
-                reason: e.to_string(),
-            })?;
-        FfiEvent::try_from(event)
-    }
-
     /// Store `data` under a content-address, returning its MCID (34
     /// bytes). `name` is attached to the manifest when `data` is large
     /// enough to be chunked; silently unused for a single block, which
@@ -1563,8 +1529,8 @@ impl FfiSession {
         name: String,
         identity: &FfiKeyPair,
     ) -> Result<Vec<u8>, FfiError> {
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let mcid = macula_rust::content::put(session, &data, name, &identity.0)
             .await
             .map_err(|e| FfiError::Content {
@@ -1580,8 +1546,8 @@ impl FfiSession {
         identity: &FfiKeyPair,
     ) -> Result<Vec<u8>, FfiError> {
         let mcid = to_mcid(mcid)?;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         macula_rust::content::get(session, mcid, &identity.0)
             .await
             .map_err(|e| FfiError::Content {
@@ -1605,8 +1571,8 @@ impl FfiSession {
     ) -> Result<FfiStream, FfiError> {
         let realm = to_32(realm)?;
         let deadline_ms = (now_ms() + timeout_ms) as i128;
-        let mut guard = self.0.lock().await;
-        let session = guard.as_mut().ok_or(FfiError::Closed)?;
+        let session = self.session().await?;
+        let session = &session;
         let handle = macula_rust::stream::StreamHandle::open(
             session,
             &procedure,
@@ -1628,6 +1594,40 @@ impl FfiSession {
         let mut guard = self.0.lock().await;
         if let Some(session) = guard.take() {
             session.close("normal", None, &identity.0).await;
+        }
+    }
+}
+
+/// One subscription on an [`FfiSession`] — wraps
+/// [`macula_rust::connection::Subscription`] behind a mutex, the way
+/// [`FfiStream`] wraps a stream. Created by [`FfiSession::subscribe`].
+#[derive(uniffi::Object)]
+pub struct FfiSubscription(tokio::sync::Mutex<Option<macula_rust::connection::Subscription>>);
+
+#[uniffi::export(async_runtime = "tokio")]
+impl FfiSubscription {
+    /// Waits up to `timeout_ms` for the next event on this subscription.
+    /// Fails with [`FfiError::Recv`] when none arrives in time, once the
+    /// subscription fell more than 256 events behind (after its queued
+    /// events), and once the session ended.
+    pub async fn recv_event(&self, timeout_ms: u64) -> Result<FfiEvent, FfiError> {
+        let mut guard = self.0.lock().await;
+        let subscription = guard.as_mut().ok_or(FfiError::Closed)?;
+        let event = subscription
+            .recv_event(std::time::Duration::from_millis(timeout_ms))
+            .await
+            .map_err(|e| FfiError::Recv {
+                reason: e.to_string(),
+            })?;
+        FfiEvent::try_from(event)
+    }
+
+    /// Ends the subscription, sending UNSUBSCRIBE when no other subscription
+    /// on the session holds its realm and topic. A no-op if already closed.
+    pub async fn close(&self) {
+        let subscription = self.0.lock().await.take();
+        if let Some(subscription) = subscription {
+            subscription.close().await;
         }
     }
 }

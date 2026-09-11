@@ -57,8 +57,9 @@ CLI, or WASM as any other Rust SDK.
 | Primitive | Caller | Provider | Notes |
 |---|---|---|---|
 | Handshake (CONNECT/HELLO) | ✅ | — | Ed25519 identity, S/Kademlia puzzle-hardened |
-| Unary RPC (CALL/RESULT/ERROR) | ✅ | ✅ | `Session::serve_one_call`, BOLT#4 error mapping live-verified |
-| PubSub (PUBLISH/SUBSCRIBE/EVENT) | ✅ | ✅ | A subscriber gets its own publish, verified live |
+| One session, many uses | ✅ | ✅ | `Session` is a cloneable handle with one reader: calls, subscriptions and serving on it run at the same time, and a slow consumer never stalls a call's reply |
+| Unary RPC (CALL/RESULT/ERROR) | ✅ | ✅ | `Session::serve_one_call`, BOLT#4 error mapping live-verified; a call that times out says whether its frame was sent |
+| PubSub (PUBLISH/SUBSCRIBE/EVENT) | ✅ | ✅ | `Session::subscribe` returns a `Subscription` with its own queue of 256 events; a subscriber gets its own publish, verified live |
 | Content transfer (single-block + chunked) | ✅ | ✅ | Content-addressed, BLAKE3/SHA-256 |
 | Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet; `ClientStream` mode's reply path is SDK-correct but currently blocked by a `macula-station` bug — see [Known limitations](#known-limitations) |
 | RPC advertise/unadvertise | ✅ | — | |
@@ -102,14 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,
         &provider_identity,
     )
     .await?;
-    let mut caller_session = connection::connect(
+    let caller_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,
@@ -148,10 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve_one_call(lookup, &provider_identity, Duration::from_secs(10))
             .await;
         // Close explicitly instead of letting provider_session drop when
-        // this task ends — see Session's own doc for why: there is no
-        // Drop impl, so a bare drop gives quinn's send-scheduling no
-        // guarantee the RESULT just sent actually reached the peer
-        // before the connection is torn down.
+        // this task ends — see Session's own doc for why: dropping the
+        // last handle closes the connection at once, which gives quinn's
+        // send-scheduling no guarantee the RESULT just sent actually
+        // reached the peer first.
         provider_session
             .close(
                 "normal",
@@ -413,9 +414,9 @@ traced directly to the Erlang SDK's source.
   it as an open, unconfirmed question. Root-caused: it was a test-harness
   bug, not a real difference between gated and plain serving. The failing
   harness spawned the provider's `Session` into a task that dropped it
-  the instant `serve_one_call`/`serve_one_call_gated` returned; `Session`
-  has no `Drop` impl, so the underlying QUIC connection can close before
-  the just-sent reply frame is actually flushed to the peer — the exact
+  the instant `serve_one_call`/`serve_one_call_gated` returned; dropping
+  the last `Session` handle closes the underlying QUIC connection, which
+  can happen before the just-sent reply frame is flushed to the peer — the exact
   same class of race already documented on [`Session::close`], just
   never hit by drop instead of an explicit close before now. Confirmed
   by direct A/B: 8/8 plain AND 8/8 gated calls succeeded once the

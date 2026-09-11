@@ -56,7 +56,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{ready, Future};
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -189,7 +188,7 @@ pub(crate) trait DhtLookups {
 
 /// The real lookups: DHT queries over `session`.
 struct Via<'a> {
-    session: &'a mut Session,
+    session: &'a Session,
     id: &'a KeyPair,
 }
 
@@ -675,7 +674,7 @@ pub(crate) async fn resolve_within<D: DhtLookups>(
 /// end up serving the call. The first candidate whose station endpoint
 /// resolves is returned.
 pub async fn resolve(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -713,7 +712,7 @@ fn trusted_advertisements(recs: &[Record]) -> (Vec<ProcedureCandidate>, ResolveE
 /// and names `expected_org` is trusted. Opt-in — [`resolve`] itself is
 /// unaffected and remains the right choice for unmanaged realms.
 pub async fn resolve_with_cert_chain(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -943,7 +942,7 @@ async fn dial_verified(
 /// Sends one CALL on a dialed session with whatever remains of the
 /// deadline, then closes the session.
 async fn call_then_close(
-    mut target: Session,
+    target: Session,
     remaining: Duration,
     id: &KeyPair,
     procedure: &str,
@@ -991,7 +990,7 @@ async fn call_then_close(
 /// the signed DHT chain resolved; a mismatch is
 /// [`CallError::TrustViolation`], and that candidate is skipped.
 pub async fn call(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1025,7 +1024,7 @@ pub async fn call(
 /// path, which cannot resolve a direct-dial-only advertisement to begin
 /// with.
 pub async fn call_with_ucan(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1065,7 +1064,7 @@ pub async fn call_with_ucan(
 /// authorization; [`call`] itself is unaffected.
 #[allow(clippy::too_many_arguments)]
 pub async fn call_with_cert_chain(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1131,7 +1130,7 @@ pub async fn call_with_cert_chain(
 /// replaced, so a long-lived server needs to call this again on its own
 /// schedule; see [`keep_advertised_direct`] for that loop.
 pub async fn advertise_direct(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1156,7 +1155,7 @@ pub async fn advertise_direct(
 /// [`resolve_with_cert_chain`]/[`call_with_cert_chain`] for the
 /// corresponding checks. Opt-in: plain [`advertise_direct`] is unaffected.
 pub async fn advertise_direct_with_cert_chain(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1186,7 +1185,7 @@ pub async fn advertise_direct_with_cert_chain(
 #[derive(Debug)]
 pub enum AdvertiseDirectError {
     /// The ordinary station-side ADVERTISE frame failed to send.
-    Advertise(connection::SendFrameError),
+    Advertise(connection::SendError),
     /// The ordinary ADVERTISE succeeded, but publishing the direct-dial
     /// DHT record failed — the procedure IS now reachable via ordinary
     /// advertise-gossip, just not via direct-dial resolution.
@@ -1233,7 +1232,7 @@ impl std::error::Error for AdvertiseDirectError {}
 /// into a synthetic struct would relocate the count, not reduce it.
 #[allow(clippy::too_many_arguments)]
 pub async fn keep_advertised_direct<F>(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1323,25 +1322,25 @@ async fn dial_and_verify(
 enum StationTarget {
     /// A session direct dial dialed for this request: closed after a content
     /// transfer, handed to the caller with a stream.
-    Dialed(Box<Session>),
-    /// The connection of a session this process already had open to the
-    /// station under the same identity. That session owns it, so it is
-    /// never closed here.
-    Reused(Arc<quinn::Connection>),
+    Dialed(Session),
+    /// A session this process already had open to the station under the
+    /// same identity. Its owner keeps it, so it is never closed here.
+    Reused(Session),
 }
 
 impl StationTarget {
     async fn open_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
         match self {
-            StationTarget::Dialed(session) => session.open_dedicated_stream().await,
-            StationTarget::Reused(shared) => connection::dedicated_stream_on(shared).await,
+            StationTarget::Dialed(session) | StationTarget::Reused(session) => {
+                session.open_dedicated_stream().await
+            }
         }
     }
 
     /// The session direct dial dialed for this request, if it dialed one.
     fn into_dialed(self) -> Option<Session> {
         match self {
-            StationTarget::Dialed(session) => Some(*session),
+            StationTarget::Dialed(session) => Some(session),
             StationTarget::Reused(_) => None,
         }
     }
@@ -1363,7 +1362,7 @@ async fn dial_target(
 ) -> Result<StationTarget, DialAndVerifyError> {
     dial_verified(resolved, id, timeout)
         .await
-        .map(|session| StationTarget::Dialed(Box::new(session)))
+        .map(StationTarget::Dialed)
 }
 
 /// The connection of a session this process already has open to `station`
@@ -1373,7 +1372,7 @@ async fn dial_target(
 fn open_session_to(id: &KeyPair, station: &[u8; 32]) -> Option<StationTarget> {
     open_sessions::live()
         .find(id.node_id(), *station)
-        .map(StationTarget::Reused)
+        .map(|open| StationTarget::Reused(Session::from_open(open)))
 }
 
 /// A stream [`open_stream_direct`] opened, and the session direct dial
@@ -1472,7 +1471,7 @@ async fn open_stream_on(
 /// says which: the caller owns and closes that session when it is set.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_stream_direct(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1506,7 +1505,7 @@ pub async fn open_stream_direct(
 /// unaffected.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_stream_direct_with_cert_chain(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     realm: [u8; 32],
     procedure: &str,
@@ -1594,7 +1593,7 @@ async fn put_then_release(
 /// endpoint lookup or dial, and the session stays open. Otherwise direct
 /// dial dials a session for the upload and closes it afterwards.
 pub async fn put_direct(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     station: [u8; 32],
     data: &[u8],
@@ -1759,7 +1758,7 @@ async fn get_then_release(
 /// FROM an already-announced provider is a perfectly ordinary leaf
 /// operation.
 pub async fn get_direct(
-    resolve_via: &mut Session,
+    resolve_via: &Session,
     id: &KeyPair,
     mcid: Mcid,
     timeout: Duration,
@@ -3296,7 +3295,7 @@ mod tests {
     #[test]
     fn public_direct_dial_futures_are_send() {
         fn assert_send<T: Send>(_: &T) {}
-        let _type_check_only = |session: &mut Session, id: &KeyPair, mode: StreamMode| {
+        let _type_check_only = |session: &Session, id: &KeyPair, mode: StreamMode| {
             assert_send(&super::resolve(session, id, REALM, PROCEDURE));
             assert_send(&super::resolve_with_cert_chain(
                 session, id, REALM, PROCEDURE, b"", ORG,

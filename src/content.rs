@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use crate::bolt4;
 use crate::cbor::Value;
-use crate::connection::{CallError, FrameStream, Session};
+use crate::connection::{FrameStream, Session, StreamCallError};
 use crate::identity::KeyPair;
 use crate::manifest::{self, Manifest, Mcid};
 
@@ -56,7 +56,7 @@ pub enum PutError {
     /// Opening the dedicated stream itself failed (e.g. the connection
     /// is already dead) — never got as far as making a call.
     OpenStream(quinn::ConnectionError),
-    Call(CallError),
+    Call(StreamCallError),
     /// The station rejected the call with a BOLT#4 ERROR.
     Remote {
         code: u8,
@@ -92,7 +92,7 @@ pub enum GetError {
     /// Opening the dedicated stream itself failed (e.g. the connection
     /// is already dead) — never got as far as making a call.
     OpenStream(quinn::ConnectionError),
-    Call(CallError),
+    Call(StreamCallError),
     Remote {
         code: u8,
         name: String,
@@ -136,7 +136,7 @@ impl std::error::Error for GetError {}
 /// matching `macula_content_transfer:put_single_block/3` — `name` is
 /// silently unused on that path, not an oversight.
 pub async fn put(
-    session: &mut Session,
+    session: &Session,
     data: &[u8],
     name: impl Into<String>,
     identity: &KeyPair,
@@ -177,7 +177,7 @@ pub(crate) async fn put_on(
 
 /// Fetch and verify the content addressed by `mcid`.
 pub async fn get(
-    session: &mut Session,
+    session: &Session,
     mcid: Mcid,
     identity: &KeyPair,
 ) -> Result<Vec<u8>, GetError> {
@@ -337,7 +337,7 @@ async fn call_with_retry(
     payload: Value,
     timeout: Duration,
     identity: &KeyPair,
-) -> Result<crate::frame::CallResponse, CallError> {
+) -> Result<crate::frame::CallResponse, StreamCallError> {
     let mut attempt = 0;
     loop {
         attempt += 1;

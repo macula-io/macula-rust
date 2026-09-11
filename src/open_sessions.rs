@@ -23,12 +23,6 @@ pub(crate) trait Live {
     fn is_live(&self) -> bool;
 }
 
-impl Live for quinn::Connection {
-    fn is_live(&self) -> bool {
-        self.close_reason().is_none()
-    }
-}
-
 /// An identity's node id and a station's node id.
 type Pair = ([u8; 32], [u8; 32]);
 
@@ -50,11 +44,22 @@ impl<C: Live> OpenSessions<C> {
             .insert((identity, station), Arc::downgrade(session));
     }
 
+    #[cfg(test)]
     pub(crate) fn unregister(&self, identity: [u8; 32], station: [u8; 32], session: &Arc<C>) {
+        self.unregister_pointer(identity, station, Arc::as_ptr(session));
+    }
+
+    /// [`unregister`](Self::unregister), for a session only a weak reference
+    /// is left to, such as one whose last handle is being dropped.
+    pub(crate) fn unregister_weak(&self, identity: [u8; 32], station: [u8; 32], session: &Weak<C>) {
+        self.unregister_pointer(identity, station, session.as_ptr());
+    }
+
+    fn unregister_pointer(&self, identity: [u8; 32], station: [u8; 32], session: *const C) {
         let mut open = self.lock();
         if open
             .get(&(identity, station))
-            .is_some_and(|held| std::ptr::eq(held.as_ptr(), Arc::as_ptr(session)))
+            .is_some_and(|held| std::ptr::eq(held.as_ptr(), session))
         {
             open.remove(&(identity, station));
         }
@@ -80,8 +85,8 @@ impl<C: Live> OpenSessions<C> {
 
 /// This process's open sessions, which every
 /// [`Session`](crate::connection::Session) registers with.
-pub(crate) fn live() -> &'static OpenSessions<quinn::Connection> {
-    static LIVE: OnceLock<OpenSessions<quinn::Connection>> = OnceLock::new();
+pub(crate) fn live() -> &'static OpenSessions<crate::connection::SessionInner> {
+    static LIVE: OnceLock<OpenSessions<crate::connection::SessionInner>> = OnceLock::new();
     LIVE.get_or_init(OpenSessions::default)
 }
 

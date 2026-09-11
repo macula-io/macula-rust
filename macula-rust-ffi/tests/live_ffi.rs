@@ -496,7 +496,7 @@ async fn run_publisher_facts_through_the_ffi_surface() {
     // against), so this test can only confirm AT LEAST ONE of each
     // landed, not that it was specifically ours -- an honest limit of
     // what's observable through the exposed API, not a gap in the test.
-    watcher
+    let started = watcher
         .subscribe(
             "pubsub.publish_started_v1".to_string(),
             realm.clone(),
@@ -504,7 +504,7 @@ async fn run_publisher_facts_through_the_ffi_surface() {
         )
         .await
         .expect("watcher subscribe (started)");
-    watcher
+    let completed = watcher
         .subscribe(
             "pubsub.publish_completed_v1".to_string(),
             realm.clone(),
@@ -534,33 +534,17 @@ async fn run_publisher_facts_through_the_ffi_surface() {
         .await
         .expect("run_publisher");
 
-    // The real published EVENT itself, plus the started/completed facts
-    // this run_publisher call auto-publishes, may arrive in any order and
-    // interleaved with other real traffic on this shared public fleet —
-    // drain a bounded batch and confirm both fact topics landed, mirroring
-    // the batch-drain correlation discipline the core crate's own RPC
-    // telemetry facts test already established for the identical reason.
-    // These two fixed topics are global on this shared public fleet, and
-    // real, unrelated traffic on them is common enough that a real run of
-    // this test drained dozens of non-matching frames before reaching its
-    // own -- 500 attempts, not a smaller round number, to leave real
-    // headroom rather than tuning to whatever backlog happened to exist
-    // at write time.
-    let mut saw_started = false;
-    let mut saw_completed = false;
-    for _ in 0..500 {
-        if saw_started && saw_completed {
-            break;
-        }
-        let Ok(event) = watcher.recv_event(3_000).await else {
-            continue;
-        };
-        match event.topic.as_str() {
-            t if t.ends_with("pubsub.publish_started_v1") => saw_started = true,
-            t if t.ends_with("pubsub.publish_completed_v1") => saw_completed = true,
-            _ => {}
-        }
-    }
+    // Each subscription receives only its own fact topic, so the first event
+    // on each is a fact of that kind. These topics are global on this shared
+    // public fleet, so the test confirms one of each landed, as noted above.
+    let saw_started = started.recv_event(10_000).await.is_ok_and(|event| {
+        event.topic.ends_with("pubsub.publish_started_v1")
+    });
+    let saw_completed = completed.recv_event(10_000).await.is_ok_and(|event| {
+        event.topic.ends_with("pubsub.publish_completed_v1")
+    });
+    started.close().await;
+    completed.close().await;
     assert!(saw_started, "pubsub.publish_started_v1 should have landed");
     assert!(
         saw_completed,
