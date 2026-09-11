@@ -43,8 +43,11 @@ usually touches both, but their version numbers don't move in lockstep.
   observed at all, where it used to report `ProcedureNotAdvertised` or
   `StationEndpointNotFound`. A `station_endpoint` lookup follows the same
   rule, reporting `StationEndpointNotFound` only when a lookup was
-  answered, and retries a lookup that fails within its budget. An
-  exhaustive `match` on `ResolveError` needs the new arm.
+  answered, and retries a lookup that fails within its budget. A record
+  that names no dialable address is looked up again too, and when it is
+  the latest answer the lookup reports the new
+  `ResolveError::MalformedStationEndpoint`. An exhaustive `match` on
+  `ResolveError` needs both new arms.
 - **Breaking: direct dial reuses a session this process already has open
   to the provider's station under the same identity.** A station keeps one
   connection per identity and closes the older one when a newer one

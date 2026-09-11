@@ -115,6 +115,10 @@ pub enum ResolveError {
     /// A `station_endpoint` record was found under the right key, but its
     /// signer didn't match the station it's supposed to describe.
     StationEndpointSignerMismatch,
+    /// The station's `station_endpoint` record verified but named no
+    /// dialable address, and it was the latest answer before the deadline.
+    /// Matches `macula_direct_dial`'s `malformed_station_endpoint`.
+    MalformedStationEndpoint,
     Dht(DhtError),
     /// [`resolve_with_cert_chain`] only: at least one candidate
     /// advertisement's envelope signature verified (otherwise
@@ -148,6 +152,10 @@ impl std::fmt::Display for ResolveError {
             ResolveError::StationEndpointSignerMismatch => {
                 write!(f, "direct_dial: station_endpoint signer mismatch")
             }
+            ResolveError::MalformedStationEndpoint => write!(
+                f,
+                "direct_dial: the station_endpoint record names no dialable address"
+            ),
             ResolveError::Dht(e) => write!(f, "direct_dial: {e}"),
             ResolveError::NoAuthorizedAdvertisement(e) => write!(
                 f,
@@ -775,13 +783,23 @@ struct EndpointLookup {
     answered: bool,
 }
 
-/// With `retry_within_budget`, an absent or stale record, or a lookup that
-/// failed, is looked up again every [`RESOLVE_RETRY_DELAY`] until `budget`
-/// runs out — the DHT can hand back a replica that hasn't been evicted yet
-/// even though the station's own current publish is live. When no usable
-/// record turns up, the lookup reports what it observed: not found when a
-/// lookup was answered, else the latest failed lookup's error, else a
-/// timeout.
+/// What the latest answered `station_endpoint` lookup found instead of a
+/// usable record.
+#[derive(Clone, Copy)]
+enum Answered {
+    NotFound,
+    Malformed,
+}
+
+/// With `retry_within_budget`, a lookup that found no usable record (absent,
+/// expired, or naming no dialable address) or that failed is looked up again
+/// every [`RESOLVE_RETRY_DELAY`] until `budget` runs out — the DHT can hand
+/// back a replica that hasn't been evicted yet even though the station's own
+/// current publish is live. A record that doesn't verify ends the lookup.
+/// When no usable record turns up, the lookup reports what it observed, as
+/// `macula_direct_dial`'s `endpoint_recorded/3` does: the latest answered
+/// lookup (not found, or the malformed record), else the latest failed
+/// lookup's error, else a timeout.
 async fn lookup_station_endpoint<D: DhtLookups>(
     dht: &mut D,
     station: [u8; 32],
@@ -790,12 +808,11 @@ async fn lookup_station_endpoint<D: DhtLookups>(
 ) -> EndpointLookup {
     let key = dht::station_endpoint_key(station);
     let mut seen_version = None;
-    let mut answered = false;
+    let mut answered = None;
     let mut failed = None;
     loop {
         match tokio::time::timeout(budget.remaining(), dht.find_record(key)).await {
             Ok(Ok(rec)) => {
-                answered = true;
                 seen_version = Some(rec.version);
                 // The station_endpoint record for `station` must be SIGNED BY
                 // `station` itself — checking the signature and that the
@@ -806,28 +823,31 @@ async fn lookup_station_endpoint<D: DhtLookups>(
                     return EndpointLookup {
                         outcome: Err(ResolveError::StationEndpointSignerMismatch),
                         seen_version,
-                        answered,
+                        answered: true,
                     };
                 }
                 match dht::verify(&rec) {
-                    Ok(()) => {
-                        return EndpointLookup {
-                            outcome: read_endpoint(station, &rec),
-                            seen_version,
-                            answered,
+                    Ok(()) => match read_endpoint(station, &rec) {
+                        Some(resolved) => {
+                            return EndpointLookup {
+                                outcome: Ok(resolved),
+                                seen_version,
+                                answered: true,
+                            }
                         }
-                    }
-                    Err(dht::VerifyError::Expired) => {}
+                        None => answered = Some(Answered::Malformed),
+                    },
+                    Err(dht::VerifyError::Expired) => answered = Some(Answered::NotFound),
                     Err(_) => {
                         return EndpointLookup {
                             outcome: Err(ResolveError::NoTrustedAdvertisement),
                             seen_version,
-                            answered,
+                            answered: true,
                         }
                     }
                 }
             }
-            Ok(Err(DhtError::NotFound)) => answered = true,
+            Ok(Err(DhtError::NotFound)) => answered = Some(Answered::NotFound),
             // A failed lookup teaches nothing: looked up again like an absent
             // record.
             Ok(Err(e)) => failed = Some(e),
@@ -835,31 +855,28 @@ async fn lookup_station_endpoint<D: DhtLookups>(
             Err(_) => {}
         }
         if !retry_within_budget || budget.passed() {
-            let unresolved = if answered {
-                ResolveError::StationEndpointNotFound
-            } else if let Some(e) = failed {
-                ResolveError::Dht(e)
-            } else {
-                ResolveError::Timeout
+            let unresolved = match (answered, failed) {
+                (Some(Answered::NotFound), _) => ResolveError::StationEndpointNotFound,
+                (Some(Answered::Malformed), _) => ResolveError::MalformedStationEndpoint,
+                (None, Some(e)) => ResolveError::Dht(e),
+                (None, None) => ResolveError::Timeout,
             };
             return EndpointLookup {
                 outcome: Err(unresolved),
                 seen_version,
-                answered,
+                answered: answered.is_some(),
             };
         }
         tokio::time::sleep(RESOLVE_RETRY_DELAY.min(budget.remaining())).await;
     }
 }
 
-fn read_endpoint(station: [u8; 32], rec: &Record) -> Result<Resolved, ResolveError> {
-    let ep = dht::read_station_endpoint(rec).map_err(|_| ResolveError::StationEndpointNotFound)?;
-    let host = ep
-        .host_advertised
-        .into_iter()
-        .next()
-        .ok_or(ResolveError::StationEndpointNotFound)?;
-    Ok(Resolved {
+/// The dialable address a verified `station_endpoint` record names, or
+/// `None` when it names none.
+fn read_endpoint(station: [u8; 32], rec: &Record) -> Option<Resolved> {
+    let ep = dht::read_station_endpoint(rec).ok()?;
+    let host = ep.host_advertised.into_iter().next()?;
+    Some(Resolved {
         station,
         host,
         port: ep.quic_port,
@@ -1911,6 +1928,27 @@ mod tests {
         )
     }
 
+    /// A `station_endpoint` signed by `signer` that advertises no host, so it
+    /// names no dialable address.
+    fn malformed_station_endpoint(signer: &KeyPair) -> Record {
+        let created_at = now_ms();
+        dht::sign(
+            Record {
+                record_type: dht::TYPE_STATION_ENDPOINT,
+                key: signer.node_id(),
+                version: *uuid::Uuid::now_v7().as_bytes(),
+                created_at,
+                expires_at: created_at + 600_000,
+                payload: Value::Map(vec![
+                    (Value::text("quic_port"), Value::Int(4433)),
+                    (Value::text("host_advertised"), Value::List(vec![])),
+                ]),
+                signature: Vec::new(),
+            },
+            signer,
+        )
+    }
+
     fn announcement(p: &Provider, mcid: Mcid) -> Record {
         dht::sign(
             dht::new_content_announcement(
@@ -2190,6 +2228,7 @@ mod tests {
         never_answered: HashSet<[u8; 32]>,
         endpoint_asked: HashMap<[u8; 32], usize>,
         endpoints: HashMap<[u8; 32], Record>,
+        endpoints_in_turn: HashMap<[u8; 32], Vec<Record>>,
     }
 
     impl FakeDht {
@@ -2203,6 +2242,7 @@ mod tests {
                 never_answered: HashSet::new(),
                 endpoint_asked: HashMap::new(),
                 endpoints: HashMap::new(),
+                endpoints_in_turn: HashMap::new(),
             })))
         }
 
@@ -2216,6 +2256,16 @@ mod tests {
                 .unwrap()
                 .endpoints
                 .insert(dht::station_endpoint_key(station.node_id()), endpoint);
+        }
+
+        /// `find_record` for `station`'s `station_endpoint` answers with
+        /// `endpoints` in turn, repeating the last.
+        fn publish_endpoints_in_turn(&self, station: &KeyPair, endpoints: Vec<Record>) {
+            self.0
+                .lock()
+                .unwrap()
+                .endpoints_in_turn
+                .insert(dht::station_endpoint_key(station.node_id()), endpoints);
         }
 
         /// When `find_records` was asked for `key`, since this DHT was
@@ -2324,6 +2374,9 @@ mod tests {
             }
             if state.never_answered.contains(&key) {
                 return None;
+            }
+            if let Some(in_turn) = state.endpoints_in_turn.get(&key) {
+                return Some(Ok(in_turn[turn.min(in_turn.len() - 1)].clone()));
             }
             Some(state.endpoints.get(&key).cloned().ok_or(DhtError::NotFound))
         }
@@ -2789,6 +2842,48 @@ mod tests {
         assert!(
             matches!(result, Err(Failure::Resolve(ResolveError::Dht(_)))),
             "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_direct_asks_again_past_a_malformed_endpoint_record() {
+        let station = KeyPair::generate();
+        let dht = FakeDht::new();
+        dht.publish_endpoints_in_turn(
+            &station,
+            vec![
+                malformed_station_endpoint(&station),
+                station_endpoint(&station, "s.test"),
+            ],
+        );
+
+        let stored = put(&dht, &FakeStations::default(), &station, ROOMY)
+            .await
+            .expect("s stores once a lookup finds its good endpoint record");
+
+        assert_eq!(stored, "stored on s.test");
+    }
+
+    #[tokio::test]
+    async fn put_direct_reports_a_malformed_endpoint_record_at_its_deadline() {
+        let station = KeyPair::generate();
+        let dht = FakeDht::new();
+        dht.publish_endpoint(&station, malformed_station_endpoint(&station));
+        let started = Instant::now();
+
+        let result = put(&dht, &FakeStations::default(), &station, SHORT).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Failure::Resolve(ResolveError::MalformedStationEndpoint))
+            ),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+        assert!(
+            dht.endpoint_lookups_of(&station) > 1,
+            "a malformed endpoint record is asked again within the budget"
         );
     }
 
