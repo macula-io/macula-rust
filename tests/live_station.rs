@@ -1971,6 +1971,103 @@ async fn direct_dial_advertise_resolve_and_call_round_trip_against_the_real_flee
         .await;
 }
 
+/// A direct call runs on the caller's own session to the provider's station
+/// instead of dialing a second connection under the same identity, which
+/// would make the station close that session. The name matches the .NET and
+/// Go tests.
+#[tokio::test]
+#[ignore = "requires network access to a live macula-station"]
+async fn resolver_session_still_connected_after_a_direct_call() {
+    let provider_identity = KeyPair::generate_with_default_puzzle();
+    let caller_identity = KeyPair::generate_with_default_puzzle();
+    let realm = [0u8; 32];
+    let procedure = format!(
+        "macula_rust.direct_dial_reuse_test.{}",
+        hex::encode(rand::random::<[u8; 8]>())
+    );
+
+    let provider_session =
+        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &provider_identity)
+            .await
+            .expect("provider handshake should succeed");
+    macula_rust::direct_dial::advertise_direct(
+        &provider_session,
+        &provider_identity,
+        realm,
+        &procedure,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .expect("advertise_direct should publish the DHT record");
+    let provider_station = provider_session.station.node_id;
+
+    let target_procedure = procedure.clone();
+    let lookup = move |_realm: &[u8; 32], proc: &str| -> Option<connection::CallHandler> {
+        if proc != target_procedure {
+            return None;
+        }
+        let echo: connection::CallHandler = std::sync::Arc::new(|payload: Value| {
+            Box::pin(async move { Ok(payload) }) as connection::BoxFuture<'static, Result<Value, String>>
+        });
+        Some(echo)
+    };
+    let serve_task = tokio::spawn(async move {
+        let result = provider_session
+            .serve_one_call(lookup, &provider_identity, std::time::Duration::from_secs(20))
+            .await;
+        (result, provider_session, provider_identity)
+    });
+
+    let resolver = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
+        .await
+        .expect("resolver handshake should succeed");
+    // Reuse needs the resolver on the provider's own station.
+    assert_eq!(
+        hex::encode(resolver.station.node_id),
+        hex::encode(provider_station),
+        "the resolver and the provider reached different stations"
+    );
+
+    let response = macula_rust::direct_dial::call(
+        &resolver,
+        &caller_identity,
+        realm,
+        &procedure,
+        Value::text("hello again"),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .expect("the direct call should be answered");
+    match response {
+        macula_rust::frame::CallResponse::Result { payload, .. } => {
+            assert_eq!(payload, Value::text("hello again"));
+        }
+        other => panic!("expected a RESULT, got {other:?}"),
+    }
+    let (serve_result, provider_session, provider_identity) =
+        serve_task.await.expect("serve task should not panic");
+    serve_result.expect("provider should serve the direct call");
+
+    // A second connection under caller_identity would have made the station
+    // close the resolver by now.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert!(
+        resolver.end_reason().is_none(),
+        "the resolver session ended: {:?}",
+        resolver.end_reason()
+    );
+    macula_rust::direct_dial::resolve(&resolver, &caller_identity, realm, &procedure)
+        .await
+        .expect("the resolver still answers DHT queries");
+
+    provider_session
+        .close("normal", Some("direct-dial reuse provider done"), &provider_identity)
+        .await;
+    resolver
+        .close("normal", Some("direct-dial reuse resolver done"), &caller_identity)
+        .await;
+}
+
 /// Proves `direct_dial::keep_advertised_direct` genuinely re-publishes on
 /// each tick (not a no-op) and stops cleanly once told to.
 #[tokio::test]

@@ -57,7 +57,12 @@ usually touches both, but their version numbers don't move in lockstep.
   stream, and leave it open. The stream functions return
   `direct_dial::OpenedStream` (`stream`, `lease`) instead of a
   `(Session, StreamHandle)` tuple; release its `SessionLease` once the
-  stream is done. `call` and its variants still dial their own connection.
+  stream is done. `call`, `call_with_ucan` and `call_with_cert_chain` run
+  on an open session the same way.
+- **A direct call whose CALL was not sent tries the next candidate.** A call
+  whose session had ended, or whose turn to write didn't come in time, moves
+  on to the next candidate, and its station may be tried again on a later
+  pass. A call that was or may have been sent is returned as before.
 - **A session direct dial dialed is shared until its last request is done.**
   A direct-dial request that finds it open uses it too, holding a lease of
   its own, and the session closes when the last lease is released instead

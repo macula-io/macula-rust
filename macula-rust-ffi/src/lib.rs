@@ -1141,7 +1141,8 @@ impl FfiSession {
 
     /// Resolves `procedure`'s provider via direct-dial (through this
     /// session, used only to query the DHT) and calls it there, in one
-    /// hop, in a SEPARATE connection from this session — see
+    /// hop, on a session already open to the provider's station under
+    /// `identity` when there is one — see
     /// [`macula_rust::direct_dial::call`]'s own doc for the full trust
     /// model. Use this instead of [`call`](Self::call) when the provider
     /// is reachable only via [`advertise_direct`](Self::advertise_direct)

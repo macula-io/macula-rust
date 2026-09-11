@@ -23,8 +23,11 @@
 //! verifies is a candidate, tried in the order the DHT returned them. A
 //! candidate whose endpoint record doesn't resolve, whose dial fails, or
 //! whose dialed identity doesn't match is skipped for the next one, because
-//! nothing has reached the provider yet. Once a CALL or STREAM_OPEN has gone
-//! out, its result is the call's result and it is never sent again. When a
+//! nothing has reached the provider yet. So is a CALL that failed before it
+//! was sent, because its session had ended or its turn to write didn't come
+//! in time; its station may be tried again on a later pass. Once a CALL or
+//! STREAM_OPEN has gone out, its result is the call's result and it is never
+//! sent again. When a
 //! query fails, no candidate qualifies, or every one failed before sending,
 //! the DHT is queried again with a backoff of 100 ms doubling to 1 s; within
 //! one call a
@@ -40,11 +43,13 @@
 //! **Reuse:** a station keeps one connection per identity and closes the
 //! older one when a newer one arrives. So when this process already has a
 //! session open to the provider's station under the same identity
-//! (`resolve_via` itself, or a [`Pool`](crate::pool::Pool) link),
-//! [`open_stream_direct`], [`put_direct`] and [`get_direct`] run on that
-//! session, on a dedicated QUIC stream of their own, instead of dialing,
-//! and never close it. They need no `station_endpoint` lookup either.
-//! [`call`] and its variants still dial.
+//! (`resolve_via` itself, or a [`Pool`](crate::pool::Pool) link), [`call`]
+//! and its variants run on that session, and [`open_stream_direct`],
+//! [`put_direct`] and [`get_direct`] run on it on a dedicated QUIC stream of
+//! their own, instead of dialing, and never close it. They need no
+//! `station_endpoint` lookup either. A session direct dial dialed is shared
+//! the same way: each request using it holds a lease, and it closes when the
+//! last one is released (see [`SessionLease`]).
 //!
 //! `cert_chain`-based org/realm authorization (Slice 7c Direction B,
 //! `macula_record:verify_advertisement_cert_chain/3` on the Erlang side) is
@@ -304,6 +309,8 @@ struct Remembered<F> {
 /// call reports a timeout.
 enum Last<F> {
     Candidate([u8; 32]),
+    /// A request that failed before it was sent, which is not remembered.
+    NotSent(F),
     NoneQualified(F),
     LookupFailed(F),
 }
@@ -314,14 +321,16 @@ fn take_last<F>(
 ) -> Option<F> {
     match last? {
         Last::Candidate(key) => failures.remove(&key).map(|remembered| remembered.error),
-        Last::NoneQualified(failure) | Last::LookupFailed(failure) => Some(failure),
+        Last::NotSent(failure) | Last::NoneQualified(failure) | Last::LookupFailed(failure) => {
+            Some(failure)
+        }
     }
 }
 
 /// Records why an answered query found no candidate: over a failed query's
 /// error, never over a candidate's failure.
 fn record_none_qualified<F>(last: &mut Option<Last<F>>, reason: F) {
-    if !matches!(last, Some(Last::Candidate(_))) {
+    if !matches!(last, Some(Last::Candidate(_) | Last::NotSent(_))) {
         *last = Some(Last::NoneQualified(reason));
     }
 }
@@ -350,12 +359,40 @@ async fn query<D: DhtLookups>(dht: &mut D, key: [u8; 32], deadline: CallDeadline
     }
 }
 
+/// Whether a request that failed was never sent, so another candidate may
+/// take it without the provider running it twice.
+pub(crate) trait NotSent {
+    fn not_sent(&self) -> bool;
+}
+
+impl NotSent for connection::CallError {
+    fn not_sent(&self) -> bool {
+        connection::CallError::not_sent(self)
+    }
+}
+
+/// A stream is never opened elsewhere: its STREAM_OPEN may already be out.
+impl NotSent for stream::OpenError {
+    fn not_sent(&self) -> bool {
+        false
+    }
+}
+
+impl NotSent for Infallible {
+    fn not_sent(&self) -> bool {
+        match *self {}
+    }
+}
+
 /// Resolves `procedure`'s provider, dials it with `dial`, and sends it one
 /// request with `request`, all within `timeout` — see the module doc's
 /// "Candidates" for how providers are tried in turn.
 ///
 /// A candidate whose station `already_open` has a session for gets the
-/// request on that session, with no endpoint lookup and no dial.
+/// request on that session, with no endpoint lookup and no dial. A request
+/// that fails before it was sent ([`NotSent`]) lets the next candidate take
+/// it and is not remembered, so its station may be tried again on a later
+/// pass; any other outcome of a request ends the call.
 ///
 /// `dial` and `request` are plain closures returning futures (not async
 /// closures) so the public functions built on this keep `Send` futures.
@@ -367,17 +404,17 @@ pub(crate) async fn reach_procedure<D, S, T, DE, RE, DF, RF>(
     cert_chain: Option<CertChainCheck<'_>>,
     mut already_open: impl FnMut(&[u8; 32]) -> Option<S>,
     mut dial: impl FnMut(Resolved, Duration) -> DF,
-    request: impl FnOnce(S, Duration) -> RF,
+    mut request: impl FnMut(S, Duration) -> RF,
     timeout: Duration,
 ) -> Result<T, Failure<DE, RE>>
 where
     D: DhtLookups,
+    RE: NotSent,
     DF: Future<Output = Result<S, DE>>,
     RF: Future<Output = Result<T, RE>>,
 {
     let deadline = CallDeadline::after(timeout);
     let key = dht::procedure_key(&dht::discovery_uri(realm, procedure));
-    let mut request = Some(request);
     let mut failures: HashMap<[u8; 32], Remembered<Failure<DE, RE>>> = HashMap::new();
     let mut last: Option<Last<Failure<DE, RE>>> = None;
     let mut pause = RESOLVE_RETRY_DELAY;
@@ -409,12 +446,13 @@ where
                 break;
             }
             if let Some(target) = reused(&mut already_open, &candidate.station) {
-                let request = request
-                    .take()
-                    .expect("the request is sent at most once, and sending it ends the call");
-                return request(target, deadline.remaining())
-                    .await
-                    .map_err(Failure::Request);
+                match request(target, deadline.remaining()).await {
+                    Err(e) if e.not_sent() => {
+                        last = Some(Last::NotSent(Failure::Request(e)));
+                        continue;
+                    }
+                    result => return result.map_err(Failure::Request),
+                }
             }
             let share = deadline.share_for(candidates.len() - tried);
             // An unchanged advertisement that already failed gets a single
@@ -435,14 +473,13 @@ where
             }
             let failure = match lookup.outcome {
                 Ok(resolved) => match dial(resolved, share.remaining()).await {
-                    Ok(target) => {
-                        let request = request.take().expect(
-                            "the request is sent at most once, and sending it ends the call",
-                        );
-                        return request(target, deadline.remaining())
-                            .await
-                            .map_err(Failure::Request);
-                    }
+                    Ok(target) => match request(target, deadline.remaining()).await {
+                        Err(e) if e.not_sent() => {
+                            last = Some(Last::NotSent(Failure::Request(e)));
+                            continue;
+                        }
+                        result => return result.map_err(Failure::Request),
+                    },
                     Err(e) => Failure::Dial(e),
                 },
                 Err(e) => Failure::Resolve(e),
@@ -634,7 +671,7 @@ fn reused<S>(already_open: impl FnOnce(&[u8; 32]) -> Option<S>, station: &[u8; 3
     already_open(station)
 }
 
-/// No session to reuse: a call, and resolution alone, always dial.
+/// No session to reuse, for resolution alone.
 fn no_open_session<S>(_station: &[u8; 32]) -> Option<S> {
     None
 }
@@ -972,9 +1009,8 @@ async fn call_then_release(
 }
 
 /// Resolves `procedure`'s provider via direct-dial (through `resolve_via`,
-/// used only to query the DHT) and calls it there, in one hop, in a
-/// SEPARATE connection from `resolve_via`. The provider must have
-/// advertised via [`advertise_direct`] (or the Erlang
+/// used only to query the DHT) and calls it there, in one hop. The provider
+/// must have advertised via [`advertise_direct`] (or the Erlang
 /// `macula_response:advertise_direct/6,7`) — a plain `advertise` publishes
 /// no discoverable record and the call returns
 /// [`ResolveError::ProcedureNotAdvertised`].
@@ -983,9 +1019,13 @@ async fn call_then_release(
 /// endpoint lookup and dial, and the CALL itself. See the module doc's
 /// "Candidates" for how providers are tried in turn.
 ///
-/// A call always dials its own connection, even when this process already
-/// has a session open to the provider's station under `id`; the station
-/// then closes that session.
+/// The call runs on a session this process already has open to the
+/// provider's station under `id` when there is one (`resolve_via`, a
+/// [`Pool`](crate::pool::Pool) link, or a session direct dial dialed for
+/// another request), and otherwise dials one, which closes once no
+/// direct-dial request still uses it. A CALL that fails before it was sent
+/// is tried on the next candidate; one that was or may have been sent is
+/// returned.
 ///
 /// The dial itself uses [`Trust::Insecure`] (no TLS verification) because
 /// trust is enforced at the application layer instead — see the module
@@ -1009,10 +1049,10 @@ pub async fn call(
         realm,
         procedure,
         None,
-        no_open_session::<StationTarget>,
+        move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, remaining: Duration| {
-            call_then_release(target, remaining, id, procedure, realm, payload, None)
+            call_then_release(target, remaining, id, procedure, realm, payload.clone(), None)
         },
         timeout,
     )
@@ -1044,7 +1084,7 @@ pub async fn call_with_ucan(
         realm,
         procedure,
         None,
-        no_open_session::<StationTarget>,
+        move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, remaining: Duration| {
             call_then_release(
@@ -1053,8 +1093,8 @@ pub async fn call_with_ucan(
                 id,
                 procedure,
                 realm,
-                payload,
-                Some(ucan_token),
+                payload.clone(),
+                Some(ucan_token.clone()),
             )
         },
         timeout,
@@ -1088,10 +1128,10 @@ pub async fn call_with_cert_chain(
             realm_ca_pem,
             expected_org,
         }),
-        no_open_session::<StationTarget>,
+        move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, remaining: Duration| {
-            call_then_release(target, remaining, id, procedure, realm, payload, None)
+            call_then_release(target, remaining, id, procedure, realm, payload.clone(), None)
         },
         timeout,
     )
@@ -1556,7 +1596,7 @@ pub async fn open_stream_direct(
         move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, _remaining: Duration| {
-            open_stream_on(target, id, procedure, realm, mode, args, deadline_ms)
+            open_stream_on(target, id, procedure, realm, mode, args.clone(), deadline_ms)
         },
         timeout,
     )
@@ -1595,7 +1635,7 @@ pub async fn open_stream_direct_with_cert_chain(
         move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, _remaining: Duration| {
-            open_stream_on(target, id, procedure, realm, mode, args, deadline_ms)
+            open_stream_on(target, id, procedure, realm, mode, args.clone(), deadline_ms)
         },
         timeout,
     )
@@ -1916,6 +1956,13 @@ mod tests {
     /// How long the timeout-bound cases may take to return.
     const SHORT_BOUND: Duration = Duration::from_secs(1);
     const CONTENT: &[u8] = b"the content";
+
+    // The fakes' request failures are strings, which count as sent.
+    impl NotSent for String {
+        fn not_sent(&self) -> bool {
+            false
+        }
+    }
 
     fn procedure_key() -> [u8; 32] {
         dht::procedure_key(&dht::discovery_uri(REALM, PROCEDURE))
@@ -3175,6 +3222,184 @@ mod tests {
         assert!(closed.is_none(), "the stream still uses the session");
 
         assert!(stream.release_lease().is_some());
+    }
+
+    // A direct call reuses an open session, and after its request failed goes
+    // on to the next candidate only when its CALL was never sent. The names
+    // match the .NET and Go tests.
+
+    /// A call on the fakes whose request is `request`.
+    async fn call_requesting<RF>(
+        dht: &FakeDht,
+        stations: &FakeStations,
+        already_open: impl FnMut(&[u8; 32]) -> Option<String>,
+        request: impl FnMut(String, Duration) -> RF,
+    ) -> Result<String, Failure<String, connection::CallError>>
+    where
+        RF: Future<Output = Result<String, connection::CallError>>,
+    {
+        reach_procedure(
+            &mut dht.clone(),
+            REALM,
+            PROCEDURE,
+            None,
+            already_open,
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            request,
+            ROOMY,
+        )
+        .await
+    }
+
+    fn answer_from(session: String) -> std::future::Ready<Result<String, connection::CallError>> {
+        ready(Ok(format!("reply from {session}")))
+    }
+
+    #[tokio::test]
+    async fn call_reuses_an_open_session_to_the_provider_station() {
+        // No endpoint is published for a, so only reuse can reach it.
+        let a = Provider::new("a.test");
+        let a_station = a.station.node_id();
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        let stations = FakeStations::default();
+
+        let reply = call_requesting(
+            &dht,
+            &stations,
+            |station: &[u8; 32]| {
+                (*station == a_station).then(|| "the caller's session to a".to_string())
+            },
+            |session: String, _remaining: Duration| answer_from(session),
+        )
+        .await
+        .expect("the call is answered on the open session");
+
+        assert_eq!(reply, "reply from the caller's session to a");
+        assert!(stations.reached().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_whose_reused_session_has_ended_dials_the_station_fresh() {
+        let a = Provider::new("a.test");
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        dht.publish_endpoint(&a.station, station_endpoint(&a.station, &a.host));
+        let stations = FakeStations::default();
+        // The caller's session to a is open until the call finds it has ended,
+        // and a session that ends leaves the open set.
+        let open = Cell::new(true);
+
+        let reply = call_requesting(
+            &dht,
+            &stations,
+            |_station: &[u8; 32]| open.get().then(|| "the caller's session to a".to_string()),
+            |session: String, _remaining: Duration| {
+                if session != "the caller's session to a" {
+                    return answer_from(session);
+                }
+                open.set(false);
+                ready(Err(connection::CallError::SessionEnded {
+                    reason: connection::SessionEndReason::StreamFailed(
+                        "the station went away".to_string(),
+                    ),
+                    write_started: false,
+                }))
+            },
+        )
+        .await
+        .expect("the call is answered on a fresh session");
+
+        assert_eq!(reply, format!("reply from {}", a.host));
+        assert_eq!(stations.reached(), vec![a.host.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_that_was_not_sent_is_tried_again_on_the_next_pass() {
+        let a = Provider::new("a.test");
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        dht.publish_endpoint(&a.station, station_endpoint(&a.station, &a.host));
+        let stations = FakeStations::default();
+        let attempts = Cell::new(0);
+
+        let reply = call_requesting(
+            &dht,
+            &stations,
+            nothing_open,
+            |host: String, _remaining: Duration| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    ready(Err(connection::CallError::Timeout {
+                        write_started: false,
+                    }))
+                } else {
+                    answer_from(host)
+                }
+            },
+        )
+        .await
+        .expect("the next pass answers");
+
+        assert_eq!(reply, format!("reply from {}", a.host));
+        assert_eq!(stations.reached(), vec![a.host.clone(), a.host.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_that_timed_out_waiting_for_the_write_lock_may_try_the_next_candidate() {
+        let (dht, a, b) = two_providers_with_endpoints();
+        let stations = FakeStations::default();
+
+        let reply = call_requesting(
+            &dht,
+            &stations,
+            nothing_open,
+            |host: String, _remaining: Duration| {
+                if host == a.host {
+                    ready(Err(connection::CallError::Timeout {
+                        write_started: false,
+                    }))
+                } else {
+                    answer_from(host)
+                }
+            },
+        )
+        .await
+        .expect("b answers");
+
+        assert_eq!(reply, format!("reply from {}", b.host));
+        assert_eq!(stations.reached(), vec![a.host.clone(), b.host.clone()]);
+    }
+
+    #[tokio::test]
+    async fn a_direct_call_that_timed_out_after_its_write_started_is_not_tried_on_another_candidate(
+    ) {
+        let (dht, a, _b) = two_providers_with_endpoints();
+        let stations = FakeStations::default();
+
+        let result = call_requesting(
+            &dht,
+            &stations,
+            nothing_open,
+            |host: String, _remaining: Duration| {
+                assert_eq!(host, a.host, "the CALL was sent a second time");
+                ready(Err(connection::CallError::Timeout {
+                    write_started: true,
+                }))
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Failure::Request(connection::CallError::Timeout {
+                    write_started: true
+                }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(stations.reached(), vec![a.host.clone()]);
     }
 
     #[tokio::test]
