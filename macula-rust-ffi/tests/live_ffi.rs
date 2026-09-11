@@ -537,12 +537,14 @@ async fn run_publisher_facts_through_the_ffi_surface() {
     // Each subscription receives only its own fact topic, so the first event
     // on each is a fact of that kind. These topics are global on this shared
     // public fleet, so the test confirms one of each landed, as noted above.
-    let saw_started = started.recv_event(10_000).await.is_ok_and(|event| {
-        event.topic.ends_with("pubsub.publish_started_v1")
-    });
-    let saw_completed = completed.recv_event(10_000).await.is_ok_and(|event| {
-        event.topic.ends_with("pubsub.publish_completed_v1")
-    });
+    let saw_started = started
+        .recv_event(10_000)
+        .await
+        .is_ok_and(|event| event.topic.ends_with("pubsub.publish_started_v1"));
+    let saw_completed = completed
+        .recv_event(10_000)
+        .await
+        .is_ok_and(|event| event.topic.ends_with("pubsub.publish_completed_v1"));
     started.close().await;
     completed.close().await;
     assert!(saw_started, "pubsub.publish_started_v1 should have landed");

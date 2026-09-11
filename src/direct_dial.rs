@@ -1052,7 +1052,15 @@ pub async fn call(
         move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, remaining: Duration| {
-            call_then_release(target, remaining, id, procedure, realm, payload.clone(), None)
+            call_then_release(
+                target,
+                remaining,
+                id,
+                procedure,
+                realm,
+                payload.clone(),
+                None,
+            )
         },
         timeout,
     )
@@ -1131,7 +1139,15 @@ pub async fn call_with_cert_chain(
         move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, remaining: Duration| {
-            call_then_release(target, remaining, id, procedure, realm, payload.clone(), None)
+            call_then_release(
+                target,
+                remaining,
+                id,
+                procedure,
+                realm,
+                payload.clone(),
+                None,
+            )
         },
         timeout,
     )
@@ -1596,7 +1612,15 @@ pub async fn open_stream_direct(
         move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, _remaining: Duration| {
-            open_stream_on(target, id, procedure, realm, mode, args.clone(), deadline_ms)
+            open_stream_on(
+                target,
+                id,
+                procedure,
+                realm,
+                mode,
+                args.clone(),
+                deadline_ms,
+            )
         },
         timeout,
     )
@@ -1635,7 +1659,15 @@ pub async fn open_stream_direct_with_cert_chain(
         move |station: &[u8; 32]| open_session_to(id, station),
         move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
         move |target: StationTarget, _remaining: Duration| {
-            open_stream_on(target, id, procedure, realm, mode, args.clone(), deadline_ms)
+            open_stream_on(
+                target,
+                id,
+                procedure,
+                realm,
+                mode,
+                args.clone(),
+                deadline_ms,
+            )
         },
         timeout,
     )
@@ -3206,7 +3238,10 @@ mod tests {
         let second = StationTarget::reuse(session).expect("the dialed session is reused");
 
         let (_, closed) = run_then_release(first, |_session| ready("first stored")).await;
-        assert!(closed.is_none(), "the second transfer still uses the session");
+        assert!(
+            closed.is_none(),
+            "the second transfer still uses the session"
+        );
 
         let (_, closed) = run_then_release(second, |_session| ready("second stored")).await;
         assert!(closed.is_some(), "the last transfer closes the session");

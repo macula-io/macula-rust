@@ -37,6 +37,7 @@ use crate::bolt4;
 use crate::cbor::Value;
 use crate::frame::{self, CallInfo, CallResponse, CallSpec, Decoded, EventInfo, SubscribeSpec};
 use crate::identity::KeyPair;
+use drop_warning::{DropWarnings, Kind, Reason, Subject};
 
 pub(crate) type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
 pub(crate) type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
@@ -71,8 +72,10 @@ pub enum SessionEndReason {
     /// A write on the control stream stalled for longer than the send
     /// timeout, so a frame may be half written.
     SendTimeout,
-    /// The control stream ended or failed, including a frame that couldn't
-    /// be decoded.
+    /// The station sent a frame that couldn't be decoded, so nothing after it
+    /// could be read in step.
+    Malformed(String),
+    /// The control stream ended or failed.
     StreamFailed(String),
     /// The session was closed or dropped here.
     Closed,
@@ -96,6 +99,12 @@ impl std::fmt::Display for SessionEndReason {
                 f,
                 "a write on the control stream stalled past the send timeout"
             ),
+            SessionEndReason::Malformed(why) => {
+                write!(
+                    f,
+                    "the station sent a frame that could not be decoded: {why}"
+                )
+            }
             SessionEndReason::StreamFailed(why) => write!(f, "the control stream failed: {why}"),
             SessionEndReason::Closed => write!(f, "the session was closed"),
         }
@@ -145,7 +154,9 @@ pub enum CallError {
     /// CALL was still waiting for its turn to write, so it was never sent,
     /// and true once its write had started, so the station may have it. A
     /// reply that arrives later is counted as unrouted.
-    Timeout { write_started: bool },
+    Timeout {
+        write_started: bool,
+    },
     /// The session ended before a reply came. `write_started` means the same
     /// as for [`CallError::Timeout`].
     SessionEnded {
@@ -193,10 +204,7 @@ impl std::fmt::Display for CallError {
             CallError::SessionEnded {
                 reason,
                 write_started: false,
-            } => write!(
-                f,
-                "the session ended before the CALL was sent: {reason}"
-            ),
+            } => write!(f, "the session ended before the CALL was sent: {reason}"),
             CallError::SessionEnded {
                 reason,
                 write_started: true,
@@ -267,6 +275,8 @@ pub(crate) struct Channel {
     hand_off: Mutex<Option<mpsc::Sender<Value>>>,
     unrouted: Mutex<HashMap<String, u64>>,
     reported: Mutex<HashMap<String, (u64, Option<std::time::Instant>)>>,
+    /// The bounded warnings for dropped CALLs and replies and refused streams.
+    drop_warnings: DropWarnings,
     ended: OnceLock<SessionEndReason>,
     ended_tx: watch::Sender<bool>,
     on_ended: Mutex<Option<OnEnded>>,
@@ -363,6 +373,7 @@ impl Channel {
             hand_off: Mutex::new(Some(hand_off_tx)),
             unrouted: Mutex::new(HashMap::new()),
             reported: Mutex::new(HashMap::new()),
+            drop_warnings: DropWarnings::new(station),
             ended: OnceLock::new(),
             ended_tx,
             on_ended: Mutex::new(Some(on_ended)),
@@ -387,6 +398,12 @@ impl Channel {
     /// How many frames of each type arrived with nothing to route them to.
     pub(crate) fn unrouted_frame_counts(&self) -> HashMap<String, u64> {
         lock(&self.unrouted).clone()
+    }
+
+    /// The bounded warnings for frames this session drops and streams it
+    /// refuses.
+    pub(crate) fn drop_warnings(&self) -> &DropWarnings {
+        &self.drop_warnings
     }
 
     /// Sends an already signed frame whole. Waiting for the turn to write is
@@ -429,8 +446,8 @@ impl Channel {
         after_written: Option<Value>,
     ) -> Result<CallResponse, CallError> {
         let deadline = tokio::time::Instant::now() + timeout;
-        let bytes = frame::encode(&frame::sign(frame::call(spec), identity))
-            .map_err(CallError::Encode)?;
+        let bytes =
+            frame::encode(&frame::sign(frame::call(spec), identity)).map_err(CallError::Encode)?;
         let (reply_tx, reply_rx) = oneshot::channel();
         lock(&self.calls).insert(spec.call_id, reply_tx);
         let _waiting = Waiting {
@@ -683,7 +700,8 @@ impl Channel {
                 None
             }
             "goodbye" => Some(SessionEndReason::Goodbye {
-                reason: text_field(&frame, "reason").unwrap_or_else(|| "no reason given".to_string()),
+                reason: text_field(&frame, "reason")
+                    .unwrap_or_else(|| "no reason given".to_string()),
                 detail: text_field(&frame, "detail"),
             }),
             "hello" | "connect" => Some(SessionEndReason::ProtocolViolation { frame_type }),
@@ -695,13 +713,24 @@ impl Channel {
     }
 
     fn complete_call(&self, frame_type: &str, frame: &Value) {
-        let waiting = frame::frame_call_id(frame).and_then(|call_id| lock(&self.calls).remove(&call_id));
-        match waiting {
-            Some(reply) => {
+        let call_id = frame::frame_call_id(frame);
+        let waiting = call_id.and_then(|call_id| lock(&self.calls).remove(&call_id));
+        match (waiting, call_id) {
+            (Some(reply), _) => {
                 let _ = reply.send(frame::parse_call_response(frame));
             }
-            None => self.drop_unrouted(frame_type),
+            (None, Some(call_id)) => {
+                self.drop_reply(frame_type, Reason::UnknownCallId, Subject::CallId(call_id))
+            }
+            (None, None) => self.drop_reply(frame_type, Reason::Malformed, Subject::Nothing),
         }
+    }
+
+    /// Counts a RESULT or ERROR no call waits for, with a bounded warning.
+    fn drop_reply(&self, frame_type: &str, reason: Reason, subject: Subject) {
+        self.count_unrouted(frame_type);
+        self.drop_warnings
+            .record(Kind::DroppedReply, reason, subject);
     }
 
     fn deliver_event(&self, frame: &Value) {
@@ -729,16 +758,17 @@ impl Channel {
     }
 
     fn queue_inbound_call(&self, frame: &Value) {
-        // A CALL that isn't signed by the caller it names gets no reply, as in
-        // macula_station_link.erl's on_inbound_call/3.
-        let Ok(call) = frame::parse_call(frame) else {
-            self.drop_unrouted("call");
-            return;
-        };
-        if frame::verify(frame, &call.caller).is_err() {
-            self.drop_unrouted("call");
+        // A CALL that isn't signed by the caller it names gets no reply, and
+        // nothing else looks at it first, as in macula_station_link.erl's
+        // on_inbound_call/3.
+        if let Err(reason) = drop_warning::signed_caller(frame) {
+            self.drop_call(reason, frame);
             return;
         }
+        let Ok(call) = frame::parse_call(frame) else {
+            self.drop_call(Reason::Malformed, frame);
+            return;
+        };
         let refused = match lock(&self.inbound_tx).as_ref() {
             Some(calls) => match calls.try_send(call) {
                 Err(mpsc::error::TrySendError::Full(call)) => Some(call.call_id),
@@ -760,10 +790,23 @@ impl Channel {
         }
     }
 
-    fn drop_unrouted(&self, frame_type: &str) {
+    /// Counts a dropped inbound CALL, with a bounded warning.
+    fn drop_call(&self, reason: Reason, frame: &Value) {
+        self.count_unrouted("call");
+        self.drop_warnings
+            .record(Kind::DroppedCall, reason, drop_warning::procedure_of(frame));
+    }
+
+    fn count_unrouted(&self, frame_type: &str) {
         *lock(&self.unrouted)
             .entry(frame_type.to_string())
             .or_default() += 1;
+    }
+
+    /// Counts a frame nothing routes, with at most one warning line per frame
+    /// type a minute.
+    fn drop_unrouted(&self, frame_type: &str) {
+        self.count_unrouted(frame_type);
         let mut reported = lock(&self.reported);
         let (dropped, last) = reported.entry(frame_type.to_string()).or_insert((0, None));
         *dropped += 1;
@@ -809,10 +852,7 @@ async fn read(channel: Arc<Channel>, mut reader: BoxRead, mut buf: Vec<u8>) {
                 Err(e) => {
                     // Nothing after a frame that can't be decoded can be read
                     // in step.
-                    channel.end(
-                        SessionEndReason::StreamFailed(format!("a frame could not be decoded: {e}")),
-                        false,
-                    );
+                    channel.end(SessionEndReason::Malformed(e.to_string()), false);
                     return;
                 }
             }
@@ -824,14 +864,19 @@ async fn read(channel: Arc<Channel>, mut reader: BoxRead, mut buf: Vec<u8>) {
         match read {
             Ok(0) => {
                 channel.end(
-                    SessionEndReason::StreamFailed("the station closed the control stream".to_string()),
+                    SessionEndReason::StreamFailed(
+                        "the station closed the control stream".to_string(),
+                    ),
                     false,
                 );
                 return;
             }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) => {
-                channel.end(SessionEndReason::StreamFailed(format!("reading: {e}")), false);
+                channel.end(
+                    SessionEndReason::StreamFailed(format!("reading: {e}")),
+                    false,
+                );
                 return;
             }
         }
@@ -922,6 +967,8 @@ impl Drop for Subscription {
         }
     }
 }
+
+pub(crate) mod drop_warning;
 
 #[cfg(test)]
 pub(crate) mod fake_station;
@@ -1029,7 +1076,10 @@ mod tests {
     async fn two_subscribers_with_different_topics_each_get_only_their_events() {
         let (channel, mut station, _ended) = connect();
         let id = KeyPair::generate();
-        let mut orders = channel.subscribe(&subscribe("app/orders"), &id).await.unwrap();
+        let mut orders = channel
+            .subscribe(&subscribe("app/orders"), &id)
+            .await
+            .unwrap();
         let mut invoices = channel
             .subscribe(&subscribe("app/invoices"), &id)
             .await
@@ -1038,7 +1088,10 @@ mod tests {
         station.send_event("app/orders", "order 1").await;
         station.send_event("app/invoices", "invoice 1").await;
 
-        assert_eq!(event_text(orders.recv_event(WAIT).await.unwrap()), "order 1");
+        assert_eq!(
+            event_text(orders.recv_event(WAIT).await.unwrap()),
+            "order 1"
+        );
         assert_eq!(
             event_text(invoices.recv_event(WAIT).await.unwrap()),
             "invoice 1"
@@ -1062,7 +1115,9 @@ mod tests {
             .await
             .unwrap();
 
-        station.send_event("app/orders/eu/placed", "two segments").await;
+        station
+            .send_event("app/orders/eu/placed", "two segments")
+            .await;
         station.send_event("app/placed", "no segment").await;
         station.send_event("app/orders/placed", "one segment").await;
 
@@ -1080,8 +1135,14 @@ mod tests {
     async fn closing_the_last_subscription_for_a_topic_unsubscribes() {
         let (channel, mut station, _ended) = connect();
         let id = KeyPair::generate();
-        let first = channel.subscribe(&subscribe("app/orders"), &id).await.unwrap();
-        let second = channel.subscribe(&subscribe("app/orders"), &id).await.unwrap();
+        let first = channel
+            .subscribe(&subscribe("app/orders"), &id)
+            .await
+            .unwrap();
+        let second = channel
+            .subscribe(&subscribe("app/orders"), &id)
+            .await
+            .unwrap();
         assert_eq!(frame_type(&station.next_frame().await), "subscribe");
 
         first.close().await;
@@ -1149,7 +1210,10 @@ mod tests {
     async fn an_overflowing_event_consumer_ends_with_an_overflow_error_and_the_session_stays_up() {
         let (channel, mut station, _ended) = connect();
         let id = KeyPair::generate();
-        let mut behind = channel.subscribe(&subscribe("app/ticks"), &id).await.unwrap();
+        let mut behind = channel
+            .subscribe(&subscribe("app/ticks"), &id)
+            .await
+            .unwrap();
 
         let pending = spawn_call(&channel, call("app/echo"), WAIT);
         let sent = station.next("call").await;
@@ -1170,7 +1234,10 @@ mod tests {
             Err(RecvEventError::Overflow)
         ));
 
-        let mut fresh = channel.subscribe(&subscribe("app/ticks"), &id).await.unwrap();
+        let mut fresh = channel
+            .subscribe(&subscribe("app/ticks"), &id)
+            .await
+            .unwrap();
         station.send_event("app/ticks", "after the overflow").await;
         assert_eq!(
             event_text(fresh.recv_event(WAIT).await.unwrap()),
@@ -1346,7 +1413,7 @@ mod tests {
 
         let (reason, closed_here) = tokio::time::timeout(WAIT, ended).await.unwrap().unwrap();
         assert!(
-            matches!(reason, SessionEndReason::StreamFailed(_)),
+            matches!(reason, SessionEndReason::Malformed(_)),
             "{reason:?}"
         );
         assert!(!closed_here);
@@ -1465,48 +1532,13 @@ mod tests {
         );
     }
 
-    struct CapturingLogger;
-
-    static LOGGED: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
-
-    impl log::Log for CapturingLogger {
-        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            lock(&LOGGED).push((record.level(), record.args().to_string()));
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn capture_logs() {
-        static INSTALLED: OnceLock<()> = OnceLock::new();
-        INSTALLED.get_or_init(|| {
-            let _ = log::set_logger(&CapturingLogger);
-            log::set_max_level(log::LevelFilter::Info);
-        });
-    }
-
-    fn logged_about(node_id: &[u8; 32]) -> Vec<(log::Level, String)> {
-        let node_id = hex(node_id);
-        lock(&LOGGED)
-            .iter()
-            .filter(|(_, line)| line.contains(&node_id))
-            .cloned()
-            .collect()
-    }
-
     #[tokio::test]
     async fn a_session_end_is_logged_once_with_its_reason() {
         capture_logs();
 
         let (ended_by_station, mut station, ended) = connect();
         let station_id = station.identity.node_id();
-        station
-            .send(&frame::goodbye("maintenance", None))
-            .await;
+        station.send(&frame::goodbye("maintenance", None)).await;
         tokio::time::timeout(WAIT, ended).await.unwrap().unwrap();
         ended_by_station.end(SessionEndReason::Closed, true);
 
@@ -1517,7 +1549,10 @@ mod tests {
         assert_eq!(by_station.len(), 1, "{by_station:?}");
         assert_eq!(by_station[0].0, log::Level::Warn);
         assert!(by_station[0].1.contains("maintenance"), "{by_station:?}");
-        assert!(by_station[0].1.contains(&hex(&station_id)), "{by_station:?}");
+        assert!(
+            by_station[0].1.contains(&hex(&station_id)),
+            "{by_station:?}"
+        );
         let by_us = logged_about(&ended_here.identity.node_id());
         assert_eq!(by_us.len(), 1, "{by_us:?}");
         assert_eq!(by_us[0].0, log::Level::Info);
@@ -1591,7 +1626,9 @@ mod tests {
         station
             .send_inbound_call("app/forged", Signer::Other(Box::new(KeyPair::generate())))
             .await;
-        station.send_inbound_call("app/genuine", Signer::Caller).await;
+        station
+            .send_inbound_call("app/genuine", Signer::Caller)
+            .await;
 
         let served = tokio::time::timeout(WAIT, channel.next_inbound_call())
             .await
@@ -1605,8 +1642,12 @@ mod tests {
     async fn an_unsigned_inbound_call_is_dropped() {
         let (channel, mut station, _ended) = connect();
 
-        station.send_inbound_call("app/unsigned", Signer::Nobody).await;
-        station.send_inbound_call("app/genuine", Signer::Caller).await;
+        station
+            .send_inbound_call("app/unsigned", Signer::Nobody)
+            .await;
+        station
+            .send_inbound_call("app/genuine", Signer::Caller)
+            .await;
 
         let served = tokio::time::timeout(WAIT, channel.next_inbound_call())
             .await

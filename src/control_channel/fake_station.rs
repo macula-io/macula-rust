@@ -36,7 +36,10 @@ pub(crate) fn connect_with(send_timeout: Duration) -> (Arc<Channel>, FakeStation
     (channel, station, ended_rx)
 }
 
-pub(crate) fn connect_ending(send_timeout: Duration, on_ended: OnEnded) -> (Arc<Channel>, FakeStation) {
+pub(crate) fn connect_ending(
+    send_timeout: Duration,
+    on_ended: OnEnded,
+) -> (Arc<Channel>, FakeStation) {
     let (session_writes, station_reads) = tokio::io::duplex(1);
     let (station_writes, session_reads) = tokio::io::duplex(READ_CHUNK);
     let identity = KeyPair::generate();
@@ -139,7 +142,10 @@ impl FakeStation {
         let event = Value::Map(vec![
             (Value::text("frame_type"), Value::text("event")),
             (Value::text("realm"), Value::Bytes(REALM.to_vec())),
-            (Value::text("topic"), Value::Bytes(topic.as_bytes().to_vec())),
+            (
+                Value::text("topic"),
+                Value::Bytes(topic.as_bytes().to_vec()),
+            ),
             (
                 Value::text("publisher"),
                 Value::Bytes(self.identity.node_id().to_vec()),
@@ -193,7 +199,9 @@ impl FakeStation {
 
     /// Whether the session sends no frame for `wait`.
     pub(crate) async fn nothing_sent_within(&mut self, wait: Duration) -> bool {
-        tokio::time::timeout(wait, self.frames.recv()).await.is_err()
+        tokio::time::timeout(wait, self.frames.recv())
+            .await
+            .is_err()
     }
 }
 
@@ -277,4 +285,41 @@ pub(crate) async fn turn_taken(channel: &Channel) {
     })
     .await
     .expect("a writer took the turn in time");
+}
+
+/// Keeps every log line a test run writes, for tests that check what was
+/// logged. The log crate takes one logger for the whole process, so every
+/// such test installs this same one and picks its own lines by a node id.
+struct CapturingLogger;
+
+static LOGGED: Mutex<Vec<(log::Level, String)>> = Mutex::new(Vec::new());
+
+impl log::Log for CapturingLogger {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        lock(&LOGGED).push((record.level(), record.args().to_string()));
+    }
+
+    fn flush(&self) {}
+}
+
+pub(crate) fn capture_logs() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let _ = log::set_logger(&CapturingLogger);
+        log::set_max_level(log::LevelFilter::Info);
+    });
+}
+
+/// The captured lines that name `node_id`, in the order they were logged.
+pub(crate) fn logged_about(node_id: &[u8; 32]) -> Vec<(log::Level, String)> {
+    let node_id = hex(node_id);
+    lock(&LOGGED)
+        .iter()
+        .filter(|(_, line)| line.contains(&node_id))
+        .cloned()
+        .collect()
 }

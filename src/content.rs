@@ -176,11 +176,7 @@ pub(crate) async fn put_on(
 }
 
 /// Fetch and verify the content addressed by `mcid`.
-pub async fn get(
-    session: &Session,
-    mcid: Mcid,
-    identity: &KeyPair,
-) -> Result<Vec<u8>, GetError> {
+pub async fn get(session: &Session, mcid: Mcid, identity: &KeyPair) -> Result<Vec<u8>, GetError> {
     let stream = session
         .open_dedicated_stream()
         .await

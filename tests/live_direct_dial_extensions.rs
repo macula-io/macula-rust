@@ -76,11 +76,9 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
     // implicit drop tore the connection down before the already-sent
     // frame had necessarily been fully processed peer-side.
     let accept_task = tokio::spawn(async move {
-        let result = macula_rust::stream::StreamHandle::accept(
-            &provider_session,
-            Duration::from_secs(15),
-        )
-        .await;
+        let result =
+            macula_rust::stream::StreamHandle::accept(&provider_session, Duration::from_secs(15))
+                .await;
         (result, provider_session)
     });
 
@@ -244,10 +242,9 @@ async fn put_and_get_direct_round_trip_against_the_real_fleet() {
     // get_direct correctly REFUSES an announcement whose claimed announcer
     // doesn't match who answers the dial, which is itself a real
     // correctness property worth confirming.
-    let getter_session =
-        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &getter_id)
-            .await
-            .expect("getter handshake should succeed");
+    let getter_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &getter_id)
+        .await
+        .expect("getter handshake should succeed");
     match direct_dial::get_direct(&getter_session, &getter_id, mcid, Duration::from_secs(15)).await {
         Err(direct_dial::GetDirectError::Dial(direct_dial::DialAndVerifyError::TrustViolation { resolved, dialed })) => {
             println!(

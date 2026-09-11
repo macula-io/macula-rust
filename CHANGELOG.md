@@ -68,6 +68,30 @@ usually touches both, but their version numbers don't move in lockstep.
   signature was verified against, replacing any `"caller"` the sender put in
   the payload. A payload that isn't a map reaches the handler unchanged and
   carries no caller.
+- **Breaking: `StreamHandle::accept` refuses a STREAM_OPEN not signed by its
+  caller.** Stream handlers previously received the STREAM_OPEN's caller
+  field unverified; upgrade if a stream handler relies on it. A stream whose
+  first frame doesn't verify against the caller it names, has no signature
+  or caller, is of another type, or doesn't decode is aborted in both
+  directions with application error code 2 (`stream::REFUSED_STREAM`),
+  with nothing written, and accept waits for the next stream within its
+  timeout. `AcceptError::Parse` is removed. A provider that accepts a
+  stream and won't serve it refuses it with `StreamHandle::refuse`, which
+  writes a STREAM_ERROR, finishes the send half and stops reading with
+  code 2.
+- **A stream handler receives its caller.** Map args of an accepted
+  STREAM_OPEN carry the verified caller under `"caller"`, replacing any
+  `"caller"` the opener put there, as a CALL handler's payload does.
+- **Drop warnings.** A session logs a dropped CALL (`dropped_call`), a
+  RESULT or ERROR for no pending call (`dropped_reply`) and a refused stream
+  (`refused_stream_open`) with its `count`, `reason`, and `procedure` or
+  `call_id`. The first of a kind in an interval is logged at once, and the
+  rest are counted into one closing line when the interval ends.
+  `Session::set_drop_warning_interval` sets the interval, 60 seconds by
+  default.
+- **A frame that doesn't decode ends a session as `SessionEndReason::Malformed`**,
+  where it used to end as `StreamFailed`. An exhaustive `match` on
+  `SessionEndReason` needs the new arm.
 - **A session direct dial dialed is shared until its last request is done.**
   A direct-dial request that finds it open uses it too, holding a lease of
   its own, and the session closes when the last lease is released instead

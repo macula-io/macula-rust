@@ -457,30 +457,26 @@ impl Pool {
         payload: crate::cbor::Value,
         deadline_ms: i128,
     ) -> Result<CallResponse, PoolCallError> {
-        let calls = self
-            .select_connected_links()
-            .await
-            .into_iter()
-            .map(|link| {
-                let spec = CallSpec::new(
-                    rand::random(),
-                    procedure,
-                    realm,
-                    payload.clone(),
-                    deadline_ms,
-                    self.identity.node_id(),
-                );
-                async move {
-                    // A handle, cloned out, so no lock is held across the round trip.
-                    let session = link.state.lock().await.session.clone();
-                    let Some(session) = session else {
-                        return Err(link_not_connected(&link));
-                    };
-                    session
-                        .link_call(&spec, &self.identity, self.options.call_timeout)
-                        .await
-                }
-            });
+        let calls = self.select_connected_links().await.into_iter().map(|link| {
+            let spec = CallSpec::new(
+                rand::random(),
+                procedure,
+                realm,
+                payload.clone(),
+                deadline_ms,
+                self.identity.node_id(),
+            );
+            async move {
+                // A handle, cloned out, so no lock is held across the round trip.
+                let session = link.state.lock().await.session.clone();
+                let Some(session) = session else {
+                    return Err(link_not_connected(&link));
+                };
+                session
+                    .link_call(&spec, &self.identity, self.options.call_timeout)
+                    .await
+            }
+        });
         call_until_sent(calls).await
     }
 
@@ -583,7 +579,9 @@ impl Pool {
 /// twice. Returns the first reply, a BOLT#4 ERROR reply included, else the
 /// failure that stopped it: a call that was or may have been sent, or the
 /// last one.
-async fn call_until_sent<F>(calls: impl IntoIterator<Item = F>) -> Result<CallResponse, PoolCallError>
+async fn call_until_sent<F>(
+    calls: impl IntoIterator<Item = F>,
+) -> Result<CallResponse, PoolCallError>
 where
     F: std::future::Future<Output = Result<CallResponse, CallError>>,
 {
@@ -1125,7 +1123,10 @@ mod tests {
     async fn call_falls_through_to_next_connected_link() {
         let (gone, gone_station, gone_ended) = connect();
         drop(gone_station);
-        tokio::time::timeout(WAIT, gone_ended).await.unwrap().unwrap();
+        tokio::time::timeout(WAIT, gone_ended)
+            .await
+            .unwrap()
+            .unwrap();
         let (live, mut station, _ended) = connect();
         let identity = KeyPair::generate();
         let (first, second) = (call("app/echo"), call("app/echo"));

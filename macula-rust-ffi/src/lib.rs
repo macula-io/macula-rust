@@ -1062,15 +1062,16 @@ impl FfiSession {
         let realm = to_32(realm)?;
         let spec = macula_rust::frame::SubscribeSpec::new(topic, realm, identity.0.node_id());
         let session = self.session().await?;
-        let subscription = session
-            .subscribe(&spec, &identity.0)
-            .await
-            .map_err(|e| FfiError::Send {
-                reason: e.to_string(),
-            })?;
-        Ok(std::sync::Arc::new(FfiSubscription(tokio::sync::Mutex::new(
-            Some(subscription),
-        ))))
+        let subscription =
+            session
+                .subscribe(&spec, &identity.0)
+                .await
+                .map_err(|e| FfiError::Send {
+                    reason: e.to_string(),
+                })?;
+        Ok(std::sync::Arc::new(FfiSubscription(
+            tokio::sync::Mutex::new(Some(subscription)),
+        )))
     }
 
     /// Send a signed ADVERTISE (§6.9) — registers this session as the
@@ -1515,6 +1516,12 @@ impl FfiSession {
     /// [`advertise`](Self::advertise) has registered at least one
     /// procedure — otherwise the station has nothing to route here. Other
     /// methods on this `FfiSession` carry on while it waits.
+    ///
+    /// The app decides whether to serve a stream it accepts. One it refuses
+    /// should get a STREAM_ERROR with macula's codes, `unauthorized` when the
+    /// caller may not use the procedure and `not_found` for a procedure it
+    /// doesn't serve, sent with [`FfiStream::refuse`], so a caller sees the
+    /// same refusal from every stack.
     pub async fn accept_stream(&self, timeout_ms: u64) -> Result<FfiAcceptedStream, FfiError> {
         let session = self.session().await?;
         let session = &session;
@@ -1755,6 +1762,28 @@ impl FfiStream {
         let mut guard = self.0.lock().await;
         if let Some(handle) = guard.take() {
             handle.abort(code, message, &identity.0).await;
+        }
+    }
+
+    /// Refuses a stream accepted and not served: writes a STREAM_ERROR with
+    /// `code` and `message`, then finishes sending and stops reading — see
+    /// [`macula_rust::stream::StreamHandle::refuse`]. A no-op if already
+    /// closed, aborted or refused.
+    pub async fn refuse(
+        &self,
+        code: String,
+        message: String,
+        identity: &FfiKeyPair,
+    ) -> Result<(), FfiError> {
+        let handle = self.0.lock().await.take();
+        match handle {
+            Some(handle) => handle
+                .refuse(code, message, &identity.0)
+                .await
+                .map_err(|e| FfiError::Send {
+                    reason: e.to_string(),
+                }),
+            None => Ok(()),
         }
     }
 }

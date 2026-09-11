@@ -134,7 +134,7 @@ impl std::fmt::Display for StreamCallError {
 impl std::error::Error for StreamCallError {}
 
 impl FrameStream {
-    fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+    pub(crate) fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
         Self {
             send,
             recv,
@@ -145,6 +145,23 @@ impl FrameStream {
     /// Any bytes already read past the last decoded frame.
     pub fn leftover_bytes(&self) -> &[u8] {
         &self.buf
+    }
+
+    /// Aborts both halves with `code`, writing nothing: RESET_STREAM on the
+    /// send half and STOP_SENDING on the receive half. Stopping has to be
+    /// explicit, since a receive half dropped unread sends STOP_SENDING with
+    /// code 0.
+    pub(crate) fn abort_both(mut self, code: u32) {
+        let code = quinn::VarInt::from_u32(code);
+        let _ = self.send.reset(code);
+        let _ = self.recv.stop(code);
+    }
+
+    /// Finishes the send half, so what was written still reaches the peer,
+    /// and stops the receive half with `code`.
+    pub(crate) fn finish_and_stop_reading(mut self, code: u32) {
+        let _ = self.send.finish();
+        let _ = self.recv.stop(quinn::VarInt::from_u32(code));
     }
 
     pub async fn send_frame(&mut self, frame: Value) -> Result<(), SendFrameError> {
@@ -609,9 +626,30 @@ impl Session {
     /// How many frames of each type the station sent that nothing on this
     /// session was waiting for, such as the station's own advertise
     /// broadcasts. They are dropped, and at most one log line per type per
-    /// minute reports them.
+    /// minute reports them, except a dropped CALL, RESULT or ERROR, which gets
+    /// a drop warning instead (see
+    /// [`drop_warning_interval`](Self::drop_warning_interval)).
     pub fn unrouted_frame_counts(&self) -> HashMap<String, u64> {
         self.inner.channel.unrouted_frame_counts()
+    }
+
+    /// How long this session's drop warning intervals last. The first inbound
+    /// CALL or reply of an interval this session drops, and the first stream
+    /// it refuses, is logged at once with the reason; the rest of the same
+    /// kind in that interval are counted into one closing line when it ends.
+    /// Defaults to 60 seconds.
+    pub fn drop_warning_interval(&self) -> Duration {
+        self.inner.channel.drop_warnings().interval()
+    }
+
+    /// Sets [`drop_warning_interval`](Self::drop_warning_interval), for the
+    /// intervals that start after this.
+    pub fn set_drop_warning_interval(&self, interval: Duration) {
+        self.inner.channel.drop_warnings().set_interval(interval);
+    }
+
+    pub(crate) fn drop_warnings(&self) -> &crate::control_channel::drop_warning::DropWarnings {
+        self.inner.channel.drop_warnings()
     }
 
     /// Open a new dedicated QUIC stream on this same connection, separate
@@ -989,9 +1027,7 @@ impl Session {
         let goodbye = frame::sign(frame::goodbye(reason, detail), identity);
         self.inner.channel.close(&goodbye).await;
         tokio::time::sleep(Self::CLOSE_DRAIN).await;
-        self.inner
-            .connection
-            .close(0u32.into(), reason.as_bytes());
+        self.inner.connection.close(0u32.into(), reason.as_bytes());
     }
 
     /// The supervised counterpart to the bare [`publish`](Self::publish)
@@ -1245,7 +1281,7 @@ fn rpc_replied(
 /// replacing a `"caller"` the sender put there under a text or byte-string
 /// key; any other payload unchanged. Mirrors
 /// `macula_station_link:with_caller/2`.
-fn with_caller(payload: Value, caller: [u8; 32]) -> Value {
+pub(crate) fn with_caller(payload: Value, caller: [u8; 32]) -> Value {
     match payload {
         Value::Map(mut fields) => {
             fields.retain(|(key, _)| !is_caller_key(key));
@@ -1311,10 +1347,12 @@ where
     match outcome {
         Ok(Ok(value)) => {
             if let Some(session) = session {
-                session
-                    .inner
-                    .channel
-                    .hand_off(rpc_replied(call_info.realm, identity, request_id, None));
+                session.inner.channel.hand_off(rpc_replied(
+                    call_info.realm,
+                    identity,
+                    request_id,
+                    None,
+                ));
             }
             frame::result(&frame::ResultSpec::new(call_info.call_id, value, self_pub))
         }
@@ -1506,7 +1544,10 @@ mod ucan_gating_tests {
         let (caller, claimed) = (KeyPair::generate().node_id(), KeyPair::generate().node_id());
         let payload = Value::Map(vec![
             (Value::text("caller"), Value::Bytes(claimed.to_vec())),
-            (Value::Bytes(b"caller".to_vec()), Value::Bytes(claimed.to_vec())),
+            (
+                Value::Bytes(b"caller".to_vec()),
+                Value::Bytes(claimed.to_vec()),
+            ),
         ]);
 
         let seen = payload_seen_by_the_handler(payload, caller).await;

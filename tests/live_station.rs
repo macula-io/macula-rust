@@ -275,7 +275,10 @@ async fn pubsub_round_trip_against_the_real_fleet() {
         .await
         .expect("PUBLISH should send without error");
 
-    match subscription.recv_event(std::time::Duration::from_secs(5)).await {
+    match subscription
+        .recv_event(std::time::Duration::from_secs(5))
+        .await
+    {
         Ok(event) => {
             println!(
                 "OBSERVED: received our own EVENT back — topic={} seq={} delivered_via={} payload={:?}",
@@ -459,10 +462,9 @@ async fn run_subscriber_and_run_publisher_against_the_real_fleet() {
 #[ignore = "requires network access to a live macula-station"]
 async fn publish_survives_immediate_close_against_the_real_fleet() {
     let sub_identity = KeyPair::generate_with_default_puzzle();
-    let sub_session =
-        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_identity)
-            .await
-            .expect("handshake should succeed (subscriber)");
+    let sub_session = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &sub_identity)
+        .await
+        .expect("handshake should succeed (subscriber)");
 
     let realm: [u8; 32] = rand::random();
     let topic = format!(
@@ -1221,10 +1223,9 @@ async fn rpc_telemetry_facts_against_the_real_fleet() {
 
     // Watcher subscribes to all 4 topics BEFORE anything happens — pubsub
     // has no replay for a late subscriber.
-    let watcher =
-        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_identity)
-            .await
-            .expect("watcher handshake should succeed");
+    let watcher = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &watcher_identity)
+        .await
+        .expect("watcher handshake should succeed");
     let mut subscriptions = Vec::new();
     for topic in [
         "rpc.sent_v1",
@@ -1986,10 +1987,14 @@ async fn resolver_session_still_connected_after_a_direct_call() {
         hex::encode(rand::random::<[u8; 8]>())
     );
 
-    let provider_session =
-        connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &provider_identity)
-            .await
-            .expect("provider handshake should succeed");
+    let provider_session = connection::connect(
+        STATION_HOST,
+        STATION_PORT,
+        Trust::WebPki,
+        &provider_identity,
+    )
+    .await
+    .expect("provider handshake should succeed");
     macula_rust::direct_dial::advertise_direct(
         &provider_session,
         &provider_identity,
@@ -2007,13 +2012,18 @@ async fn resolver_session_still_connected_after_a_direct_call() {
             return None;
         }
         let echo: connection::CallHandler = std::sync::Arc::new(|payload: Value| {
-            Box::pin(async move { Ok(payload) }) as connection::BoxFuture<'static, Result<Value, String>>
+            Box::pin(async move { Ok(payload) })
+                as connection::BoxFuture<'static, Result<Value, String>>
         });
         Some(echo)
     };
     let serve_task = tokio::spawn(async move {
         let result = provider_session
-            .serve_one_call(lookup, &provider_identity, std::time::Duration::from_secs(20))
+            .serve_one_call(
+                lookup,
+                &provider_identity,
+                std::time::Duration::from_secs(20),
+            )
             .await;
         (result, provider_session, provider_identity)
     });
@@ -2071,10 +2081,18 @@ async fn resolver_session_still_connected_after_a_direct_call() {
     );
 
     provider_session
-        .close("normal", Some("direct-dial reuse provider done"), &provider_identity)
+        .close(
+            "normal",
+            Some("direct-dial reuse provider done"),
+            &provider_identity,
+        )
         .await;
     resolver
-        .close("normal", Some("direct-dial reuse resolver done"), &caller_identity)
+        .close(
+            "normal",
+            Some("direct-dial reuse resolver done"),
+            &caller_identity,
+        )
         .await;
 }
 
