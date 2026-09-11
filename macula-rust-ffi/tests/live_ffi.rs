@@ -377,9 +377,16 @@ async fn ucan_gated_serve_one_call_through_the_ffi_surface() {
         serve_until_procedure(&provider, &serve_procedure, policy, 10_000, 5, &provider_id).await
     });
 
+    // A gated provider accepts a token only from the caller it names as its
+    // audience: that caller's node id as lowercase hex.
+    let caller_audience: String = caller_id
+        .node_id()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let token = ucan_create(
         "did:macula:live-test-issuer".to_string(),
-        "did:macula:live-test-audience".to_string(),
+        caller_audience,
         vec![FfiCapability {
             with: "mri:test".to_string(),
             can: "invoke".to_string(),

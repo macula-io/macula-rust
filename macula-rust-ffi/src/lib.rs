@@ -408,7 +408,9 @@ impl From<macula_rust::ucan::Payload> for FfiUcanPayload {
 
 /// Mints a new UCAN token, self-issued and signed by `identity` — see
 /// [`macula_rust::ucan::create`]'s own doc for the full contract
-/// (`issuer`/`audience` are opaque DID strings, not validated here).
+/// (`issuer`/`audience` are opaque strings, not validated here). A token
+/// for a UCAN-gated procedure must name the calling node as its `audience`:
+/// that node's id as lowercase hex.
 #[uniffi::export]
 pub fn ucan_create(
     issuer: String,

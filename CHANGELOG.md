@@ -34,6 +34,18 @@ usually touches both, but their version numbers don't move in lockstep.
   `get_direct` transfer cut off by the timeout, and `last`, also its
   `source()`, carries the failure before it. An exhaustive `match` on
   `GetDirectError` needs the new arm.
+- **Breaking: a UCAN-gated procedure binds the token to its caller.**
+  `ucan::Policy::check` takes the CALL's `caller` as well as its token, and
+  a `Policy::required` procedure accepts a token only when its `aud` is
+  that caller's 32-byte node id as lowercase hex, with no `did:` prefix. A
+  token with another or no audience is refused as `unauthorized`
+  (`UcanError::WrongAudience`, and `UcanError::NoCaller` when `check` gets
+  no 32-byte caller; both new). Mint tokens for gated procedures with that
+  audience.
+- **An inbound CALL must be signed by the caller it names.**
+  `Session::serve_one_call` and `serve_one_call_gated` drop a CALL whose
+  signature doesn't verify against its `caller` field, without a reply and
+  before any policy or handler runs, matching the Erlang station link.
 
 ### [0.3.0] - 2026-09-05
 
@@ -310,6 +322,10 @@ did, but the two have moved at different paces ever since).
   authorized provider, and their `timeout_ms` now bounds finding the
   provider as well. A `get_direct` whose transfer the timeout cuts off
   reports `FfiError::Content` with the earlier failure in its reason.
+- `FfiSession::serve_one_call_gated` refuses a UCAN token whose `aud` isn't
+  the calling node's id as lowercase hex, and both serve calls drop a CALL
+  that isn't signed by its caller. Mint tokens for gated procedures with
+  `ucan_create` using that audience.
 
 ### [ffi-0.3.1] - 2026-09-05
 

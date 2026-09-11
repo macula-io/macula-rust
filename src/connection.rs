@@ -757,10 +757,16 @@ impl Session {
     /// open policy (the default [`serve_one_call`](Self::serve_one_call)
     /// uses) behaves identically; a [`crate::ucan::Policy::required`]
     /// policy demands a CALL's `ucan_token` verify against the required
-    /// issuer, and refuses with BOLT#4 `unauthorized` WITHOUT ever
-    /// invoking `lookup` or a handler if it doesn't — a [`CallHandler`]
-    /// never sees the raw token either way, matching the reference's own
-    /// handler contract (payload only).
+    /// issuer and name the CALL's `caller` as its audience, and refuses
+    /// with BOLT#4 `unauthorized` WITHOUT ever invoking `lookup` or a
+    /// handler if it doesn't — a [`CallHandler`] never sees the raw token
+    /// either way, matching the reference's own handler contract (payload
+    /// only).
+    ///
+    /// Before any policy runs, the CALL's signature must verify against the
+    /// `caller` it names; a CALL that doesn't is dropped with no reply, as
+    /// `macula_station_link.erl`'s `on_inbound_call/3` does, and this keeps
+    /// waiting for the next one.
     pub async fn serve_one_call_gated<L, P>(
         &mut self,
         lookup: L,
@@ -796,11 +802,11 @@ impl Session {
                 .recv_frame()
                 .await
                 .map_err(ServeCallError::Recv)?;
-            let Ok(call_info) = frame::parse_call(&value) else {
-                continue; // not ours -- see this method's doc on the limitation
+            let Some(reply) =
+                reply_to_frame(&value, &lookup, &policy, identity, Some(&mut *self)).await
+            else {
+                continue; // not a CALL signed by its caller -- see this method's doc
             };
-            let reply =
-                build_call_reply(call_info, &lookup, &policy, identity, Some(&mut *self)).await;
             let signed = frame::sign(reply, identity);
             self.control
                 .send_frame(signed)
@@ -1187,6 +1193,28 @@ async fn announce_rpc_replied(
     announce_fact(session, realm, identity, RPC_REPLIED_TOPIC, payload).await;
 }
 
+/// The reply to one inbound frame, or `None` when there is nothing to
+/// answer: the frame isn't a CALL, or its signature doesn't verify against
+/// the `caller` it names. Mirrors `macula_station_link.erl`'s
+/// `on_inbound_call/3`: a CALL that isn't signed by the caller it names
+/// never reaches policy or a handler, and gets no reply. Otherwise
+/// [`build_call_reply`].
+async fn reply_to_frame<L, P>(
+    value: &Value,
+    lookup: &L,
+    policy: &P,
+    identity: &KeyPair,
+    session: Option<&mut Session>,
+) -> Option<Value>
+where
+    L: Fn(&[u8; 32], &str) -> Option<CallHandler>,
+    P: Fn(&[u8; 32], &str) -> crate::ucan::Policy,
+{
+    let call_info = frame::parse_call(value).ok()?;
+    frame::verify(value, &call_info.caller).ok()?;
+    Some(build_call_reply(call_info, lookup, policy, identity, session).await)
+}
+
 /// Fires `rpc.received_v1`/`rpc.replied_v1` around dispatch when `session`
 /// is `Some` -- `None` for the pure dispatch-logic unit tests in
 /// `ucan_gating_tests` below, which deliberately exercise this function
@@ -1219,7 +1247,7 @@ where
     let self_pub = identity.node_id();
 
     if policy(&call_info.realm, &call_info.procedure)
-        .check(&call_info.ucan_token)
+        .check(&call_info.ucan_token, &call_info.caller)
         .is_err()
     {
         return frame::call_error(&frame::CallErrorSpec::new(
@@ -1275,6 +1303,8 @@ mod ucan_gating_tests {
     //! `(CallInfo, lookup, policy, self_pub)`, so its dispatch/reply logic
     //! is fully testable in isolation. Mirrors `macula-go`'s own 4
     //! connection-level UCAN-gating unit tests (`serve_ucan_test.go`).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::identity::KeyPair;
     use crate::ucan::{self, Policy};
@@ -1374,7 +1404,7 @@ mod ucan_gating_tests {
         let id = KeyPair::generate();
         let good_token = ucan::create(
             "did:iss",
-            "did:aud",
+            &hex::encode(call_info(Vec::new()).caller),
             vec![],
             &id,
             ucan::CreateOpts::default(),
@@ -1393,5 +1423,203 @@ mod ucan_gating_tests {
             frame::parse_call_response(&reply),
             Ok(frame::CallResponse::Result { .. })
         ));
+    }
+
+    // The provider side of an inbound CALL: a CALL reaches policy and a
+    // handler only when its signature verifies against the caller it names,
+    // and a gated policy accepts a token only from the caller it was minted
+    // for. The names match macula-go's connection/serve_caller_test.go; the
+    // behaviour matches macula_station_link.erl's on_inbound_call/3.
+
+    fn call_frame(named_caller: &KeyPair) -> Value {
+        frame::call(&frame::CallSpec::new(
+            [3; 16],
+            "test.proc",
+            [0; 32],
+            Value::text("hello"),
+            0,
+            named_caller.node_id(),
+        ))
+    }
+
+    fn call_info_from(caller: [u8; 32], ucan_token: Vec<u8>) -> frame::CallInfo {
+        frame::CallInfo {
+            caller,
+            ..call_info(ucan_token)
+        }
+    }
+
+    fn token_for(issuer: &KeyPair, audience: &str) -> Vec<u8> {
+        ucan::create(
+            "did:iss",
+            audience,
+            vec![],
+            issuer,
+            ucan::CreateOpts::default(),
+        )
+        .unwrap()
+    }
+
+    /// An echo handler that counts how often it ran.
+    fn counting_lookup(
+        invocations: Arc<AtomicUsize>,
+    ) -> impl Fn(&[u8; 32], &str) -> Option<CallHandler> {
+        move |_, _| {
+            let invocations = invocations.clone();
+            Some(Arc::new(move |payload: Value| {
+                invocations.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(payload) })
+            }))
+        }
+    }
+
+    fn is_unauthorized(reply: &Value) -> bool {
+        matches!(
+            frame::parse_call_response(reply),
+            Ok(frame::CallResponse::Error { code, .. }) if code == bolt4::Code::Unauthorized as u8
+        )
+    }
+
+    #[tokio::test]
+    async fn reply_to_frame_ignores_a_call_not_signed_by_its_caller() {
+        let (named, signer) = (KeyPair::generate(), KeyPair::generate());
+        let invocations = Arc::new(AtomicUsize::new(0));
+
+        let reply = reply_to_frame(
+            &frame::sign(call_frame(&named), &signer),
+            &counting_lookup(invocations.clone()),
+            &|_, _| Policy::open(),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+
+        assert!(reply.is_none(), "{reply:?}");
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reply_to_frame_ignores_an_unsigned_call() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+
+        let reply = reply_to_frame(
+            &call_frame(&KeyPair::generate()),
+            &counting_lookup(invocations.clone()),
+            &|_, _| Policy::open(),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+
+        assert!(reply.is_none(), "{reply:?}");
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reply_to_frame_answers_a_call_signed_by_its_caller() {
+        let caller = KeyPair::generate();
+        let invocations = Arc::new(AtomicUsize::new(0));
+
+        let reply = reply_to_frame(
+            &frame::sign(call_frame(&caller), &caller),
+            &counting_lookup(invocations.clone()),
+            &|_, _| Policy::open(),
+            &KeyPair::generate(),
+            None,
+        )
+        .await
+        .expect("a CALL signed by its caller is answered");
+
+        assert!(matches!(
+            frame::parse_call_response(&reply),
+            Ok(frame::CallResponse::Result { .. })
+        ));
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    /// A `CallInfo` always carries a 32-byte caller, so a CALL without one
+    /// can't reach the policy at all: the frame itself is dropped.
+    #[tokio::test]
+    async fn reply_to_frame_ignores_a_call_without_caller() {
+        let caller = KeyPair::generate();
+        let invocations = Arc::new(AtomicUsize::new(0));
+
+        let reply = reply_to_frame(
+            &frame::sign(call_frame(&caller).without(&["caller"]), &caller),
+            &counting_lookup(invocations.clone()),
+            &|_, _| Policy::open(),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+
+        assert!(reply.is_none(), "{reply:?}");
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn build_call_reply_gated_policy_refuses_a_token_presented_by_another_caller() {
+        let (issuer, audience, presenter) = (
+            KeyPair::generate(),
+            KeyPair::generate(),
+            KeyPair::generate(),
+        );
+        let token = token_for(&issuer, &hex::encode(audience.node_id()));
+
+        let reply = build_call_reply(
+            call_info_from(presenter.node_id(), token),
+            &never_called_lookup(),
+            &move |_, _| Policy::required(issuer.node_id()),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+
+        assert!(
+            is_unauthorized(&reply),
+            "{:?}",
+            frame::parse_call_response(&reply)
+        );
+    }
+
+    #[tokio::test]
+    async fn build_call_reply_gated_policy_accepts_a_token_from_its_audience() {
+        let (issuer, caller) = (KeyPair::generate(), KeyPair::generate());
+        let token = token_for(&issuer, &hex::encode(caller.node_id()));
+
+        let reply = build_call_reply(
+            call_info_from(caller.node_id(), token),
+            &echo_lookup(),
+            &move |_, _| Policy::required(issuer.node_id()),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            frame::parse_call_response(&reply),
+            Ok(frame::CallResponse::Result { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn build_call_reply_gated_policy_refuses_a_token_without_audience() {
+        let (issuer, caller) = (KeyPair::generate(), KeyPair::generate());
+        let token = token_for(&issuer, "");
+
+        let reply = build_call_reply(
+            call_info_from(caller.node_id(), token),
+            &never_called_lookup(),
+            &move |_, _| Policy::required(issuer.node_id()),
+            &KeyPair::generate(),
+            None,
+        )
+        .await;
+
+        assert!(
+            is_unauthorized(&reply),
+            "{:?}",
+            frame::parse_call_response(&reply)
+        );
     }
 }

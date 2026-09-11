@@ -86,10 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     println!("call without a token: {rejected:?}");
 
-    // Second call: a real token minted by the required authority.
+    // Second call: a real token minted by the required authority. It names
+    // this caller as its audience (the caller's node id as lowercase hex),
+    // the only caller a gated provider accepts it from.
     let token = ucan::create(
         "did:key:example-issuer",
-        "did:key:example-audience",
+        &hex::encode(caller_id.node_id()),
         vec![],
         &authority,
         ucan::CreateOpts::default(),
