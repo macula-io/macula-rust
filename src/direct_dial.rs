@@ -33,8 +33,9 @@
 //! and each candidate gets a share of what remains for its endpoint lookup
 //! and dial. At the deadline, the most recent candidate failure is returned
 //! as it was raised; a later query that finds nothing, or fails, never
-//! replaces it. When no candidate was ever tried, the reason none qualified
-//! is returned instead.
+//! replaces it. When no candidate was ever tried, the call returns why the
+//! latest answered query found none, else the latest failed query's error,
+//! else a timeout: an absence nobody observed is never reported.
 //!
 //! **Reuse:** a station keeps one connection per identity and closes the
 //! older one when a newer one arrives. So when this process already has a
@@ -122,6 +123,9 @@ pub enum ResolveError {
     /// the specific [`CertChainError`] from the LAST candidate tried
     /// (absent chain, wrong org, untrusted chain, etc.).
     NoAuthorizedAdvertisement(CertChainError),
+    /// The timeout ran out before any DHT lookup was answered or failed, or
+    /// before any candidate could be tried.
+    Timeout,
 }
 
 impl std::fmt::Display for ResolveError {
@@ -148,6 +152,10 @@ impl std::fmt::Display for ResolveError {
             ResolveError::NoAuthorizedAdvertisement(e) => write!(
                 f,
                 "direct_dial: no candidate advertisement is cert-chain-authorized for the expected org: {e}"
+            ),
+            ResolveError::Timeout => write!(
+                f,
+                "direct_dial: the timeout ran out before a provider was resolved"
             ),
         }
     }
@@ -283,12 +291,14 @@ struct Remembered<F> {
     error: F,
 }
 
-/// The failure a call reports at its deadline: the remembered failure of the
-/// last candidate tried or, while no candidate has failed yet, why the last
-/// query found none.
+/// The failure a call reports at its deadline, the first of: the remembered
+/// failure of the last candidate tried, why the latest answered query found
+/// no candidate, and the latest failed query's error. With none of them the
+/// call reports a timeout.
 enum Last<F> {
-    Unresolved(F),
     Candidate([u8; 32]),
+    NoneQualified(F),
+    LookupFailed(F),
 }
 
 fn take_last<F>(
@@ -296,19 +306,40 @@ fn take_last<F>(
     failures: &mut HashMap<[u8; 32], Remembered<F>>,
 ) -> Option<F> {
     match last? {
-        Last::Unresolved(failure) => Some(failure),
         Last::Candidate(key) => failures.remove(&key).map(|remembered| remembered.error),
+        Last::NoneQualified(failure) | Last::LookupFailed(failure) => Some(failure),
     }
 }
 
-/// Whether a query that found no candidate may record why: never over a
-/// candidate's failure, and not over an earlier reason once the deadline has
-/// cut the query short, since such a query learned nothing.
-fn may_record_unresolved<F>(last: &Option<Last<F>>, deadline: CallDeadline) -> bool {
-    match last {
-        Some(Last::Candidate(_)) => false,
-        Some(Last::Unresolved(_)) => !deadline.passed(),
-        None => true,
+/// Records why an answered query found no candidate: over a failed query's
+/// error, never over a candidate's failure.
+fn record_none_qualified<F>(last: &mut Option<Last<F>>, reason: F) {
+    if !matches!(last, Some(Last::Candidate(_))) {
+        *last = Some(Last::NoneQualified(reason));
+    }
+}
+
+/// Records a failed query's error, only while no candidate has failed and no
+/// query was answered.
+fn record_lookup_failure<F>(last: &mut Option<Last<F>>, error: F) {
+    if matches!(last, None | Some(Last::LookupFailed(_))) {
+        *last = Some(Last::LookupFailed(error));
+    }
+}
+
+/// What one DHT query came to.
+enum Lookup {
+    Answered(Vec<Record>),
+    Failed(DhtError),
+    /// Cut off by the deadline: it learned nothing.
+    CutOff,
+}
+
+async fn query<D: DhtLookups>(dht: &mut D, key: [u8; 32], deadline: CallDeadline) -> Lookup {
+    match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
+        Ok(Ok(recs)) => Lookup::Answered(recs),
+        Ok(Err(e)) => Lookup::Failed(e),
+        Err(_) => Lookup::CutOff,
     }
 }
 
@@ -344,27 +375,28 @@ where
     let mut last: Option<Last<Failure<DE, RE>>> = None;
     let mut pause = RESOLVE_RETRY_DELAY;
     loop {
-        let (recs, lookup_failure) =
-            match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
-                Ok(Ok(recs)) => (recs, None),
-                // A lookup that failed teaches nothing: no records this pass,
-                // and its error is why none qualified.
-                Ok(Err(e)) => (Vec::new(), Some(e)),
-                // Cut off by the deadline: no records this pass.
-                Err(_) => (Vec::new(), None),
-            };
-        let (candidates, unresolved) = if let Some(e) = lookup_failure {
-            (Vec::new(), ResolveError::Dht(e))
-        } else if recs.is_empty() {
-            (Vec::new(), ResolveError::ProcedureNotAdvertised)
-        } else if let Some(check) = cert_chain {
-            authorized_advertisements(&recs, check)
-        } else {
-            trusted_advertisements(&recs)
+        let candidates = match query(dht, key, deadline).await {
+            Lookup::Answered(recs) => {
+                let (candidates, unresolved) = if recs.is_empty() {
+                    (Vec::new(), ResolveError::ProcedureNotAdvertised)
+                } else if let Some(check) = cert_chain {
+                    authorized_advertisements(&recs, check)
+                } else {
+                    trusted_advertisements(&recs)
+                };
+                if candidates.is_empty() {
+                    record_none_qualified(&mut last, Failure::Resolve(unresolved));
+                }
+                candidates
+            }
+            // A failed query teaches nothing, and is retried like one that
+            // found no candidate.
+            Lookup::Failed(e) => {
+                record_lookup_failure(&mut last, Failure::Resolve(ResolveError::Dht(e)));
+                Vec::new()
+            }
+            Lookup::CutOff => Vec::new(),
         };
-        if candidates.is_empty() && may_record_unresolved(&last, deadline) {
-            last = Some(Last::Unresolved(Failure::Resolve(unresolved)));
-        }
         for (tried, candidate) in candidates.iter().enumerate() {
             if deadline.passed() {
                 break;
@@ -427,10 +459,9 @@ where
             break;
         }
     }
-    // With no failure seen at all, the deadline ran out before any
-    // candidate could be tried.
-    Err(take_last(last, &mut failures)
-        .unwrap_or(Failure::Resolve(ResolveError::StationEndpointNotFound)))
+    // With nothing observed at all, the deadline ran out before any query
+    // was answered or any candidate could be tried.
+    Err(take_last(last, &mut failures).unwrap_or(Failure::Resolve(ResolveError::Timeout)))
 }
 
 /// Resolves a known station's endpoint, dials it with `dial`, and sends it
@@ -495,21 +526,22 @@ where
     let mut last: Option<Last<ContentFailure<DE, RE>>> = None;
     let mut pause = RESOLVE_RETRY_DELAY;
     loop {
-        let (recs, lookup_failure) =
-            match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
-                Ok(Ok(recs)) => (recs, None),
-                // A lookup that failed teaches nothing: no records this pass,
-                // and its error is why none qualified.
-                Ok(Err(e)) => (Vec::new(), Some(e)),
-                // Cut off by the deadline: no records this pass.
-                Err(_) => (Vec::new(), None),
-            };
-        let providers = trusted_content_providers(&recs);
-        if providers.is_empty() && may_record_unresolved(&last, deadline) {
-            last = Some(Last::Unresolved(
-                lookup_failure.map_or(ContentFailure::NotAnnounced, ContentFailure::Dht),
-            ));
-        }
+        let providers = match query(dht, key, deadline).await {
+            Lookup::Answered(recs) => {
+                let providers = trusted_content_providers(&recs);
+                if providers.is_empty() {
+                    record_none_qualified(&mut last, ContentFailure::NotAnnounced);
+                }
+                providers
+            }
+            // A failed query teaches nothing, and is retried like one that
+            // found no provider.
+            Lookup::Failed(e) => {
+                record_lookup_failure(&mut last, ContentFailure::Dht(e));
+                Vec::new()
+            }
+            Lookup::CutOff => Vec::new(),
+        };
         for (tried, provider) in providers.iter().enumerate() {
             if deadline.passed() {
                 break;
@@ -557,7 +589,9 @@ where
             break;
         }
     }
-    Err(take_last(last, &mut failures).unwrap_or(ContentFailure::NotAnnounced))
+    // With nothing observed at all, the deadline ran out before any query
+    // was answered or any provider could be tried.
+    Err(take_last(last, &mut failures).unwrap_or(ContentFailure::Timeout(None)))
 }
 
 /// Reaches one content provider: on the session `already_open` has for its
@@ -741,10 +775,13 @@ struct EndpointLookup {
     answered: bool,
 }
 
-/// With `retry_within_budget`, an absent or stale record is looked up again
-/// every [`RESOLVE_RETRY_DELAY`] until `budget` runs out — the DHT can hand
-/// back a replica that hasn't been evicted yet even though the station's
-/// own current publish is live.
+/// With `retry_within_budget`, an absent or stale record, or a lookup that
+/// failed, is looked up again every [`RESOLVE_RETRY_DELAY`] until `budget`
+/// runs out — the DHT can hand back a replica that hasn't been evicted yet
+/// even though the station's own current publish is live. When no usable
+/// record turns up, the lookup reports what it observed: not found when a
+/// lookup was answered, else the latest failed lookup's error, else a
+/// timeout.
 async fn lookup_station_endpoint<D: DhtLookups>(
     dht: &mut D,
     station: [u8; 32],
@@ -754,6 +791,7 @@ async fn lookup_station_endpoint<D: DhtLookups>(
     let key = dht::station_endpoint_key(station);
     let mut seen_version = None;
     let mut answered = false;
+    let mut failed = None;
     loop {
         match tokio::time::timeout(budget.remaining(), dht.find_record(key)).await {
             Ok(Ok(rec)) => {
@@ -790,19 +828,22 @@ async fn lookup_station_endpoint<D: DhtLookups>(
                 }
             }
             Ok(Err(DhtError::NotFound)) => answered = true,
-            Ok(Err(e)) => {
-                return EndpointLookup {
-                    outcome: Err(ResolveError::Dht(e)),
-                    seen_version,
-                    answered,
-                }
-            }
+            // A failed lookup teaches nothing: looked up again like an absent
+            // record.
+            Ok(Err(e)) => failed = Some(e),
             // Cut off by the budget: nothing learned.
             Err(_) => {}
         }
         if !retry_within_budget || budget.passed() {
+            let unresolved = if answered {
+                ResolveError::StationEndpointNotFound
+            } else if let Some(e) = failed {
+                ResolveError::Dht(e)
+            } else {
+                ResolveError::Timeout
+            };
             return EndpointLookup {
-                outcome: Err(ResolveError::StationEndpointNotFound),
+                outcome: Err(unresolved),
                 seen_version,
                 answered,
             };
@@ -1591,10 +1632,11 @@ pub enum GetDirectError {
     EndpointParse(String),
     Dial(DialAndVerifyError),
     Get(content::GetError),
-    /// The timeout ran out during a content transfer. `last` is the
-    /// failure before it, if any — for example the provider tried first
-    /// serving content that didn't verify — and is also this error's
-    /// [`source`](std::error::Error::source).
+    /// The timeout ran out before the content arrived: during a content
+    /// transfer, or before any provider lookup was answered. `last` is the
+    /// failure before a cut-off transfer, if any — for example the provider
+    /// tried first serving content that didn't verify — and is also this
+    /// error's [`source`](std::error::Error::source).
     Timeout {
         last: Option<Box<GetDirectError>>,
     },
@@ -1616,7 +1658,7 @@ impl std::fmt::Display for GetDirectError {
             GetDirectError::Timeout { last: None } => {
                 write!(
                     f,
-                    "direct_dial: the timeout ran out during the content transfer"
+                    "direct_dial: the timeout ran out before the content arrived"
                 )
             }
             GetDirectError::Timeout { last: Some(last) } => write!(
@@ -2037,6 +2079,101 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn call_reports_not_advertised_when_a_lookup_answered_before_later_ones_failed() {
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![]]);
+        dht.fail_lookups_after(procedure_key(), 1);
+
+        let result = call(&dht, &FakeStations::default(), SHORT).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Failure::Resolve(ResolveError::ProcedureNotAdvertised))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_reports_a_timeout_when_no_lookup_was_answered_in_time() {
+        let dht = FakeDht::new();
+        dht.never_answer(procedure_key());
+        let started = Instant::now();
+
+        let result = call(&dht, &FakeStations::default(), SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Timeout))),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+    }
+
+    #[tokio::test]
+    async fn call_keeps_a_lookup_error_when_a_later_lookup_is_cut_off_by_the_deadline() {
+        let dht = FakeDht::new();
+        dht.fail_first_lookups(procedure_key(), 1);
+        dht.never_answer(procedure_key());
+
+        let result = call(&dht, &FakeStations::default(), SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Dht(_)))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_direct_reports_not_announced_when_a_lookup_answered_before_later_ones_failed() {
+        let mcid = new_mcid();
+        let dht = FakeDht::new();
+        dht.answer(dht::content_key(mcid), vec![vec![]]);
+        dht.fail_lookups_after(dht::content_key(mcid), 1);
+        let stations = FakeStations::default();
+
+        let result = fetch_content(
+            &mut dht.clone(),
+            mcid,
+            nothing_open,
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
+            SHORT,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContentFailure::NotAnnounced)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_direct_reports_a_timeout_when_no_lookup_was_answered_in_time() {
+        let mcid = new_mcid();
+        let dht = FakeDht::new();
+        dht.never_answer(dht::content_key(mcid));
+        let stations = FakeStations::default();
+        let started = Instant::now();
+
+        let result = fetch_content(
+            &mut dht.clone(),
+            mcid,
+            nothing_open,
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
+            SHORT,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ContentFailure::Timeout(None))),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+    }
+
     /// A DHT that answers `find_records` on a key with successive replies,
     /// repeating the last, and `find_record` with the `station_endpoint`
     /// published under that key (not_found otherwise). Clones share state,
@@ -2050,6 +2187,8 @@ mod tests {
         asked: HashMap<[u8; 32], Vec<Duration>>,
         fail_after: HashMap<[u8; 32], usize>,
         fail_first: HashMap<[u8; 32], usize>,
+        never_answered: HashSet<[u8; 32]>,
+        endpoint_asked: HashMap<[u8; 32], usize>,
         endpoints: HashMap<[u8; 32], Record>,
     }
 
@@ -2061,6 +2200,8 @@ mod tests {
                 asked: HashMap::new(),
                 fail_after: HashMap::new(),
                 fail_first: HashMap::new(),
+                never_answered: HashSet::new(),
+                endpoint_asked: HashMap::new(),
                 endpoints: HashMap::new(),
             })))
         }
@@ -2108,10 +2249,17 @@ mod tests {
                 .fail_first
                 .insert(key, failed_lookups);
         }
-    }
 
-    impl DhtLookups for FakeDht {
-        async fn find_records(&mut self, key: [u8; 32]) -> Result<Vec<Record>, DhtError> {
+        /// Lookups of `key` never get an answer once any
+        /// `fail_first_lookups` have failed; only the caller's deadline ends
+        /// them.
+        fn never_answer(&self, key: [u8; 32]) {
+            self.0.lock().unwrap().never_answered.insert(key);
+        }
+
+        /// Answers one `find_records` lookup of `key` at once, or `None` when
+        /// `key` is never answered.
+        fn lookup_now(&self, key: [u8; 32]) -> Option<Result<Vec<Record>, DhtError>> {
             let mut state = self.0.lock().unwrap();
             let elapsed = state.started.elapsed();
             let asked = state.asked.entry(key).or_default();
@@ -2122,32 +2270,78 @@ mod tests {
                 .get(&key)
                 .is_some_and(|failed| turn < *failed)
             {
-                return Err(DhtError::Remote(
+                return Some(Err(DhtError::Remote(
                     "the station did not answer the lookup".to_string(),
-                ));
+                )));
+            }
+            if state.never_answered.contains(&key) {
+                return None;
             }
             if state
                 .fail_after
                 .get(&key)
                 .is_some_and(|answered| turn >= *answered)
             {
-                return Err(DhtError::Remote("the resolver session is gone".to_string()));
+                return Some(Err(DhtError::Remote(
+                    "the resolver session is gone".to_string(),
+                )));
             }
-            Ok(state
+            Some(Ok(state
                 .replies
                 .get(&key)
                 .map(|replies| replies[turn.min(replies.len() - 1)].clone())
-                .unwrap_or_default())
+                .unwrap_or_default()))
         }
 
-        async fn find_record(&mut self, key: [u8; 32]) -> Result<Record, DhtError> {
+        /// How many times `find_record` was asked for `station`'s
+        /// `station_endpoint`.
+        fn endpoint_lookups_of(&self, station: &KeyPair) -> usize {
             self.0
                 .lock()
                 .unwrap()
-                .endpoints
+                .endpoint_asked
+                .get(&dht::station_endpoint_key(station.node_id()))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// Answers one `find_record` lookup of `key` at once, or `None` when
+        /// `key` is never answered. `fail_first_lookups` and `never_answer`
+        /// apply to `station_endpoint` keys too.
+        fn endpoint_lookup_now(&self, key: [u8; 32]) -> Option<Result<Record, DhtError>> {
+            let mut state = self.0.lock().unwrap();
+            let asked = state.endpoint_asked.entry(key).or_default();
+            *asked += 1;
+            let turn = *asked - 1;
+            if state
+                .fail_first
                 .get(&key)
-                .cloned()
-                .ok_or(DhtError::NotFound)
+                .is_some_and(|failed| turn < *failed)
+            {
+                return Some(Err(DhtError::Remote(
+                    "the station did not answer the lookup".to_string(),
+                )));
+            }
+            if state.never_answered.contains(&key) {
+                return None;
+            }
+            Some(state.endpoints.get(&key).cloned().ok_or(DhtError::NotFound))
+        }
+    }
+
+    impl DhtLookups for FakeDht {
+        async fn find_records(&mut self, key: [u8; 32]) -> Result<Vec<Record>, DhtError> {
+            match self.lookup_now(key) {
+                Some(answer) => answer,
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn find_record(&mut self, key: [u8; 32]) -> Result<Record, DhtError> {
+            match self.endpoint_lookup_now(key) {
+                Some(answer) => answer,
+                None => std::future::pending().await,
+            }
         }
     }
 
@@ -2492,6 +2686,129 @@ mod tests {
             "{result:?}"
         );
         assert_returned_within(SHORT_BOUND, started);
+    }
+
+    async fn put(
+        dht: &FakeDht,
+        stations: &FakeStations,
+        station: &KeyPair,
+        timeout: Duration,
+    ) -> Result<String, Failure<String, String>> {
+        reach_station(
+            &mut dht.clone(),
+            station.node_id(),
+            nothing_open,
+            |r: Resolved, _remaining: Duration| ready(stations.dial(&r)),
+            |host: String, _remaining: Duration| {
+                ready(Ok::<_, String>(format!("stored on {host}")))
+            },
+            timeout,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn put_direct_reports_no_station_endpoint_when_a_lookup_answered_not_found() {
+        let result = put(
+            &FakeDht::new(),
+            &FakeStations::default(),
+            &KeyPair::generate(),
+            SHORT,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Failure::Resolve(ResolveError::StationEndpointNotFound))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_direct_retries_an_endpoint_lookup_that_fails() {
+        let station = KeyPair::generate();
+        let dht = FakeDht::new();
+        dht.publish_endpoint(&station, station_endpoint(&station, "s.test"));
+        dht.fail_first_lookups(dht::station_endpoint_key(station.node_id()), 1);
+
+        let stored = put(&dht, &FakeStations::default(), &station, ROOMY)
+            .await
+            .expect("s stores once its endpoint lookup is answered");
+
+        assert_eq!(stored, "stored on s.test");
+    }
+
+    #[tokio::test]
+    async fn put_direct_reports_a_failed_endpoint_lookup_when_every_lookup_failed() {
+        let station = KeyPair::generate();
+        let dht = FakeDht::new();
+        dht.fail_first_lookups(dht::station_endpoint_key(station.node_id()), usize::MAX);
+        let started = Instant::now();
+
+        let result = put(&dht, &FakeStations::default(), &station, SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Dht(_)))),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+        assert!(
+            dht.endpoint_lookups_of(&station) > 1,
+            "a failed endpoint lookup is retried within the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_direct_reports_a_timeout_when_no_endpoint_lookup_was_answered_in_time() {
+        let station = KeyPair::generate();
+        let dht = FakeDht::new();
+        dht.never_answer(dht::station_endpoint_key(station.node_id()));
+        let started = Instant::now();
+
+        let result = put(&dht, &FakeStations::default(), &station, SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Timeout))),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+    }
+
+    #[tokio::test]
+    async fn put_direct_keeps_a_lookup_error_when_a_later_endpoint_lookup_is_cut_off_by_the_deadline(
+    ) {
+        let station = KeyPair::generate();
+        let dht = FakeDht::new();
+        dht.fail_first_lookups(dht::station_endpoint_key(station.node_id()), 1);
+        dht.never_answer(dht::station_endpoint_key(station.node_id()));
+
+        let result = put(&dht, &FakeStations::default(), &station, SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Dht(_)))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_reports_a_timeout_when_no_endpoint_lookup_was_answered_in_time() {
+        let a = Provider::new("a.test");
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        dht.never_answer(dht::station_endpoint_key(a.station.node_id()));
+        let stations = FakeStations::default();
+        let started = Instant::now();
+
+        let result = call(&dht, &stations, SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Timeout))),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+        assert!(stations.reached().is_empty());
     }
 
     #[tokio::test]

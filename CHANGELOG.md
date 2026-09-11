@@ -32,9 +32,19 @@ usually touches both, but their version numbers don't move in lockstep.
   seconds, and `put_direct`'s timeout covers the endpoint lookup and the
   dial.
 - **Breaking: new `GetDirectError::Timeout { last }`.** It reports a
-  `get_direct` transfer cut off by the timeout, and `last`, also its
-  `source()`, carries the failure before it. An exhaustive `match` on
-  `GetDirectError` needs the new arm.
+  `get_direct` whose timeout ran out during a transfer, where `last`, also
+  its `source()`, carries the failure before it, or before any provider
+  lookup was answered. An exhaustive `match` on `GetDirectError` needs the
+  new arm.
+- **Breaking: new `ResolveError::Timeout`, and a call reports what it
+  observed.** At its timeout a direct-dial call returns the last candidate
+  failure, else why an answered DHT lookup found nothing, else a failed
+  lookup's error, and `ResolveError::Timeout` only when nothing was
+  observed at all, where it used to report `ProcedureNotAdvertised` or
+  `StationEndpointNotFound`. A `station_endpoint` lookup follows the same
+  rule, reporting `StationEndpointNotFound` only when a lookup was
+  answered, and retries a lookup that fails within its budget. An
+  exhaustive `match` on `ResolveError` needs the new arm.
 - **Breaking: direct dial reuses a session this process already has open
   to the provider's station under the same identity.** A station keeps one
   connection per identity and closes the older one when a newer one
