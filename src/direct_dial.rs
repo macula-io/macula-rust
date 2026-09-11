@@ -30,8 +30,10 @@
 //! station that already failed is dialed again only once its advertisement
 //! or endpoint record has changed. The call's `timeout` bounds all of it,
 //! and each candidate gets a share of what remains for its endpoint lookup
-//! and dial. At the deadline, the last failure is returned as it was
-//! raised.
+//! and dial. At the deadline, the most recent candidate failure is returned
+//! as it was raised; a later query that finds nothing, or fails, never
+//! replaces it. When no candidate was ever tried, the reason none qualified
+//! is returned instead.
 //!
 //! `cert_chain`-based org/realm authorization (Slice 7c Direction B,
 //! `macula_record:verify_advertisement_cert_chain/3` on the Erlang side) is
@@ -269,8 +271,9 @@ struct Remembered<F> {
     error: F,
 }
 
-/// The failure a call reports at its deadline: why the last query found no
-/// candidate, or the remembered failure of the last candidate tried.
+/// The failure a call reports at its deadline: the remembered failure of the
+/// last candidate tried or, while no candidate has failed yet, why the last
+/// query found none.
 enum Last<F> {
     Unresolved(F),
     Candidate([u8; 32]),
@@ -283,6 +286,29 @@ fn take_last<F>(
     match last? {
         Last::Unresolved(failure) => Some(failure),
         Last::Candidate(key) => failures.remove(&key).map(|remembered| remembered.error),
+    }
+}
+
+/// The remembered failure of the last candidate tried, when the last failure
+/// is a candidate's.
+fn take_candidate<F>(
+    last: Option<Last<F>>,
+    failures: &mut HashMap<[u8; 32], Remembered<F>>,
+) -> Option<F> {
+    match last? {
+        Last::Candidate(key) => failures.remove(&key).map(|remembered| remembered.error),
+        Last::Unresolved(_) => None,
+    }
+}
+
+/// Whether a query that found no candidate may record why: never over a
+/// candidate's failure, and not over an earlier reason once the deadline has
+/// cut the query short, since such a query learned nothing.
+fn may_record_unresolved<F>(last: &Option<Last<F>>, deadline: CallDeadline) -> bool {
+    match last {
+        Some(Last::Candidate(_)) => false,
+        Some(Last::Unresolved(_)) => !deadline.passed(),
+        None => true,
     }
 }
 
@@ -315,7 +341,12 @@ where
     loop {
         let recs = match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
             Ok(Ok(recs)) => recs,
-            Ok(Err(e)) => return Err(Failure::Resolve(ResolveError::Dht(e))),
+            // The resolver session failed. A candidate that already failed
+            // is still the call's answer; otherwise the lookup's own error.
+            Ok(Err(e)) => {
+                return Err(take_candidate(last, &mut failures)
+                    .unwrap_or(Failure::Resolve(ResolveError::Dht(e))))
+            }
             // Cut off by the deadline: no records this pass.
             Err(_) => Vec::new(),
         };
@@ -326,9 +357,7 @@ where
         } else {
             trusted_advertisements(&recs)
         };
-        // A query the deadline cut short learned nothing, so it doesn't
-        // replace a failure already seen.
-        if candidates.is_empty() && !(deadline.passed() && last.is_some()) {
+        if candidates.is_empty() && may_record_unresolved(&last, deadline) {
             last = Some(Last::Unresolved(Failure::Resolve(unresolved)));
         }
         for (tried, candidate) in candidates.iter().enumerate() {
@@ -445,12 +474,16 @@ where
     loop {
         let recs = match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
             Ok(Ok(recs)) => recs,
-            Ok(Err(e)) => return Err(ContentFailure::Dht(e)),
+            // The resolver session failed. A provider that already failed is
+            // still the call's answer; otherwise the lookup's own error.
+            Ok(Err(e)) => {
+                return Err(take_candidate(last, &mut failures).unwrap_or(ContentFailure::Dht(e)))
+            }
             // Cut off by the deadline: no records this pass.
             Err(_) => Vec::new(),
         };
         let providers = trusted_content_providers(&recs);
-        if providers.is_empty() && !(deadline.passed() && last.is_some()) {
+        if providers.is_empty() && may_record_unresolved(&last, deadline) {
             last = Some(Last::Unresolved(ContentFailure::NotAnnounced));
         }
         for (tried, provider) in providers.iter().enumerate() {
@@ -1703,6 +1736,66 @@ mod tests {
         std::array::from_fn(|_| rand::random())
     }
 
+    #[tokio::test]
+    async fn call_reports_the_last_candidate_failure_when_a_later_pass_finds_none() {
+        let a = Provider::new("a.test");
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)], vec![]]);
+        dht.publish_endpoint(&a.station, station_endpoint(&a.station, &a.host));
+        let stations = FakeStations::default();
+        stations.refuse(&a.host);
+
+        let result = call(&dht, &stations, Duration::from_secs(1)).await;
+
+        assert!(
+            matches!(&result, Err(Failure::Dial(e)) if e.contains("refused")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_reports_the_last_candidate_failure_when_a_later_lookup_fails() {
+        let a = Provider::new("a.test");
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        dht.fail_lookups_after(procedure_key(), 1);
+        dht.publish_endpoint(&a.station, station_endpoint(&a.station, &a.host));
+        let stations = FakeStations::default();
+        stations.refuse(&a.host);
+
+        let result = call(&dht, &stations, Duration::from_secs(1)).await;
+
+        assert!(
+            matches!(&result, Err(Failure::Dial(e)) if e.contains("refused")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_direct_reports_the_last_candidate_failure_when_a_later_lookup_fails() {
+        let p = Provider::new("p.test");
+        let mcid = new_mcid();
+        let dht = FakeDht::new();
+        dht.answer(dht::content_key(mcid), vec![vec![announcement(&p, mcid)]]);
+        dht.fail_lookups_after(dht::content_key(mcid), 1);
+        let stations = FakeStations::default();
+        stations.refuse(&p.host);
+
+        let result = fetch_content(
+            &mut dht.clone(),
+            mcid,
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(
+            matches!(&result, Err(ContentFailure::Dial(e)) if e.contains("refused")),
+            "{result:?}"
+        );
+    }
+
     /// A DHT that answers `find_records` on a key with successive replies,
     /// repeating the last, and `find_record` with the `station_endpoint`
     /// published under that key (not_found otherwise). Clones share state,
@@ -1714,6 +1807,7 @@ mod tests {
         started: Instant,
         replies: HashMap<[u8; 32], Vec<Vec<Record>>>,
         asked: HashMap<[u8; 32], Vec<Duration>>,
+        fail_after: HashMap<[u8; 32], usize>,
         endpoints: HashMap<[u8; 32], Record>,
     }
 
@@ -1723,6 +1817,7 @@ mod tests {
                 started: Instant::now(),
                 replies: HashMap::new(),
                 asked: HashMap::new(),
+                fail_after: HashMap::new(),
                 endpoints: HashMap::new(),
             })))
         }
@@ -1750,6 +1845,16 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+
+        /// After `answered_lookups` lookups, `find_records` on `key` fails,
+        /// the way a query over a resolver session that has dropped does.
+        fn fail_lookups_after(&self, key: [u8; 32], answered_lookups: usize) {
+            self.0
+                .lock()
+                .unwrap()
+                .fail_after
+                .insert(key, answered_lookups);
+        }
     }
 
     impl DhtLookups for FakeDht {
@@ -1759,6 +1864,13 @@ mod tests {
             let asked = state.asked.entry(key).or_default();
             asked.push(elapsed);
             let turn = asked.len() - 1;
+            if state
+                .fail_after
+                .get(&key)
+                .is_some_and(|answered| turn >= *answered)
+            {
+                return Err(DhtError::Remote("the resolver session is gone".to_string()));
+            }
             Ok(state
                 .replies
                 .get(&key)
