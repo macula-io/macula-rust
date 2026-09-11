@@ -89,7 +89,7 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
             .await
             .expect("resolver handshake should succeed");
 
-    let (target_session, mut handle) = match direct_dial::open_stream_direct(
+    let opened = match direct_dial::open_stream_direct(
         &mut resolver_session,
         &caller_id,
         realm,
@@ -112,6 +112,10 @@ async fn open_stream_direct_round_trip_against_the_real_fleet() {
         }
         Err(e) => panic!("open_stream_direct should resolve, dial, and open: {e}"),
     };
+    let mut handle = opened.stream;
+    let target_session = opened.session.expect(
+        "caller_id has no session open to the provider's station, so direct dial dials one",
+    );
 
     let (accept_result, provider_session) =
         accept_task.await.expect("accept task should not panic");

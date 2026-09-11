@@ -34,6 +34,17 @@ usually touches both, but their version numbers don't move in lockstep.
   `get_direct` transfer cut off by the timeout, and `last`, also its
   `source()`, carries the failure before it. An exhaustive `match` on
   `GetDirectError` needs the new arm.
+- **Breaking: direct dial reuses a session this process already has open
+  to the provider's station under the same identity.** A station keeps one
+  connection per identity and closes the older one when a newer one
+  arrives, so a second dial used to close `resolve_via` or a `Pool` link.
+  `open_stream_direct`, `open_stream_direct_with_cert_chain`, `put_direct`
+  and `get_direct` now run on that open session, on a dedicated QUIC
+  stream, and leave it open. The stream functions return
+  `direct_dial::OpenedStream` (`stream`, `session`) instead of a
+  `(Session, StreamHandle)` tuple, and `session` is `None` when the stream
+  runs on a session that was already open. `call` and its variants still
+  dial their own connection.
 - **Breaking: a UCAN-gated procedure binds the token to its caller.**
   `ucan::Policy::check` takes the CALL's `caller` as well as its token, and
   a `Policy::required` procedure accepts a token only when its `aud` is
@@ -326,6 +337,11 @@ did, but the two have moved at different paces ever since).
   the calling node's id as lowercase hex, and both serve calls drop a CALL
   that isn't signed by its caller. Mint tokens for gated procedures with
   `ucan_create` using that audience.
+- **Breaking: `FfiOpenedDirectStream::session` is optional.** The direct-dial
+  stream and content calls on `FfiSession` run on a session this process
+  already has open to the provider's station under the same identity,
+  instead of dialing a second one that would close it. `session` is absent
+  when the stream runs on such a session; close it only when it is set.
 
 ### [ffi-0.3.1] - 2026-09-05
 

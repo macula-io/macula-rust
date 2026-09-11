@@ -18,6 +18,7 @@ pub mod frame;
 pub mod identity;
 pub mod keystore;
 pub mod manifest;
+mod open_sessions;
 pub mod pool;
 pub mod stream;
 pub mod transport;

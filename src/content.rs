@@ -141,11 +141,20 @@ pub async fn put(
     name: impl Into<String>,
     identity: &KeyPair,
 ) -> Result<Mcid, PutError> {
-    let mut stream = session
+    let stream = session
         .open_dedicated_stream()
         .await
         .map_err(PutError::OpenStream)?;
+    put_on(stream, data, name, identity).await
+}
 
+/// [`put`], over a dedicated stream already open to the station.
+pub(crate) async fn put_on(
+    mut stream: FrameStream,
+    data: &[u8],
+    name: impl Into<String>,
+    identity: &KeyPair,
+) -> Result<Mcid, PutError> {
     if data.len() <= manifest::DEFAULT_CHUNK_SIZE {
         let mcid = manifest::block_mcid(data);
         put_block(&mut stream, &mcid, data, identity).await?;
@@ -172,11 +181,19 @@ pub async fn get(
     mcid: Mcid,
     identity: &KeyPair,
 ) -> Result<Vec<u8>, GetError> {
-    let mut stream = session
+    let stream = session
         .open_dedicated_stream()
         .await
         .map_err(GetError::OpenStream)?;
+    get_on(stream, mcid, identity).await
+}
 
+/// [`get`], over a dedicated stream already open to the station.
+pub(crate) async fn get_on(
+    mut stream: FrameStream,
+    mcid: Mcid,
+    identity: &KeyPair,
+) -> Result<Vec<u8>, GetError> {
     if !manifest::mcid_is_chunked(&mcid) {
         let data = get_block(&mut stream, &mcid, identity).await?;
         if manifest::block_mcid(&data) != mcid {

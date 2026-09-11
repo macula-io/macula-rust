@@ -706,15 +706,28 @@ pub struct FfiAcceptedStream {
 }
 
 /// What [`FfiSession::open_stream_direct`]/
-/// [`FfiSession::open_stream_direct_with_cert_chain`] hand back: the fresh
-/// [`FfiSession`] dialed for this stream, and the [`FfiStream`] itself.
-/// Unlike [`FfiAcceptedStream`] (a stream on an EXISTING session), a
-/// direct-dial stream opens a brand new session — the caller owns it and
-/// must close it once done, alongside the stream.
+/// [`FfiSession::open_stream_direct_with_cert_chain`] hand back: the
+/// [`FfiStream`], and the [`FfiSession`] direct dial dialed for it, if any.
+/// `session` is set when direct dial opened a new session for this stream:
+/// the caller owns it and must close it once done, alongside the stream. It
+/// is absent when the stream runs on a session this process already had
+/// open to the provider's station under the same identity: that session
+/// belongs to its owner and stays open.
 #[derive(uniffi::Record)]
 pub struct FfiOpenedDirectStream {
-    pub session: std::sync::Arc<FfiSession>,
+    pub session: Option<std::sync::Arc<FfiSession>>,
     pub stream: std::sync::Arc<FfiStream>,
+}
+
+impl From<macula_rust::direct_dial::OpenedStream> for FfiOpenedDirectStream {
+    fn from(opened: macula_rust::direct_dial::OpenedStream) -> Self {
+        Self {
+            session: opened.session.map(|session| {
+                std::sync::Arc::new(FfiSession(tokio::sync::Mutex::new(Some(session))))
+            }),
+            stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(opened.stream)))),
+        }
+    }
 }
 
 /// How to trust whatever certificate the station presents — mirrors
@@ -1357,15 +1370,15 @@ impl FfiSession {
 
     /// Resolves `procedure`'s provider via direct-dial (through this
     /// session, used only to query the DHT) and opens a stream to it
-    /// there, in one hop, in a SEPARATE session from this one — mirrors
+    /// there, in one hop — mirrors
     /// [`call_direct`](Self::call_direct)'s own resolve-then-dial shape for
     /// [`stream_open`](Self::stream_open) instead of
-    /// [`call`](Self::call). The caller owns BOTH the returned
-    /// [`FfiOpenedDirectStream::session`] and
-    /// [`FfiOpenedDirectStream::stream`] — unlike a unary call, which owns
-    /// its dial for exactly one request/reply, a stream outlives this
-    /// function call, so the returned session must be closed once the
-    /// stream (and any other work on it) is done.
+    /// [`call`](Self::call). The stream runs on a session this process
+    /// already has open to the provider's station under `identity` when
+    /// there is one, and otherwise on a new session direct dial opens for
+    /// it. The caller owns the returned [`FfiOpenedDirectStream::stream`],
+    /// and [`FfiOpenedDirectStream::session`] when it is set: close that
+    /// session once the stream (and any other work on it) is done.
     pub async fn open_stream_direct(
         &self,
         procedure: String,
@@ -1379,7 +1392,7 @@ impl FfiSession {
         let deadline_ms = (now_ms() + timeout_ms) as i128;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let (opened_session, handle) = macula_rust::direct_dial::open_stream_direct(
+        let opened = macula_rust::direct_dial::open_stream_direct(
             session,
             &identity.0,
             realm,
@@ -1393,10 +1406,7 @@ impl FfiSession {
         .map_err(|e| FfiError::Resolve {
             reason: e.to_string(),
         })?;
-        Ok(FfiOpenedDirectStream {
-            session: std::sync::Arc::new(FfiSession(tokio::sync::Mutex::new(Some(opened_session)))),
-            stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(handle)))),
-        })
+        Ok(FfiOpenedDirectStream::from(opened))
     }
 
     /// [`open_stream_direct`](Self::open_stream_direct), resolved via
@@ -1421,36 +1431,32 @@ impl FfiSession {
         let deadline_ms = (now_ms() + timeout_ms) as i128;
         let mut guard = self.0.lock().await;
         let session = guard.as_mut().ok_or(FfiError::Closed)?;
-        let (opened_session, handle) =
-            macula_rust::direct_dial::open_stream_direct_with_cert_chain(
-                session,
-                &identity.0,
-                realm,
-                &procedure,
-                &realm_ca_pem,
-                &expected_org,
-                mode.into(),
-                args.into(),
-                deadline_ms,
-                std::time::Duration::from_millis(timeout_ms),
-            )
-            .await
-            .map_err(|e| FfiError::Resolve {
-                reason: e.to_string(),
-            })?;
-        Ok(FfiOpenedDirectStream {
-            session: std::sync::Arc::new(FfiSession(tokio::sync::Mutex::new(Some(opened_session)))),
-            stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(handle)))),
-        })
+        let opened = macula_rust::direct_dial::open_stream_direct_with_cert_chain(
+            session,
+            &identity.0,
+            realm,
+            &procedure,
+            &realm_ca_pem,
+            &expected_org,
+            mode.into(),
+            args.into(),
+            deadline_ms,
+            std::time::Duration::from_millis(timeout_ms),
+        )
+        .await
+        .map_err(|e| FfiError::Resolve {
+            reason: e.to_string(),
+        })?;
+        Ok(FfiOpenedDirectStream::from(opened))
     }
 
     /// Stores `data` at a KNOWN `station` (32 bytes) directly, in one hop,
     /// instead of going through whatever station this session happens to
     /// be connected to — see
-    /// [`macula_rust::direct_dial::put_direct`]'s own doc, including
-    /// its identity-collision caveat when this session is already
-    /// connected to `station` (use a different identity for this session
-    /// than `identity` if so).
+    /// [`macula_rust::direct_dial::put_direct`]'s own doc. When this
+    /// process already has a session open to `station` under `identity`,
+    /// such as this one, the upload runs on that session and leaves it
+    /// open instead of dialing.
     pub async fn put_direct(
         &self,
         station: Vec<u8>,

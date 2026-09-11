@@ -35,6 +35,15 @@
 //! replaces it. When no candidate was ever tried, the reason none qualified
 //! is returned instead.
 //!
+//! **Reuse:** a station keeps one connection per identity and closes the
+//! older one when a newer one arrives. So when this process already has a
+//! session open to the provider's station under the same identity
+//! (`resolve_via` itself, or a [`Pool`](crate::pool::Pool) link),
+//! [`open_stream_direct`], [`put_direct`] and [`get_direct`] run on that
+//! session, on a dedicated QUIC stream of their own, instead of dialing,
+//! and never close it. They need no `station_endpoint` lookup either.
+//! [`call`] and its variants still dial.
+//!
 //! `cert_chain`-based org/realm authorization (Slice 7c Direction B,
 //! `macula_record:verify_advertisement_cert_chain/3` on the Erlang side) is
 //! opt-in here too, matching the reference and `macula-go`'s own port —
@@ -45,18 +54,20 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::{ready, Future};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
 use crate::cbor::Value;
 use crate::cert_chain::{self, CertChainError};
-use crate::connection::{self, Session};
+use crate::connection::{self, FrameStream, Session};
 use crate::content;
 use crate::dht::{self, DhtError, Record};
 use crate::frame::{CallResponse, StreamMode};
 use crate::identity::KeyPair;
 use crate::manifest::Mcid;
+use crate::open_sessions;
 use crate::stream::{self, StreamHandle};
 use crate::transport::Trust;
 
@@ -316,13 +327,18 @@ fn may_record_unresolved<F>(last: &Option<Last<F>>, deadline: CallDeadline) -> b
 /// request with `request`, all within `timeout` — see the module doc's
 /// "Candidates" for how providers are tried in turn.
 ///
+/// A candidate whose station `already_open` has a session for gets the
+/// request on that session, with no endpoint lookup and no dial.
+///
 /// `dial` and `request` are plain closures returning futures (not async
 /// closures) so the public functions built on this keep `Send` futures.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn reach_procedure<D, S, T, DE, RE, DF, RF>(
     dht: &mut D,
     realm: [u8; 32],
     procedure: &str,
     cert_chain: Option<CertChainCheck<'_>>,
+    mut already_open: impl FnMut(&[u8; 32]) -> Option<S>,
     mut dial: impl FnMut(Resolved, Duration) -> DF,
     request: impl FnOnce(S, Duration) -> RF,
     timeout: Duration,
@@ -363,6 +379,14 @@ where
         for (tried, candidate) in candidates.iter().enumerate() {
             if deadline.passed() {
                 break;
+            }
+            if let Some(target) = reused(&mut already_open, &candidate.station) {
+                let request = request
+                    .take()
+                    .expect("the request is sent at most once, and sending it ends the call");
+                return request(target, deadline.remaining())
+                    .await
+                    .map_err(Failure::Request);
             }
             let share = deadline.share_for(candidates.len() - tried);
             // An unchanged advertisement that already failed gets a single
@@ -422,10 +446,13 @@ where
 
 /// Resolves a known station's endpoint, dials it with `dial`, and sends it
 /// one request with `request`. `timeout` bounds the endpoint lookup and the
-/// dial; the request gets whatever remains and may ignore it.
+/// dial; the request gets whatever remains and may ignore it. When
+/// `already_open` has a session for the station, the request runs on it
+/// instead, with no endpoint lookup and no dial.
 pub(crate) async fn reach_station<D, S, T, DE, RE, DF, RF>(
     dht: &mut D,
     station: [u8; 32],
+    already_open: impl FnOnce(&[u8; 32]) -> Option<S>,
     dial: impl FnOnce(Resolved, Duration) -> DF,
     request: impl FnOnce(S, Duration) -> RF,
     timeout: Duration,
@@ -436,6 +463,11 @@ where
     RF: Future<Output = Result<T, RE>>,
 {
     let deadline = CallDeadline::after(timeout);
+    if let Some(target) = reused(already_open, &station) {
+        return request(target, deadline.remaining())
+            .await
+            .map_err(Failure::Request);
+    }
     let resolved = lookup_station_endpoint(dht, station, deadline, true)
         .await
         .outcome
@@ -453,10 +485,12 @@ where
 /// `fetch`, all within `timeout`. Any failure moves on to the next
 /// provider, since a fetch is verified against its MCID and safe to repeat
 /// elsewhere; a provider that failed is skipped on later passes unless its
-/// announcement changed.
+/// announcement changed. A provider whose station `already_open` has a
+/// session for is fetched from on that session, with no dial.
 pub(crate) async fn fetch_content<D, S, T, DE, RE, DF, FF>(
     dht: &mut D,
     mcid: Mcid,
+    mut already_open: impl FnMut(&[u8; 32]) -> Option<S>,
     mut dial: impl FnMut(Resolved, Duration) -> DF,
     mut fetch: impl FnMut(S, Duration) -> FF,
     timeout: Duration,
@@ -495,33 +529,24 @@ where
                 .get(&provider.announcer)
                 .is_some_and(|remembered| remembered.record_version == provider.version);
             if !already_failed {
-                let failure = match parse_seed_url(&provider.endpoint) {
-                    None => ContentFailure::EndpointParse(provider.endpoint.clone()),
-                    Some((host, port)) => {
-                        let resolved = Resolved {
-                            station: provider.announcer,
-                            host,
-                            port,
-                        };
-                        match dial(resolved, share.remaining()).await {
-                            Err(e) => ContentFailure::Dial(e),
-                            Ok(target) => match tokio::time::timeout(
-                                deadline.remaining(),
-                                fetch(target, deadline.remaining()),
-                            )
-                            .await
-                            {
-                                Ok(Ok(content)) => return Ok(content),
-                                Ok(Err(e)) => ContentFailure::Fetch(e),
-                                Err(_) => {
-                                    return Err(ContentFailure::Timeout(
-                                        take_last(last, &mut failures).map(Box::new),
-                                    ))
-                                }
-                            },
-                        }
-                    }
-                };
+                let failure =
+                    match reach_provider(provider, &mut already_open, &mut dial, share).await {
+                        Err(failure) => failure,
+                        Ok(target) => match tokio::time::timeout(
+                            deadline.remaining(),
+                            fetch(target, deadline.remaining()),
+                        )
+                        .await
+                        {
+                            Ok(Ok(content)) => return Ok(content),
+                            Ok(Err(e)) => ContentFailure::Fetch(e),
+                            Err(_) => {
+                                return Err(ContentFailure::Timeout(
+                                    take_last(last, &mut failures).map(Box::new),
+                                ))
+                            }
+                        },
+                    };
                 failures.insert(
                     provider.announcer,
                     Remembered {
@@ -545,6 +570,44 @@ where
     Err(take_last(last, &mut failures).unwrap_or(ContentFailure::NotAnnounced))
 }
 
+/// Reaches one content provider: on the session `already_open` has for its
+/// station when there is one, otherwise by dialing its announced endpoint
+/// within `share`.
+async fn reach_provider<S, DE, RE, DF>(
+    provider: &ContentCandidate,
+    already_open: impl FnOnce(&[u8; 32]) -> Option<S>,
+    dial: impl FnOnce(Resolved, Duration) -> DF,
+    share: CallDeadline,
+) -> Result<S, ContentFailure<DE, RE>>
+where
+    DF: Future<Output = Result<S, DE>>,
+{
+    if let Some(target) = reused(already_open, &provider.announcer) {
+        return Ok(target);
+    }
+    let (host, port) = parse_seed_url(&provider.endpoint)
+        .ok_or_else(|| ContentFailure::EndpointParse(provider.endpoint.clone()))?;
+    let resolved = Resolved {
+        station: provider.announcer,
+        host,
+        port,
+    };
+    dial(resolved, share.remaining())
+        .await
+        .map_err(ContentFailure::Dial)
+}
+
+/// The session already open to `station` that a request runs on instead of
+/// dialing, if any.
+fn reused<S>(already_open: impl FnOnce(&[u8; 32]) -> Option<S>, station: &[u8; 32]) -> Option<S> {
+    already_open(station)
+}
+
+/// No session to reuse: a call, and resolution alone, always dial.
+fn no_open_session<S>(_station: &[u8; 32]) -> Option<S> {
+    None
+}
+
 /// Resolution alone: the "dial" and the "request" hand the resolved
 /// endpoint straight back.
 pub(crate) async fn resolve_within<D: DhtLookups>(
@@ -559,6 +622,7 @@ pub(crate) async fn resolve_within<D: DhtLookups>(
         realm,
         procedure,
         cert_chain,
+        no_open_session::<Resolved>,
         |resolved: Resolved, _share: Duration| ready(Ok::<_, Infallible>(resolved)),
         |resolved: Resolved, _remaining: Duration| ready(Ok::<_, Infallible>(resolved)),
         timeout,
@@ -868,6 +932,10 @@ async fn call_then_close(
 /// endpoint lookup and dial, and the CALL itself. See the module doc's
 /// "Candidates" for how providers are tried in turn.
 ///
+/// A call always dials its own connection, even when this process already
+/// has a session open to the provider's station under `id`; the station
+/// then closes that session.
+///
 /// The dial itself uses [`Trust::Insecure`] (no TLS verification) because
 /// trust is enforced at the application layer instead — see the module
 /// doc's "Trust model". After the dial, the freshly connected session's own
@@ -890,6 +958,7 @@ pub async fn call(
         realm,
         procedure,
         None,
+        no_open_session::<Session>,
         move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
         move |target: Session, remaining: Duration| {
             call_then_close(target, remaining, id, procedure, realm, payload, None)
@@ -924,6 +993,7 @@ pub async fn call_with_ucan(
         realm,
         procedure,
         None,
+        no_open_session::<Session>,
         move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
         move |target: Session, remaining: Duration| {
             call_then_close(
@@ -967,6 +1037,7 @@ pub async fn call_with_cert_chain(
             realm_ca_pem,
             expected_org,
         }),
+        no_open_session::<Session>,
         move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
         move |target: Session, remaining: Duration| {
             call_then_close(target, remaining, id, procedure, realm, payload, None)
@@ -1200,6 +1271,76 @@ async fn dial_and_verify(
     Ok(target)
 }
 
+/// The session a stream or content transfer runs on.
+enum StationTarget {
+    /// A session direct dial dialed for this request: closed after a content
+    /// transfer, handed to the caller with a stream.
+    Dialed(Box<Session>),
+    /// The connection of a session this process already had open to the
+    /// station under the same identity. That session owns it, so it is
+    /// never closed here.
+    Reused(Arc<quinn::Connection>),
+}
+
+impl StationTarget {
+    async fn open_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
+        match self {
+            StationTarget::Dialed(session) => session.open_dedicated_stream().await,
+            StationTarget::Reused(shared) => connection::dedicated_stream_on(shared).await,
+        }
+    }
+
+    /// The session direct dial dialed for this request, if it dialed one.
+    fn into_dialed(self) -> Option<Session> {
+        match self {
+            StationTarget::Dialed(session) => Some(*session),
+            StationTarget::Reused(_) => None,
+        }
+    }
+
+    /// Closes the session if direct dial dialed it for this request.
+    async fn release(self, id: &KeyPair) {
+        if let Some(session) = self.into_dialed() {
+            session.close("normal", None, id).await;
+        }
+    }
+}
+
+/// Dials a resolved station for a request that could have reused an open
+/// session instead.
+async fn dial_target(
+    resolved: Resolved,
+    id: &KeyPair,
+    timeout: Duration,
+) -> Result<StationTarget, DialAndVerifyError> {
+    dial_verified(resolved, id, timeout)
+        .await
+        .map(|session| StationTarget::Dialed(Box::new(session)))
+}
+
+/// The connection of a session this process already has open to `station`
+/// under `id`, such as `resolve_via` or a pool link, reused instead of
+/// dialing: a second connection under the same identity would make the
+/// station close that session.
+fn open_session_to(id: &KeyPair, station: &[u8; 32]) -> Option<StationTarget> {
+    open_sessions::live()
+        .find(id.node_id(), *station)
+        .map(StationTarget::Reused)
+}
+
+/// A stream [`open_stream_direct`] opened, and the session direct dial
+/// dialed for it, if it dialed one.
+pub struct OpenedStream {
+    pub stream: StreamHandle,
+    /// The session direct dial dialed for this stream. The caller owns it
+    /// and closes it once the stream and any other work on it is done. It is
+    /// `None` when the stream runs on a session this process already had
+    /// open to the provider's station under the same identity, such as
+    /// `resolve_via` or a [`Pool`](crate::pool::Pool) link: that session
+    /// belongs to its owner and stays open.
+    pub session: Option<Session>,
+}
+
 #[derive(Debug)]
 pub enum OpenStreamDirectError {
     Resolve(ResolveError),
@@ -1229,32 +1370,40 @@ fn open_stream_failure(
     }
 }
 
-/// Opens the stream on a dialed session and hands both to the caller;
-/// closes the session only if the open itself fails.
+/// Opens the stream on the target and hands it to the caller, with the
+/// session direct dial dialed for it, if any. Closes that session only if
+/// the open itself fails.
 async fn open_stream_on(
-    mut target: Session,
+    mut target: StationTarget,
     id: &KeyPair,
     procedure: &str,
     realm: [u8; 32],
     mode: StreamMode,
     args: Value,
     deadline_ms: i128,
-) -> Result<(Session, StreamHandle), stream::OpenError> {
-    let opened =
-        StreamHandle::open(&mut target, procedure, realm, mode, args, deadline_ms, id).await;
+) -> Result<OpenedStream, stream::OpenError> {
+    let opened = match target.open_dedicated_stream().await {
+        Ok(dedicated) => {
+            StreamHandle::open_on(dedicated, procedure, realm, mode, args, deadline_ms, id).await
+        }
+        Err(e) => Err(stream::OpenError::OpenStream(e)),
+    };
     match opened {
-        Ok(handle) => Ok((target, handle)),
+        Ok(handle) => Ok(OpenedStream {
+            stream: handle,
+            session: target.into_dialed(),
+        }),
         Err(e) => {
-            target.close("normal", None, id).await;
+            target.release(id).await;
             Err(e)
         }
     }
 }
 
 /// Resolves `procedure`'s provider via direct-dial (through `resolve_via`,
-/// used only to query the DHT) and opens a stream there, in one hop, in a
-/// SEPARATE connection from `resolve_via` — the streaming-RPC counterpart
-/// to [`call`]. The provider must have advertised via [`advertise_direct`]:
+/// used only to query the DHT) and opens a stream there, in one hop — the
+/// streaming-RPC counterpart to [`call`]. The provider must have advertised
+/// via [`advertise_direct`]:
 /// streaming's provider side (`macula_streamer.erl`) shares the identical
 /// `procedure_advertisement` mechanism RPC uses (confirmed against
 /// `macula_streamer.erl`/`macula_stream_sink.erl`'s own `advertise_direct`/
@@ -1265,14 +1414,14 @@ async fn open_stream_on(
 ///
 /// `timeout` bounds finding the provider, each candidate's endpoint lookup
 /// and dial, and opening the stream; `deadline_ms` is the stream's own
-/// deadline, sent to the provider. A failure once the station is dialed is
+/// deadline, sent to the provider. A failure once the station is reached is
 /// never retried elsewhere, because STREAM_OPEN may already be out.
 ///
-/// The caller owns the returned [`Session`] (and must close it once the
-/// stream and any other work on it is done) alongside the
-/// [`StreamHandle`] itself, since — unlike [`call`], which owns its dial
-/// for exactly one request/reply — a stream outlives the single function
-/// call that opens it.
+/// The stream runs on a session this process already has open to the
+/// provider's station under `id` when there is one (`resolve_via`, or a
+/// [`Pool`](crate::pool::Pool) link), on a dedicated QUIC stream of its own;
+/// otherwise direct dial dials a session for it. [`OpenedStream::session`]
+/// says which: the caller owns and closes that session when it is set.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_stream_direct(
     resolve_via: &mut Session,
@@ -1283,7 +1432,7 @@ pub async fn open_stream_direct(
     args: Value,
     deadline_ms: i128,
     timeout: Duration,
-) -> Result<(Session, StreamHandle), OpenStreamDirectError> {
+) -> Result<OpenedStream, OpenStreamDirectError> {
     reach_procedure(
         &mut Via {
             session: resolve_via,
@@ -1292,8 +1441,9 @@ pub async fn open_stream_direct(
         realm,
         procedure,
         None,
-        move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
-        move |target: Session, _remaining: Duration| {
+        move |station: &[u8; 32]| open_session_to(id, station),
+        move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
+        move |target: StationTarget, _remaining: Duration| {
             open_stream_on(target, id, procedure, realm, mode, args, deadline_ms)
         },
         timeout,
@@ -1318,7 +1468,7 @@ pub async fn open_stream_direct_with_cert_chain(
     args: Value,
     deadline_ms: i128,
     timeout: Duration,
-) -> Result<(Session, StreamHandle), OpenStreamDirectError> {
+) -> Result<OpenedStream, OpenStreamDirectError> {
     reach_procedure(
         &mut Via {
             session: resolve_via,
@@ -1330,8 +1480,9 @@ pub async fn open_stream_direct_with_cert_chain(
             realm_ca_pem,
             expected_org,
         }),
-        move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
-        move |target: Session, _remaining: Duration| {
+        move |station: &[u8; 32]| open_session_to(id, station),
+        move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
+        move |target: StationTarget, _remaining: Duration| {
             open_stream_on(target, id, procedure, realm, mode, args, deadline_ms)
         },
         timeout,
@@ -1359,15 +1510,19 @@ impl std::fmt::Display for PutDirectError {
 
 impl std::error::Error for PutDirectError {}
 
-/// Stores `data` on a dialed session, then closes the session.
-async fn put_then_close(
-    mut target: Session,
+/// Stores `data` on the target, then closes the session if direct dial
+/// dialed it for this.
+async fn put_then_release(
+    mut target: StationTarget,
     id: &KeyPair,
     data: &[u8],
     name: String,
 ) -> Result<Mcid, content::PutError> {
-    let result = content::put(&mut target, data, name, id).await;
-    target.close("normal", None, id).await;
+    let result = match target.open_dedicated_stream().await {
+        Ok(dedicated) => content::put_on(dedicated, data, name, id).await,
+        Err(e) => Err(content::PutError::OpenStream(e)),
+    };
+    target.release(id).await;
     result
 }
 
@@ -1385,15 +1540,11 @@ async fn put_then_close(
 /// `timeout` bounds the station's endpoint lookup and the dial; the upload
 /// itself runs without one, as before.
 ///
-/// **Caveat found live in `macula-go`'s port of this same function**:
-/// if `resolve_via` happens to already be connected to `station` (the
-/// common case when the caller doesn't have a separate resolver session),
-/// this call's own internal dial reuses `id` against the SAME station
-/// `resolve_via` is on — this fleet enforces one connection per identity
-/// and kicks whichever connects second, so `resolve_via`'s own connection
-/// can be closed out from under the caller by this call. Use a different
-/// identity for `resolve_via` than for `id` if the caller needs
-/// `resolve_via` to keep working afterward against that same station.
+/// When this process already has a session open to `station` under `id`
+/// (`resolve_via` itself, or a [`Pool`](crate::pool::Pool) link), the
+/// upload runs on that session, on a dedicated QUIC stream, with no
+/// endpoint lookup or dial, and the session stays open. Otherwise direct
+/// dial dials a session for the upload and closes it afterwards.
 pub async fn put_direct(
     resolve_via: &mut Session,
     id: &KeyPair,
@@ -1409,8 +1560,9 @@ pub async fn put_direct(
             id,
         },
         station,
-        move |resolved: Resolved, remaining: Duration| dial_verified(resolved, id, remaining),
-        move |target: Session, _remaining: Duration| put_then_close(target, id, data, name),
+        move |station: &[u8; 32]| open_session_to(id, station),
+        move |resolved: Resolved, remaining: Duration| dial_target(resolved, id, remaining),
+        move |target: StationTarget, _remaining: Duration| put_then_release(target, id, data, name),
         timeout,
     )
     .await
@@ -1509,14 +1661,18 @@ fn get_direct_failure(
     }
 }
 
-/// Fetches `mcid` on a dialed session, then closes the session.
-async fn get_then_close(
-    mut target: Session,
+/// Fetches `mcid` on the target, then closes the session if direct dial
+/// dialed it for this.
+async fn get_then_release(
+    mut target: StationTarget,
     id: &KeyPair,
     mcid: Mcid,
 ) -> Result<Vec<u8>, content::GetError> {
-    let result = content::get(&mut target, mcid, id).await;
-    target.close("normal", None, id).await;
+    let result = match target.open_dedicated_stream().await {
+        Ok(dedicated) => content::get_on(dedicated, mcid, id).await,
+        Err(e) => Err(content::GetError::OpenStream(e)),
+    };
+    target.release(id).await;
     result
 }
 
@@ -1529,8 +1685,10 @@ async fn get_then_close(
 /// transfer. A provider whose dial or transfer fails, including content
 /// that doesn't verify against `mcid`, is skipped for the next one. When
 /// the timeout cuts a transfer off, [`GetDirectError::Timeout`] carries the
-/// previous failure, and that transfer's session is dropped without a
-/// GOODBYE.
+/// previous failure, and a session dialed for that transfer is dropped
+/// without a GOODBYE. A provider whose station this process already has a
+/// session open to under `id` is fetched from on that session, which stays
+/// open.
 ///
 /// **Architectural note this module's other direct-dial functions don't
 /// need**: a `content_announcement`'s `endpoint` is the FINAL dial target
@@ -1563,8 +1721,9 @@ pub async fn get_direct(
             id,
         },
         mcid,
-        move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
-        move |target: Session, _remaining: Duration| get_then_close(target, id, mcid),
+        move |station: &[u8; 32]| open_session_to(id, station),
+        move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
+        move |target: StationTarget, _remaining: Duration| get_then_release(target, id, mcid),
         timeout,
     )
     .await
@@ -1736,6 +1895,11 @@ mod tests {
         std::array::from_fn(|_| rand::random())
     }
 
+    /// This process has no session open to any station.
+    fn nothing_open(_station: &[u8; 32]) -> Option<String> {
+        None
+    }
+
     #[tokio::test]
     async fn call_reports_the_last_candidate_failure_when_a_later_pass_finds_none() {
         let a = Provider::new("a.test");
@@ -1784,6 +1948,7 @@ mod tests {
         let result = fetch_content(
             &mut dht.clone(),
             mcid,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
             Duration::from_secs(1),
@@ -1930,6 +2095,7 @@ mod tests {
             REALM,
             PROCEDURE,
             None,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| ready(Ok(format!("reply from {host}"))),
             timeout,
@@ -1951,6 +2117,7 @@ mod tests {
                 realm_ca_pem,
                 expected_org: ORG,
             }),
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| ready(Ok(format!("reply from {host}"))),
             timeout,
@@ -2040,6 +2207,7 @@ mod tests {
             REALM,
             PROCEDURE,
             None,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| {
                 ready(Err::<String, _>(format!(
@@ -2105,6 +2273,7 @@ mod tests {
             REALM,
             PROCEDURE,
             None,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| {
                 ready(Ok::<_, String>(format!("stream at {host}")))
@@ -2130,6 +2299,7 @@ mod tests {
             REALM,
             PROCEDURE,
             None,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| {
                 ready(Err::<String, _>(format!(
@@ -2161,6 +2331,7 @@ mod tests {
         let content = fetch_content(
             &mut dht.clone(),
             mcid,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
             ROOMY,
@@ -2186,6 +2357,7 @@ mod tests {
         let content = fetch_content(
             &mut dht.clone(),
             mcid,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| {
                 ready(if host == "a.test" {
@@ -2211,6 +2383,7 @@ mod tests {
         let result = fetch_content(
             &mut FakeDht::new(),
             new_mcid(),
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
             SHORT,
@@ -2233,6 +2406,7 @@ mod tests {
         let result = reach_station(
             &mut FakeDht::new(),
             station.node_id(),
+            nothing_open,
             |r: Resolved, _remaining: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| ready(Ok::<_, String>(host)),
             SHORT,
@@ -2247,6 +2421,92 @@ mod tests {
             "{result:?}"
         );
         assert_returned_within(SHORT_BOUND, started);
+        assert!(stations.reached().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_stream_direct_reuses_an_open_session_to_the_provider_station() {
+        let a = Provider::new("a.test");
+        let a_station = a.station.node_id();
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        let stations = FakeStations::default();
+
+        let stream = reach_procedure(
+            &mut dht.clone(),
+            REALM,
+            PROCEDURE,
+            None,
+            |station: &[u8; 32]| {
+                (*station == a_station).then(|| "the caller's session to a".to_string())
+            },
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |session: String, _remaining: Duration| {
+                ready(Ok::<_, String>(format!("stream on {session}")))
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the stream opens on the open session");
+
+        assert_eq!(stream, "stream on the caller's session to a");
+        assert!(stations.reached().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_direct_reuses_an_open_session_to_the_provider_station() {
+        let p = Provider::new("p.test");
+        let p_station = p.station.node_id();
+        let mcid = new_mcid();
+        let dht = FakeDht::new();
+        dht.answer(dht::content_key(mcid), vec![vec![announcement(&p, mcid)]]);
+        let stations = FakeStations::default();
+        stations.refuse(&p.host);
+
+        let content = fetch_content(
+            &mut dht.clone(),
+            mcid,
+            |station: &[u8; 32]| {
+                (*station == p_station).then(|| "the caller's session to p".to_string())
+            },
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |session: String, _remaining: Duration| {
+                ready(if session == "the caller's session to p" {
+                    Ok(CONTENT.to_vec())
+                } else {
+                    Err(format!("{session} does not serve the content"))
+                })
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("p serves the content on the open session");
+
+        assert_eq!(content, CONTENT);
+        assert!(stations.reached().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_direct_reuses_an_open_session_to_the_station() {
+        let station = KeyPair::generate().node_id();
+        let stations = FakeStations::default();
+
+        let stored = reach_station(
+            &mut FakeDht::new(),
+            station,
+            |open: &[u8; 32]| {
+                (*open == station).then(|| "the caller's session to the station".to_string())
+            },
+            |r: Resolved, _remaining: Duration| ready(stations.dial(&r)),
+            |session: String, _remaining: Duration| {
+                ready(Ok::<_, String>(format!("stored on {session}")))
+            },
+            SHORT,
+        )
+        .await
+        .expect("stored on the open session");
+
+        assert_eq!(stored, "stored on the caller's session to the station");
         assert!(stations.reached().is_empty());
     }
 
@@ -2392,6 +2652,7 @@ mod tests {
         let result = fetch_content(
             &mut dht.clone(),
             mcid,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |_host: String, _remaining: Duration| {
                 fetches.set(fetches.get() + 1);
@@ -2496,6 +2757,7 @@ mod tests {
         let result = fetch_content(
             &mut dht.clone(),
             mcid,
+            nothing_open,
             |r: Resolved, _share: Duration| ready(stations.dial(&r)),
             |host: String, _remaining: Duration| async move {
                 if host == "a.test" {

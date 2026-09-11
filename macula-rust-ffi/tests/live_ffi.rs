@@ -580,15 +580,9 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
     let provider_id = FfiKeyPair::generate();
     // Two DISTINCT identities on the caller side: `resolver_id` for the
     // `caller` session (used only to query the DHT and stays open the
-    // whole test), `dial_id` for open_stream_direct's own internal fresh
-    // dial. Reusing one identity for both was a real bug in an earlier
-    // draft of this test -- this fleet kicks whichever connection reuses
-    // an identity second, so the resolver session and the internal dial
-    // fought over the same identity and one got closed out from under the
-    // other, surfacing as "peer closed the stream" on the caller's own
-    // stream. Same bug class already found and fixed elsewhere this
-    // session (see put_direct's own doc, and the content half of this
-    // same test below, which already used separate identities correctly).
+    // whole test), `dial_id` for open_stream_direct's own dial. Under one
+    // identity for both, open_stream_direct would run the stream on the
+    // caller session instead of dialing, and this test covers the dial.
     let resolver_id = FfiKeyPair::generate();
     let dial_id = FfiKeyPair::generate();
     let procedure = format!(
@@ -707,7 +701,11 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
         }
         other => panic!("expected Data, got {other:?}"),
     }
-    opened.session.close(&dial_id).await;
+    opened
+        .session
+        .expect("dial_id has no session open to the provider's station, so direct dial dials one")
+        .close(&dial_id)
+        .await;
 
     // --- content ---
     let resolve_via_id = FfiKeyPair::generate();

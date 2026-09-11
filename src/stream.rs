@@ -171,10 +171,24 @@ impl StreamHandle {
         deadline_ms: i128,
         identity: &KeyPair,
     ) -> Result<Self, OpenError> {
-        let mut stream = session
+        let stream = session
             .open_dedicated_stream()
             .await
             .map_err(OpenError::OpenStream)?;
+        Self::open_on(stream, procedure, realm, mode, args, deadline_ms, identity).await
+    }
+
+    /// [`open`](Self::open), over a dedicated stream already open to the
+    /// station.
+    pub(crate) async fn open_on(
+        mut stream: FrameStream,
+        procedure: &str,
+        realm: [u8; 32],
+        mode: StreamMode,
+        args: Value,
+        deadline_ms: i128,
+        identity: &KeyPair,
+    ) -> Result<Self, OpenError> {
         let stream_id: [u8; 16] = rand::random();
         let spec = frame::StreamOpenSpec::new(
             stream_id,

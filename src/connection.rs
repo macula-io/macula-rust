@@ -291,8 +291,13 @@ impl FrameStream {
 /// [`serve_one_call`](Self::serve_one_call)'s for the specific,
 /// confirmed-live way this bites a spawned provider task.
 pub struct Session {
-    connection: quinn::Connection,
+    /// Held only weakly by `open_sessions`, where direct dial finds it to
+    /// open dedicated streams on, so dropping the session still drops the
+    /// connection.
+    connection: Arc<quinn::Connection>,
     control: FrameStream,
+    /// The node id this session connected under.
+    identity: [u8; 32],
     pub station: HelloInfo,
 }
 
@@ -409,9 +414,12 @@ async fn connect_inner(
         });
     }
 
+    let connection = Arc::new(connection);
+    crate::open_sessions::live().register(identity.node_id(), station.node_id, &connection);
     Ok(Session {
         connection,
         control: FrameStream::with_buf(send, recv, buf),
+        identity: identity.node_id(),
         station,
     })
 }
@@ -442,6 +450,16 @@ async fn read_one_frame(recv: &mut quinn::RecvStream) -> Result<(Value, Vec<u8>)
     }
 }
 
+/// Open a dedicated QUIC stream on `connection`: what
+/// [`Session::open_dedicated_stream`] does, for code that holds only the
+/// connection, such as direct dial reusing another session's.
+pub(crate) async fn dedicated_stream_on(
+    connection: &quinn::Connection,
+) -> Result<FrameStream, quinn::ConnectionError> {
+    let (send, recv) = connection.open_bi().await?;
+    Ok(FrameStream::new(send, recv))
+}
+
 impl Session {
     /// The remote address this session's connection is with.
     pub fn remote_address(&self) -> std::net::SocketAddr {
@@ -452,8 +470,7 @@ impl Session {
     /// from the control stream — the mechanism content transfer (§12)
     /// and streaming RPC (§13) both use instead of the control stream.
     pub async fn open_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
-        let (send, recv) = self.connection.open_bi().await?;
-        Ok(FrameStream::new(send, recv))
+        dedicated_stream_on(&self.connection).await
     }
 
     /// Accept the next dedicated stream the *peer* opens toward us —
@@ -846,6 +863,11 @@ impl Session {
     /// connection, mirrors the Erlang reference's own bounded-drain
     /// approach.
     pub async fn close(mut self, reason: &str, detail: Option<&str>, identity: &KeyPair) {
+        crate::open_sessions::live().unregister(
+            self.identity,
+            self.station.node_id,
+            &self.connection,
+        );
         let goodbye = frame::sign(frame::goodbye(reason, detail), identity);
         if let Ok(encoded) = frame::encode(&goodbye) {
             let _ = self.control.send.write_all(&encoded).await;
