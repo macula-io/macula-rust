@@ -401,11 +401,12 @@ traced directly to the Erlang SDK's source.
   broken. See `macula-rust-ffi/tests/live_cert_chain_direct_dial.rs`'s
   own comments for the ruled-out theories from the earlier rounds.
 - The demo fleet's `station_endpoint` DHT records carry a short TTL and
-  are not always freshly republished — a direct-dial resolve can
-  intermittently return `StationEndpointNotFound` for a station whose
-  record happens to be stale at that moment. Retrying, or trying a
-  different fleet station, resolves it; this is fleet infrastructure
-  state, not a code defect.
+  are not always freshly republished, so a station's record can be stale
+  for a while. Direct dial tries every advertised provider in turn and
+  keeps re-querying within the call's `timeout`; only when no provider's
+  station has a usable record before it runs out does the call return
+  `StationEndpointNotFound`. This is fleet infrastructure state, not a
+  code defect.
 - **RESOLVED**: an earlier draft of this section reported
   `serve_one_call_gated`/`call_with_ucan` failing 100% of live attempts
   while `serve_one_call` succeeded reliably in the same window, and left

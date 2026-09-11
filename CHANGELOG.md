@@ -13,6 +13,28 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [0.4.0] - Unreleased
+
+#### Changed
+
+- **Direct dial tries every authorized provider.** `direct_dial::call`,
+  `call_with_ucan`, `call_with_cert_chain`, `open_stream_direct`,
+  `open_stream_direct_with_cert_chain` and `get_direct` try each advertised
+  provider in the order the DHT returns them, instead of only the first. A
+  provider that can't be reached before the request is sent is skipped for
+  the next one, and a request that has been sent is never sent again.
+  `get_direct` also retries while no provider has announced the content
+  yet.
+- **Breaking: the timeout bounds the whole call**, finding the provider
+  included. A timeout sized for the request alone can now run out during
+  resolution. `resolve` and `resolve_with_cert_chain` give up after 10
+  seconds, and `put_direct`'s timeout covers the endpoint lookup and the
+  dial.
+- **Breaking: new `GetDirectError::Timeout { last }`.** It reports a
+  `get_direct` transfer cut off by the timeout, and `last`, also its
+  `source()`, carries the failure before it. An exhaustive `match` on
+  `GetDirectError` needs the new arm.
+
 ### [0.3.0] - 2026-09-05
 
 #### Added
@@ -278,6 +300,16 @@ this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
 same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
+
+### [ffi-0.4.0] - Unreleased
+
+#### Changed
+
+- Builds on `macula-rust` 0.4, with the dependency requirement moved to
+  `"0.4"`. The direct-dial calls on `FfiSession` therefore try every
+  authorized provider, and their `timeout_ms` now bounds finding the
+  provider as well. A `get_direct` whose transfer the timeout cuts off
+  reports `FfiError::Content` with the earlier failure in its reason.
 
 ### [ffi-0.3.1] - 2026-09-05
 

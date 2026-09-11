@@ -192,17 +192,14 @@ fn validate_cert_path(realm_ca_pem: &[u8], chain: &[Vec<u8>]) -> Result<(), Cert
     Ok(())
 }
 
+/// Test certificates for cert-chain authorization: a realm CA, a leaf it
+/// issues for an advertiser key and org, and a leaf-first PEM bundle.
+/// Shared by this module's tests and `direct_dial`'s.
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
+pub(crate) mod fixtures {
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair as RcgenKeyPair};
 
-    use super::*;
-    use crate::dht;
-    use crate::identity::KeyPair;
-
-    fn test_ca() -> (Vec<u8>, rcgen::Issuer<'static, RcgenKeyPair>) {
+    pub(crate) fn test_ca() -> (Vec<u8>, rcgen::Issuer<'static, RcgenKeyPair>) {
         let key_pair = RcgenKeyPair::generate_for(&rcgen::PKCS_ED25519).expect("ca keygen");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
         let mut dn = DistinguishedName::new();
@@ -217,7 +214,7 @@ mod tests {
         (pem, rcgen::Issuer::new(params, key_pair))
     }
 
-    fn test_leaf(
+    pub(crate) fn test_leaf(
         ca_issuer: &rcgen::Issuer<'static, RcgenKeyPair>,
         advertiser_pub: [u8; 32],
         org: &str,
@@ -254,7 +251,7 @@ mod tests {
         der
     }
 
-    fn pem_bundle(ders: &[Vec<u8>]) -> Vec<u8> {
+    pub(crate) fn pem_bundle(ders: &[Vec<u8>]) -> Vec<u8> {
         let mut out = Vec::new();
         for der in ders {
             let b64 = base64_std_encode(der);
@@ -272,6 +269,16 @@ mod tests {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(data)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::fixtures::{pem_bundle, test_ca, test_leaf};
+    use super::*;
+    use crate::dht;
+    use crate::identity::KeyPair;
 
     fn advertiser_and_station() -> (KeyPair, KeyPair) {
         (KeyPair::generate(), KeyPair::generate())
