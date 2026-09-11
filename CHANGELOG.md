@@ -24,7 +24,8 @@ usually touches both, but their version numbers don't move in lockstep.
   provider that can't be reached before the request is sent is skipped for
   the next one, and a request that has been sent is never sent again.
   `get_direct` also retries while no provider has announced the content
-  yet.
+  yet, and a DHT lookup that fails is retried within the timeout instead of
+  ending the call.
 - **Breaking: the timeout bounds the whole call**, finding the provider
   included. A timeout sized for the request alone can now run out during
   resolution. `resolve` and `resolve_with_cert_chain` give up after 10

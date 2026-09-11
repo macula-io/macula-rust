@@ -24,9 +24,10 @@
 //! candidate whose endpoint record doesn't resolve, whose dial fails, or
 //! whose dialed identity doesn't match is skipped for the next one, because
 //! nothing has reached the provider yet. Once a CALL or STREAM_OPEN has gone
-//! out, its result is the call's result and it is never sent again. When
-//! no candidate qualifies, or every one failed before sending, the DHT is
-//! queried again with a backoff of 100 ms doubling to 1 s; within one call a
+//! out, its result is the call's result and it is never sent again. When a
+//! query fails, no candidate qualifies, or every one failed before sending,
+//! the DHT is queried again with a backoff of 100 ms doubling to 1 s; within
+//! one call a
 //! station that already failed is dialed again only once its advertisement
 //! or endpoint record has changed. The call's `timeout` bounds all of it,
 //! and each candidate gets a share of what remains for its endpoint lookup
@@ -300,18 +301,6 @@ fn take_last<F>(
     }
 }
 
-/// The remembered failure of the last candidate tried, when the last failure
-/// is a candidate's.
-fn take_candidate<F>(
-    last: Option<Last<F>>,
-    failures: &mut HashMap<[u8; 32], Remembered<F>>,
-) -> Option<F> {
-    match last? {
-        Last::Candidate(key) => failures.remove(&key).map(|remembered| remembered.error),
-        Last::Unresolved(_) => None,
-    }
-}
-
 /// Whether a query that found no candidate may record why: never over a
 /// candidate's failure, and not over an earlier reason once the deadline has
 /// cut the query short, since such a query learned nothing.
@@ -355,18 +344,18 @@ where
     let mut last: Option<Last<Failure<DE, RE>>> = None;
     let mut pause = RESOLVE_RETRY_DELAY;
     loop {
-        let recs = match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
-            Ok(Ok(recs)) => recs,
-            // The resolver session failed. A candidate that already failed
-            // is still the call's answer; otherwise the lookup's own error.
-            Ok(Err(e)) => {
-                return Err(take_candidate(last, &mut failures)
-                    .unwrap_or(Failure::Resolve(ResolveError::Dht(e))))
-            }
-            // Cut off by the deadline: no records this pass.
-            Err(_) => Vec::new(),
-        };
-        let (candidates, unresolved) = if recs.is_empty() {
+        let (recs, lookup_failure) =
+            match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
+                Ok(Ok(recs)) => (recs, None),
+                // A lookup that failed teaches nothing: no records this pass,
+                // and its error is why none qualified.
+                Ok(Err(e)) => (Vec::new(), Some(e)),
+                // Cut off by the deadline: no records this pass.
+                Err(_) => (Vec::new(), None),
+            };
+        let (candidates, unresolved) = if let Some(e) = lookup_failure {
+            (Vec::new(), ResolveError::Dht(e))
+        } else if recs.is_empty() {
             (Vec::new(), ResolveError::ProcedureNotAdvertised)
         } else if let Some(check) = cert_chain {
             authorized_advertisements(&recs, check)
@@ -506,19 +495,20 @@ where
     let mut last: Option<Last<ContentFailure<DE, RE>>> = None;
     let mut pause = RESOLVE_RETRY_DELAY;
     loop {
-        let recs = match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
-            Ok(Ok(recs)) => recs,
-            // The resolver session failed. A provider that already failed is
-            // still the call's answer; otherwise the lookup's own error.
-            Ok(Err(e)) => {
-                return Err(take_candidate(last, &mut failures).unwrap_or(ContentFailure::Dht(e)))
-            }
-            // Cut off by the deadline: no records this pass.
-            Err(_) => Vec::new(),
-        };
+        let (recs, lookup_failure) =
+            match tokio::time::timeout(deadline.remaining(), dht.find_records(key)).await {
+                Ok(Ok(recs)) => (recs, None),
+                // A lookup that failed teaches nothing: no records this pass,
+                // and its error is why none qualified.
+                Ok(Err(e)) => (Vec::new(), Some(e)),
+                // Cut off by the deadline: no records this pass.
+                Err(_) => (Vec::new(), None),
+            };
         let providers = trusted_content_providers(&recs);
         if providers.is_empty() && may_record_unresolved(&last, deadline) {
-            last = Some(Last::Unresolved(ContentFailure::NotAnnounced));
+            last = Some(Last::Unresolved(
+                lookup_failure.map_or(ContentFailure::NotAnnounced, ContentFailure::Dht),
+            ));
         }
         for (tried, provider) in providers.iter().enumerate() {
             if deadline.passed() {
@@ -1961,6 +1951,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn call_retries_after_a_lookup_fails() {
+        let a = Provider::new("a.test");
+        let dht = FakeDht::new();
+        dht.answer(procedure_key(), vec![vec![advertisement(&a)]]);
+        dht.fail_first_lookups(procedure_key(), 1);
+        dht.publish_endpoint(&a.station, station_endpoint(&a.station, &a.host));
+        let stations = FakeStations::default();
+
+        let reply = call(&dht, &stations, ROOMY)
+            .await
+            .expect("a answers once a lookup is answered");
+
+        assert_eq!(reply, "reply from a.test");
+        assert_eq!(dht.asked_at(procedure_key()).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_direct_retries_after_a_lookup_fails() {
+        let p = Provider::new("p.test");
+        let mcid = new_mcid();
+        let dht = FakeDht::new();
+        dht.answer(dht::content_key(mcid), vec![vec![announcement(&p, mcid)]]);
+        dht.fail_first_lookups(dht::content_key(mcid), 1);
+        let stations = FakeStations::default();
+
+        let content = fetch_content(
+            &mut dht.clone(),
+            mcid,
+            nothing_open,
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
+            ROOMY,
+        )
+        .await
+        .expect("p serves the content once a lookup is answered");
+
+        assert_eq!(content, CONTENT);
+        assert_eq!(stations.reached(), ["p.test"]);
+    }
+
+    #[tokio::test]
+    async fn call_reports_a_failed_lookup_at_its_deadline_when_no_candidate_was_tried() {
+        let dht = FakeDht::new();
+        dht.fail_first_lookups(procedure_key(), usize::MAX);
+        let started = Instant::now();
+
+        let result = call(&dht, &FakeStations::default(), SHORT).await;
+
+        assert!(
+            matches!(result, Err(Failure::Resolve(ResolveError::Dht(_)))),
+            "{result:?}"
+        );
+        assert_returned_within(SHORT_BOUND, started);
+        assert!(
+            dht.asked_at(procedure_key()).len() > 1,
+            "a failed lookup is retried until the deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_direct_reports_a_failed_lookup_at_its_deadline_when_no_provider_was_tried() {
+        let mcid = new_mcid();
+        let dht = FakeDht::new();
+        dht.fail_first_lookups(dht::content_key(mcid), usize::MAX);
+        let stations = FakeStations::default();
+        let started = Instant::now();
+
+        let result = fetch_content(
+            &mut dht.clone(),
+            mcid,
+            nothing_open,
+            |r: Resolved, _share: Duration| ready(stations.dial(&r)),
+            |_host: String, _remaining: Duration| ready(Ok::<_, String>(CONTENT.to_vec())),
+            SHORT,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ContentFailure::Dht(_))), "{result:?}");
+        assert_returned_within(SHORT_BOUND, started);
+        assert!(
+            dht.asked_at(dht::content_key(mcid)).len() > 1,
+            "a failed lookup is retried until the deadline"
+        );
+    }
+
     /// A DHT that answers `find_records` on a key with successive replies,
     /// repeating the last, and `find_record` with the `station_endpoint`
     /// published under that key (not_found otherwise). Clones share state,
@@ -1973,6 +2049,7 @@ mod tests {
         replies: HashMap<[u8; 32], Vec<Vec<Record>>>,
         asked: HashMap<[u8; 32], Vec<Duration>>,
         fail_after: HashMap<[u8; 32], usize>,
+        fail_first: HashMap<[u8; 32], usize>,
         endpoints: HashMap<[u8; 32], Record>,
     }
 
@@ -1983,6 +2060,7 @@ mod tests {
                 replies: HashMap::new(),
                 asked: HashMap::new(),
                 fail_after: HashMap::new(),
+                fail_first: HashMap::new(),
                 endpoints: HashMap::new(),
             })))
         }
@@ -2020,6 +2098,16 @@ mod tests {
                 .fail_after
                 .insert(key, answered_lookups);
         }
+
+        /// The first `failed_lookups` lookups of `key` fail, the way a query
+        /// the station doesn't answer in time does; later ones are answered.
+        fn fail_first_lookups(&self, key: [u8; 32], failed_lookups: usize) {
+            self.0
+                .lock()
+                .unwrap()
+                .fail_first
+                .insert(key, failed_lookups);
+        }
     }
 
     impl DhtLookups for FakeDht {
@@ -2029,6 +2117,15 @@ mod tests {
             let asked = state.asked.entry(key).or_default();
             asked.push(elapsed);
             let turn = asked.len() - 1;
+            if state
+                .fail_first
+                .get(&key)
+                .is_some_and(|failed| turn < *failed)
+            {
+                return Err(DhtError::Remote(
+                    "the station did not answer the lookup".to_string(),
+                ));
+            }
             if state
                 .fail_after
                 .get(&key)
