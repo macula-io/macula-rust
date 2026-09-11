@@ -14,6 +14,11 @@
 //! session, so closing an older session never drops a newer one. Entries
 //! are weak: a session dropped without closing, or whose connection has
 //! ended, is not found.
+//!
+//! A session direct dial dialed for its own requests carries [`Leases`]:
+//! every request using it holds one, so it closes when the last request is
+//! done, and it is not reused once it is closing. A session its owner opened
+//! carries none, and direct dial never closes it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
@@ -21,6 +26,48 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 /// Whether an open session's connection can still carry a request.
 pub(crate) trait Live {
     fn is_live(&self) -> bool;
+}
+
+/// A session that may carry [`Leases`]: one direct dial dialed does, one its
+/// owner opened doesn't.
+pub(crate) trait Leased {
+    fn leases(&self) -> Option<&Leases>;
+}
+
+/// The requests using a session direct dial dialed, counted so the session
+/// closes when the last one is done and is not reused once it is closing.
+/// The request that dialed the session holds the first lease.
+pub(crate) struct Leases {
+    count: Mutex<usize>,
+}
+
+impl Leases {
+    pub(crate) fn new() -> Self {
+        Self {
+            count: Mutex::new(1),
+        }
+    }
+
+    /// Takes one more lease, unless the last one was already released.
+    pub(crate) fn try_lease(&self) -> bool {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        if *count == 0 {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Gives one lease back, and says whether it was the last, so the session
+    /// is to be closed. A release after the last one does nothing.
+    pub(crate) fn release(&self) -> bool {
+        let mut count = self.count.lock().unwrap_or_else(PoisonError::into_inner);
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
+        *count == 0
+    }
 }
 
 /// An identity's node id and a station's node id.

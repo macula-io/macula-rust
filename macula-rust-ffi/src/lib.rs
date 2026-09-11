@@ -706,25 +706,40 @@ pub struct FfiAcceptedStream {
 
 /// What [`FfiSession::open_stream_direct`]/
 /// [`FfiSession::open_stream_direct_with_cert_chain`] hand back: the
-/// [`FfiStream`], and the [`FfiSession`] direct dial dialed for it, if any.
-/// `session` is set when direct dial opened a new session for this stream:
-/// the caller owns it and must close it once done, alongside the stream. It
-/// is absent when the stream runs on a session this process already had
-/// open to the provider's station under the same identity: that session
-/// belongs to its owner and stays open.
+/// [`FfiStream`], and its [`FfiSessionLease`] on the session it runs on.
+/// Release the lease once the stream is done.
 #[derive(uniffi::Record)]
 pub struct FfiOpenedDirectStream {
-    pub session: Option<std::sync::Arc<FfiSession>>,
     pub stream: std::sync::Arc<FfiStream>,
+    pub lease: std::sync::Arc<FfiSessionLease>,
 }
 
 impl From<macula_rust::direct_dial::OpenedStream> for FfiOpenedDirectStream {
     fn from(opened: macula_rust::direct_dial::OpenedStream) -> Self {
         Self {
-            session: opened.session.map(|session| {
-                std::sync::Arc::new(FfiSession(tokio::sync::Mutex::new(Some(session))))
-            }),
             stream: std::sync::Arc::new(FfiStream(tokio::sync::Mutex::new(Some(opened.stream)))),
+            lease: std::sync::Arc::new(FfiSessionLease(tokio::sync::Mutex::new(Some(
+                opened.lease,
+            )))),
+        }
+    }
+}
+
+/// A direct-dial stream's use of the session it runs on, wrapping
+/// [`macula_rust::direct_dial::SessionLease`]. A session direct dial dialed
+/// closes once no direct-dial request still uses it; a session this process
+/// already had open under its owner stays open.
+#[derive(uniffi::Object)]
+pub struct FfiSessionLease(tokio::sync::Mutex<Option<macula_rust::direct_dial::SessionLease>>);
+
+#[uniffi::export(async_runtime = "tokio")]
+impl FfiSessionLease {
+    /// Gives back this use of the session once the stream is done. A no-op
+    /// once released.
+    pub async fn release(&self, identity: &FfiKeyPair) {
+        let lease = self.0.lock().await.take();
+        if let Some(lease) = lease {
+            lease.release(&identity.0).await;
         }
     }
 }
@@ -1363,9 +1378,7 @@ impl FfiSession {
     /// [`call`](Self::call). The stream runs on a session this process
     /// already has open to the provider's station under `identity` when
     /// there is one, and otherwise on a new session direct dial opens for
-    /// it. The caller owns the returned [`FfiOpenedDirectStream::stream`],
-    /// and [`FfiOpenedDirectStream::session`] when it is set: close that
-    /// session once the stream (and any other work on it) is done.
+    /// it. Release [`FfiOpenedDirectStream::lease`] once the stream is done.
     pub async fn open_stream_direct(
         &self,
         procedure: String,

@@ -685,11 +685,7 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
         }
         other => panic!("expected Data, got {other:?}"),
     }
-    opened
-        .session
-        .expect("dial_id has no session open to the provider's station, so direct dial dials one")
-        .close(&dial_id)
-        .await;
+    opened.lease.release(&dial_id).await;
 
     // --- content ---
     let resolve_via_id = FfiKeyPair::generate();

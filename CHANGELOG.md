@@ -55,10 +55,14 @@ usually touches both, but their version numbers don't move in lockstep.
   `open_stream_direct`, `open_stream_direct_with_cert_chain`, `put_direct`
   and `get_direct` now run on that open session, on a dedicated QUIC
   stream, and leave it open. The stream functions return
-  `direct_dial::OpenedStream` (`stream`, `session`) instead of a
-  `(Session, StreamHandle)` tuple, and `session` is `None` when the stream
-  runs on a session that was already open. `call` and its variants still
-  dial their own connection.
+  `direct_dial::OpenedStream` (`stream`, `lease`) instead of a
+  `(Session, StreamHandle)` tuple; release its `SessionLease` once the
+  stream is done. `call` and its variants still dial their own connection.
+- **A session direct dial dialed is shared until its last request is done.**
+  A direct-dial request that finds it open uses it too, holding a lease of
+  its own, and the session closes when the last lease is released instead
+  of when the request that dialed it finishes. It is not reused once it is
+  closing.
 - **Breaking: a UCAN-gated procedure binds the token to its caller.**
   `ucan::Policy::check` takes the CALL's `caller` as well as its token, and
   a `Policy::required` procedure accepts a token only when its `aud` is
@@ -404,11 +408,12 @@ did, but the two have moved at different paces ever since).
   the calling node's id as lowercase hex, and both serve calls drop a CALL
   that isn't signed by its caller. Mint tokens for gated procedures with
   `ucan_create` using that audience.
-- **Breaking: `FfiOpenedDirectStream::session` is optional.** The direct-dial
-  stream and content calls on `FfiSession` run on a session this process
-  already has open to the provider's station under the same identity,
-  instead of dialing a second one that would close it. `session` is absent
-  when the stream runs on such a session; close it only when it is set.
+- **Breaking: `FfiOpenedDirectStream` carries a `lease` instead of a
+  `session`.** The direct-dial stream and content calls on `FfiSession` run
+  on a session this process already has open to the provider's station
+  under the same identity, instead of dialing a second one that would close
+  it. Call `FfiSessionLease::release` once the stream is done: a session
+  direct dial dialed closes when no other direct-dial request still uses it.
 - **Breaking: `FfiSession::subscribe` returns an `FfiSubscription`**, read
   with `recv_event(timeout_ms)` and ended with `close()`. Each subscription
   has its own queue of 256 events and receives only the events its topic

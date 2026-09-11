@@ -312,6 +312,8 @@ pub(crate) struct SessionInner {
     connection: Arc<quinn::Connection>,
     channel: Arc<Channel>,
     hello: HelloInfo,
+    /// The requests using this session, when direct dial dialed it for them.
+    leases: Option<crate::open_sessions::Leases>,
 }
 
 impl Drop for SessionInner {
@@ -326,6 +328,12 @@ impl Drop for SessionInner {
 impl crate::open_sessions::Live for SessionInner {
     fn is_live(&self) -> bool {
         self.channel.end_reason().is_none() && self.connection.close_reason().is_none()
+    }
+}
+
+impl crate::open_sessions::Leased for Session {
+    fn leases(&self) -> Option<&crate::open_sessions::Leases> {
+        self.inner.leases.as_ref()
     }
 }
 
@@ -403,7 +411,26 @@ pub async fn connect(
 ) -> Result<Session, HandshakeError> {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        connect_inner(host, port, trust, identity),
+        connect_inner(host, port, trust, identity, None),
+    )
+    .await
+    .unwrap_or(Err(HandshakeError::Timeout))
+}
+
+/// [`connect`], for a session direct dial dials for its own requests. The
+/// session counts the requests using it, starting with the one that dialed
+/// it ([`Leases`](crate::open_sessions::Leases)), so a request that finds it
+/// open shares it, and it closes when the last one is done.
+pub(crate) async fn connect_leased(
+    host: &str,
+    port: u16,
+    trust: Trust,
+    identity: &KeyPair,
+) -> Result<Session, HandshakeError> {
+    let leases = Some(crate::open_sessions::Leases::new());
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        connect_inner(host, port, trust, identity, leases),
     )
     .await
     .unwrap_or(Err(HandshakeError::Timeout))
@@ -414,6 +441,7 @@ async fn connect_inner(
     port: u16,
     trust: Trust,
     identity: &KeyPair,
+    leases: Option<crate::open_sessions::Leases>,
 ) -> Result<Session, HandshakeError> {
     let connection = transport::connect(host, port, trust)
         .await
@@ -472,6 +500,7 @@ async fn connect_inner(
             connection,
             channel,
             hello,
+            leases,
         }
     });
     crate::open_sessions::live().register(identity_node, station_node, &inner);

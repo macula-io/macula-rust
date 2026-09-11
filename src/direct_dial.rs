@@ -68,7 +68,7 @@ use crate::dht::{self, DhtError, Record};
 use crate::frame::{CallResponse, StreamMode};
 use crate::identity::KeyPair;
 use crate::manifest::Mcid;
-use crate::open_sessions;
+use crate::open_sessions::{self, Leased, Leases};
 use crate::stream::{self, StreamHandle};
 use crate::transport::Trust;
 
@@ -939,10 +939,11 @@ async fn dial_verified(
     dial_and_verify(&resolved.host, resolved.port, resolved.station, id, timeout).await
 }
 
-/// Sends one CALL on a dialed session with whatever remains of the
-/// deadline, then closes the session.
-async fn call_then_close(
-    target: Session,
+/// Sends one CALL on the target with whatever remains of the deadline, then
+/// gives back the target's lease, closing a dialed session when no other
+/// direct-dial request still uses it.
+async fn call_then_release(
+    target: StationTarget,
     remaining: Duration,
     id: &KeyPair,
     procedure: &str,
@@ -951,19 +952,22 @@ async fn call_then_close(
     ucan_token: Option<Vec<u8>>,
 ) -> Result<CallResponse, connection::CallError> {
     let deadline_ms = now_ms() + remaining.as_millis() as i128;
-    let result = match ucan_token {
-        None => {
-            target
-                .call(procedure, realm, payload, deadline_ms, id, remaining)
-                .await
+    let (result, last) = run_then_release(target, move |session: Session| async move {
+        match ucan_token {
+            None => {
+                session
+                    .call(procedure, realm, payload, deadline_ms, id, remaining)
+                    .await
+            }
+            Some(token) => {
+                session
+                    .call_with_ucan(procedure, realm, payload, deadline_ms, id, remaining, token)
+                    .await
+            }
         }
-        Some(token) => {
-            target
-                .call_with_ucan(procedure, realm, payload, deadline_ms, id, remaining, token)
-                .await
-        }
-    };
-    target.close("normal", None, id).await;
+    })
+    .await;
+    close_last(last, id).await;
     result
 }
 
@@ -1005,10 +1009,10 @@ pub async fn call(
         realm,
         procedure,
         None,
-        no_open_session::<Session>,
-        move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
-        move |target: Session, remaining: Duration| {
-            call_then_close(target, remaining, id, procedure, realm, payload, None)
+        no_open_session::<StationTarget>,
+        move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
+        move |target: StationTarget, remaining: Duration| {
+            call_then_release(target, remaining, id, procedure, realm, payload, None)
         },
         timeout,
     )
@@ -1040,10 +1044,10 @@ pub async fn call_with_ucan(
         realm,
         procedure,
         None,
-        no_open_session::<Session>,
-        move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
-        move |target: Session, remaining: Duration| {
-            call_then_close(
+        no_open_session::<StationTarget>,
+        move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
+        move |target: StationTarget, remaining: Duration| {
+            call_then_release(
                 target,
                 remaining,
                 id,
@@ -1084,10 +1088,10 @@ pub async fn call_with_cert_chain(
             realm_ca_pem,
             expected_org,
         }),
-        no_open_session::<Session>,
-        move |resolved: Resolved, share: Duration| dial_verified(resolved, id, share),
-        move |target: Session, remaining: Duration| {
-            call_then_close(target, remaining, id, procedure, realm, payload, None)
+        no_open_session::<StationTarget>,
+        move |resolved: Resolved, share: Duration| dial_target(resolved, id, share),
+        move |target: StationTarget, remaining: Duration| {
+            call_then_release(target, remaining, id, procedure, realm, payload, None)
         },
         timeout,
     )
@@ -1301,7 +1305,7 @@ async fn dial_and_verify(
 ) -> Result<Session, DialAndVerifyError> {
     let target = tokio::time::timeout(
         timeout,
-        connection::connect(host, port, Trust::Insecure, id),
+        connection::connect_leased(host, port, Trust::Insecure, id),
     )
     .await
     .unwrap_or(Err(connection::HandshakeError::Timeout))
@@ -1318,38 +1322,78 @@ async fn dial_and_verify(
     Ok(target)
 }
 
-/// The session a stream or content transfer runs on.
-enum StationTarget {
-    /// A session direct dial dialed for this request: closed after a content
-    /// transfer, handed to the caller with a stream.
-    Dialed(Session),
-    /// A session this process already had open to the station under the
-    /// same identity. Its owner keeps it, so it is never closed here.
-    Reused(Session),
+/// The session a request runs on, and whether the request holds a lease on
+/// it. A session direct dial dialed comes with the request's lease; a
+/// session this process already had open under its owner, such as
+/// `resolve_via` or a pool link, comes with none, so the request never
+/// releases or closes it.
+struct StationTarget<S = Session> {
+    session: S,
+    leased: bool,
+}
+
+impl<S: Leased> StationTarget<S> {
+    /// The target for a session direct dial just dialed, holding the lease
+    /// the dial took.
+    fn dialed(session: S) -> Self {
+        let leased = session.leases().is_some();
+        Self { session, leased }
+    }
+
+    /// The target for reusing a session found open to a station: without a
+    /// lease when its owner opened it, with a new lease when direct dial
+    /// dialed it, and none at all when its last lease was already released.
+    fn reuse(found: S) -> Option<Self> {
+        let leased = match found.leases() {
+            None => false,
+            Some(leases) if leases.try_lease() => true,
+            Some(_) => return None,
+        };
+        Some(Self {
+            session: found,
+            leased,
+        })
+    }
+
+    /// Gives back the request's lease, if it holds one. Returns the session
+    /// when that was its last lease, for the caller to close.
+    fn release_lease(self) -> Option<S> {
+        let last = self.leased && self.session.leases().is_some_and(Leases::release);
+        last.then_some(self.session)
+    }
 }
 
 impl StationTarget {
-    async fn open_dedicated_stream(&mut self) -> Result<FrameStream, quinn::ConnectionError> {
-        match self {
-            StationTarget::Dialed(session) | StationTarget::Reused(session) => {
-                session.open_dedicated_stream().await
-            }
-        }
+    async fn open_dedicated_stream(&self) -> Result<FrameStream, quinn::ConnectionError> {
+        self.session.open_dedicated_stream().await
     }
 
-    /// The session direct dial dialed for this request, if it dialed one.
-    fn into_dialed(self) -> Option<Session> {
-        match self {
-            StationTarget::Dialed(session) => Some(session),
-            StationTarget::Reused(_) => None,
-        }
-    }
-
-    /// Closes the session if direct dial dialed it for this request.
+    /// Gives back the request's lease, closing a session direct dial dialed
+    /// when no other direct-dial request still uses it.
     async fn release(self, id: &KeyPair) {
-        if let Some(session) = self.into_dialed() {
-            session.close("normal", None, id).await;
-        }
+        close_last(self.release_lease(), id).await;
+    }
+}
+
+/// Runs `request` on the target's session, then gives the target's lease
+/// back whatever the outcome. Returns the request's result, and the session
+/// when that was its last lease, for the caller to close.
+async fn run_then_release<S, T, Fut>(
+    target: StationTarget<S>,
+    request: impl FnOnce(S) -> Fut,
+) -> (T, Option<S>)
+where
+    S: Leased + Clone,
+    Fut: Future<Output = T>,
+{
+    let result = request(target.session.clone()).await;
+    (result, target.release_lease())
+}
+
+/// Closes `last`, a session whose last lease was just given back.
+async fn close_last(last: Option<Session>, id: &KeyPair) {
+    if let Some(session) = last {
+        session.close("normal", None, id).await;
     }
 }
 
@@ -1362,30 +1406,51 @@ async fn dial_target(
 ) -> Result<StationTarget, DialAndVerifyError> {
     dial_verified(resolved, id, timeout)
         .await
-        .map(StationTarget::Dialed)
+        .map(StationTarget::dialed)
 }
 
 /// The connection of a session this process already has open to `station`
 /// under `id`, such as `resolve_via` or a pool link, reused instead of
 /// dialing: a second connection under the same identity would make the
-/// station close that session.
+/// station close that session. A session direct dial dialed for another
+/// request is reused with a lease of its own, and not at all once it is
+/// closing.
 fn open_session_to(id: &KeyPair, station: &[u8; 32]) -> Option<StationTarget> {
     open_sessions::live()
         .find(id.node_id(), *station)
-        .map(|open| StationTarget::Reused(Session::from_open(open)))
+        .and_then(|open| StationTarget::reuse(Session::from_open(open)))
 }
 
-/// A stream [`open_stream_direct`] opened, and the session direct dial
-/// dialed for it, if it dialed one.
+/// A stream [`open_stream_direct`] opened, and its use of the session it
+/// runs on.
 pub struct OpenedStream {
     pub stream: StreamHandle,
-    /// The session direct dial dialed for this stream. The caller owns it
-    /// and closes it once the stream and any other work on it is done. It is
-    /// `None` when the stream runs on a session this process already had
-    /// open to the provider's station under the same identity, such as
-    /// `resolve_via` or a [`Pool`](crate::pool::Pool) link: that session
-    /// belongs to its owner and stays open.
-    pub session: Option<Session>,
+    /// Release it once the stream is done.
+    pub lease: SessionLease,
+}
+
+/// A direct-dial stream's use of the session it runs on. A session direct
+/// dial dialed stays open while any direct-dial request still uses it and
+/// closes when the last one is released; a session this process already had
+/// open under its owner, such as `resolve_via` or a
+/// [`Pool`](crate::pool::Pool) link, stays open. A lease dropped without
+/// being released leaves a dialed session open until its last handle is
+/// gone, which then closes it without a GOODBYE.
+pub struct SessionLease {
+    target: StationTarget,
+}
+
+impl SessionLease {
+    /// The session the stream runs on.
+    pub fn session(&self) -> &Session {
+        &self.target.session
+    }
+
+    /// Gives back this use of the session, closing a session direct dial
+    /// dialed when no other direct-dial request still uses it.
+    pub async fn release(self, id: &KeyPair) {
+        self.target.release(id).await;
+    }
 }
 
 #[derive(Debug)]
@@ -1417,11 +1482,10 @@ fn open_stream_failure(
     }
 }
 
-/// Opens the stream on the target and hands it to the caller, with the
-/// session direct dial dialed for it, if any. Closes that session only if
-/// the open itself fails.
+/// Opens the stream on the target and hands it to the caller with the
+/// target's lease. Gives the lease back only if the open itself fails.
 async fn open_stream_on(
-    mut target: StationTarget,
+    target: StationTarget,
     id: &KeyPair,
     procedure: &str,
     realm: [u8; 32],
@@ -1436,9 +1500,9 @@ async fn open_stream_on(
         Err(e) => Err(stream::OpenError::OpenStream(e)),
     };
     match opened {
-        Ok(handle) => Ok(OpenedStream {
-            stream: handle,
-            session: target.into_dialed(),
+        Ok(stream) => Ok(OpenedStream {
+            stream,
+            lease: SessionLease { target },
         }),
         Err(e) => {
             target.release(id).await;
@@ -1465,10 +1529,11 @@ async fn open_stream_on(
 /// never retried elsewhere, because STREAM_OPEN may already be out.
 ///
 /// The stream runs on a session this process already has open to the
-/// provider's station under `id` when there is one (`resolve_via`, or a
-/// [`Pool`](crate::pool::Pool) link), on a dedicated QUIC stream of its own;
-/// otherwise direct dial dials a session for it. [`OpenedStream::session`]
-/// says which: the caller owns and closes that session when it is set.
+/// provider's station under `id` when there is one (`resolve_via`, a
+/// [`Pool`](crate::pool::Pool) link, or a session direct dial dialed for
+/// another request), on a dedicated QUIC stream of its own; otherwise direct
+/// dial dials a session for it. Release [`OpenedStream::lease`] once the
+/// stream is done.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_stream_direct(
     resolve_via: &Session,
@@ -1557,19 +1622,22 @@ impl std::fmt::Display for PutDirectError {
 
 impl std::error::Error for PutDirectError {}
 
-/// Stores `data` on the target, then closes the session if direct dial
-/// dialed it for this.
+/// Stores `data` on the target, then gives back the target's lease, closing
+/// a dialed session when no other direct-dial request still uses it.
 async fn put_then_release(
-    mut target: StationTarget,
+    target: StationTarget,
     id: &KeyPair,
     data: &[u8],
     name: String,
 ) -> Result<Mcid, content::PutError> {
-    let result = match target.open_dedicated_stream().await {
-        Ok(dedicated) => content::put_on(dedicated, data, name, id).await,
-        Err(e) => Err(content::PutError::OpenStream(e)),
-    };
-    target.release(id).await;
+    let (result, last) = run_then_release(target, move |session: Session| async move {
+        match session.open_dedicated_stream().await {
+            Ok(dedicated) => content::put_on(dedicated, data, name, id).await,
+            Err(e) => Err(content::PutError::OpenStream(e)),
+        }
+    })
+    .await;
+    close_last(last, id).await;
     result
 }
 
@@ -1591,7 +1659,8 @@ async fn put_then_release(
 /// (`resolve_via` itself, or a [`Pool`](crate::pool::Pool) link), the
 /// upload runs on that session, on a dedicated QUIC stream, with no
 /// endpoint lookup or dial, and the session stays open. Otherwise direct
-/// dial dials a session for the upload and closes it afterwards.
+/// dial dials a session for the upload and closes it afterwards, unless
+/// another direct-dial request still uses it.
 pub async fn put_direct(
     resolve_via: &Session,
     id: &KeyPair,
@@ -1709,18 +1778,21 @@ fn get_direct_failure(
     }
 }
 
-/// Fetches `mcid` on the target, then closes the session if direct dial
-/// dialed it for this.
+/// Fetches `mcid` on the target, then gives back the target's lease, closing
+/// a dialed session when no other direct-dial request still uses it.
 async fn get_then_release(
-    mut target: StationTarget,
+    target: StationTarget,
     id: &KeyPair,
     mcid: Mcid,
 ) -> Result<Vec<u8>, content::GetError> {
-    let result = match target.open_dedicated_stream().await {
-        Ok(dedicated) => content::get_on(dedicated, mcid, id).await,
-        Err(e) => Err(content::GetError::OpenStream(e)),
-    };
-    target.release(id).await;
+    let (result, last) = run_then_release(target, move |session: Session| async move {
+        match session.open_dedicated_stream().await {
+            Ok(dedicated) => content::get_on(dedicated, mcid, id).await,
+            Err(e) => Err(content::GetError::OpenStream(e)),
+        }
+    })
+    .await;
+    close_last(last, id).await;
     result
 }
 
@@ -3016,6 +3088,93 @@ mod tests {
 
         assert_eq!(stored, "stored on the caller's session to the station");
         assert!(stations.reached().is_empty());
+    }
+
+    // Sharing a session direct dial dialed between the requests that reuse
+    // it. The names match the .NET and Go tests.
+
+    #[derive(Clone)]
+    struct FakeSession {
+        leases: Option<std::sync::Arc<Leases>>,
+    }
+
+    impl Leased for FakeSession {
+        fn leases(&self) -> Option<&Leases> {
+            self.leases.as_deref()
+        }
+    }
+
+    fn dialed_session() -> FakeSession {
+        FakeSession {
+            leases: Some(std::sync::Arc::new(Leases::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dialed_session_is_closed_after_the_request_even_when_it_fails() {
+        let target = StationTarget::dialed(dialed_session());
+
+        let (result, closed) = run_then_release(target, |_session| {
+            ready(Err::<(), _>("reset after the request went out"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(closed.is_some(), "the dialed session is closed");
+    }
+
+    #[tokio::test]
+    async fn a_reused_session_is_never_closed_by_the_request() {
+        let owned = FakeSession { leases: None };
+        let target = StationTarget::reuse(owned).expect("an owner's open session is reused");
+
+        let (_, closed) = run_then_release(target, |_session| ready("answered")).await;
+
+        assert!(closed.is_none());
+    }
+
+    #[test]
+    fn a_dialed_session_stays_open_until_its_last_lease_is_released() {
+        let leases = Leases::new();
+        assert!(leases.try_lease());
+
+        assert!(!leases.release(), "one lease is still out");
+        assert!(leases.release(), "the last lease closes the session");
+    }
+
+    #[test]
+    fn a_session_that_is_closing_is_not_reused() {
+        let session = dialed_session();
+        assert!(StationTarget::dialed(session.clone())
+            .release_lease()
+            .is_some());
+
+        assert!(StationTarget::reuse(session).is_none());
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_transfers_to_one_station_share_the_dialed_session_until_both_finish() {
+        let session = dialed_session();
+        let first = StationTarget::dialed(session.clone());
+        let second = StationTarget::reuse(session).expect("the dialed session is reused");
+
+        let (_, closed) = run_then_release(first, |_session| ready("first stored")).await;
+        assert!(closed.is_none(), "the second transfer still uses the session");
+
+        let (_, closed) = run_then_release(second, |_session| ready("second stored")).await;
+        assert!(closed.is_some(), "the last transfer closes the session");
+    }
+
+    #[tokio::test]
+    async fn a_dialed_session_shared_by_a_stream_and_a_call_closes_only_when_both_release() {
+        let session = dialed_session();
+        let stream = StationTarget::dialed(session.clone());
+        let call = StationTarget::reuse(session).expect("the dialed session is reused");
+
+        let (_, closed) = run_then_release(call, |_session| ready("answered")).await;
+        assert!(closed.is_none(), "the stream still uses the session");
+
+        assert!(stream.release_lease().is_some());
     }
 
     #[tokio::test]
