@@ -2056,9 +2056,19 @@ async fn resolver_session_still_connected_after_a_direct_call() {
         "the resolver session ended: {:?}",
         resolver.end_reason()
     );
-    macula_rust::direct_dial::resolve(&resolver, &caller_identity, realm, &procedure)
-        .await
-        .expect("the resolver still answers DHT queries");
+    // A plain DHT query, so a stale station_endpoint record on the fleet
+    // can't fail the check.
+    let advertisements = macula_rust::dht::find_records(
+        &resolver,
+        &caller_identity,
+        macula_rust::dht::procedure_key(&macula_rust::dht::discovery_uri(realm, &procedure)),
+    )
+    .await
+    .expect("the resolver still answers DHT queries");
+    assert!(
+        !advertisements.is_empty(),
+        "the resolver found no advertisement for {procedure}"
+    );
 
     provider_session
         .close("normal", Some("direct-dial reuse provider done"), &provider_identity)
