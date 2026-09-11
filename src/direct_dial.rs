@@ -2405,4 +2405,81 @@ mod tests {
             "{result:?}"
         );
     }
+
+    /// The public direct-dial futures must stay `Send`, so a caller can
+    /// spawn them and the FFI crate, which requires it, keeps building. The
+    /// check happens at compile time: the closure below is type-checked but
+    /// never run, so it needs no live session.
+    #[test]
+    fn public_direct_dial_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let _type_check_only = |session: &mut Session, id: &KeyPair, mode: StreamMode| {
+            assert_send(&super::resolve(session, id, REALM, PROCEDURE));
+            assert_send(&super::resolve_with_cert_chain(
+                session, id, REALM, PROCEDURE, b"", ORG,
+            ));
+            assert_send(&super::call(
+                session,
+                id,
+                REALM,
+                PROCEDURE,
+                Value::Null,
+                ROOMY,
+            ));
+            assert_send(&super::call_with_ucan(
+                session,
+                id,
+                REALM,
+                PROCEDURE,
+                Value::Null,
+                ROOMY,
+                Vec::new(),
+            ));
+            assert_send(&super::call_with_cert_chain(
+                session,
+                id,
+                REALM,
+                PROCEDURE,
+                b"",
+                ORG,
+                Value::Null,
+                ROOMY,
+            ));
+            assert_send(&super::open_stream_direct(
+                session,
+                id,
+                REALM,
+                PROCEDURE,
+                mode,
+                Value::Null,
+                0,
+                ROOMY,
+            ));
+            assert_send(&super::open_stream_direct_with_cert_chain(
+                session,
+                id,
+                REALM,
+                PROCEDURE,
+                b"",
+                ORG,
+                mode,
+                Value::Null,
+                0,
+                ROOMY,
+            ));
+            assert_send(&super::put_direct(session, id, [0; 32], b"", "name", ROOMY));
+            assert_send(&super::get_direct(session, id, [0; 34], ROOMY));
+            assert_send(&super::advertise_direct(
+                session, id, REALM, PROCEDURE, ROOMY,
+            ));
+            assert_send(&super::advertise_direct_with_cert_chain(
+                session,
+                id,
+                REALM,
+                PROCEDURE,
+                ROOMY,
+                Vec::new(),
+            ));
+        };
+    }
 }
