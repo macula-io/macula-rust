@@ -17,6 +17,7 @@ pub mod dht;
 pub mod direct_dial;
 pub mod frame;
 pub mod identity;
+pub mod petname;
 pub mod keystore;
 pub mod manifest;
 mod open_sessions;
