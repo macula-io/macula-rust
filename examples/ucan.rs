@@ -6,11 +6,10 @@
 //! `cargo run --example ucan`).
 //!
 //! Keeps the provider `Session` alive for a moment after
-//! `serve_one_call_gated` returns before letting it drop — `Session` has
-//! no `Drop` impl, so dropping it immediately can close the underlying
-//! QUIC connection before the just-sent reply frame actually reaches the
-//! peer (the same class of race already documented on
-//! [`macula_rust::connection::Session::close`]). See this file's own
+//! `serve_one_call_gated` returns before letting it drop — dropping its
+//! last handle closes the QUIC connection at once, which can discard the
+//! just-sent reply before it reaches the peer (the same race documented
+//! on [`macula_rust::connection::Session::close`]). See this file's own
 //! git history / README for the investigation that found this.
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +27,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let caller_id = KeyPair::generate_with_default_puzzle();
     let authority = KeyPair::generate_with_default_puzzle();
 
-    let mut provider = connection::connect(HOST, PORT, Trust::WebPki, &provider_id).await?;
-    let mut caller = connection::connect(HOST, PORT, Trust::WebPki, &caller_id).await?;
+    let provider = connection::connect(HOST, PORT, Trust::WebPki, &provider_id).await?;
+    let caller = connection::connect(HOST, PORT, Trust::WebPki, &caller_id).await?;
 
     let realm = [0u8; 32];
     let procedure = "macula_rust.examples.ucan_gated";
@@ -86,10 +85,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     println!("call without a token: {rejected:?}");
 
-    // Second call: a real token minted by the required authority.
+    // Second call: a real token minted by the required authority. It names
+    // this caller as its audience (the caller's node id as lowercase hex),
+    // the only caller a gated provider accepts it from.
     let token = ucan::create(
         "did:key:example-issuer",
-        "did:key:example-audience",
+        &hex::encode(caller_id.node_id()),
         vec![],
         &authority,
         ucan::CreateOpts::default(),

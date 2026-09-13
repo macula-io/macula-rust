@@ -377,9 +377,16 @@ async fn ucan_gated_serve_one_call_through_the_ffi_surface() {
         serve_until_procedure(&provider, &serve_procedure, policy, 10_000, 5, &provider_id).await
     });
 
+    // A gated provider accepts a token only from the caller it names as its
+    // audience: that caller's node id as lowercase hex.
+    let caller_audience: String = caller_id
+        .node_id()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let token = ucan_create(
         "did:macula:live-test-issuer".to_string(),
-        "did:macula:live-test-audience".to_string(),
+        caller_audience,
         vec![FfiCapability {
             with: "mri:test".to_string(),
             can: "invoke".to_string(),
@@ -489,7 +496,7 @@ async fn run_publisher_facts_through_the_ffi_surface() {
     // against), so this test can only confirm AT LEAST ONE of each
     // landed, not that it was specifically ours -- an honest limit of
     // what's observable through the exposed API, not a gap in the test.
-    watcher
+    let started = watcher
         .subscribe(
             "pubsub.publish_started_v1".to_string(),
             realm.clone(),
@@ -497,7 +504,7 @@ async fn run_publisher_facts_through_the_ffi_surface() {
         )
         .await
         .expect("watcher subscribe (started)");
-    watcher
+    let completed = watcher
         .subscribe(
             "pubsub.publish_completed_v1".to_string(),
             realm.clone(),
@@ -527,33 +534,19 @@ async fn run_publisher_facts_through_the_ffi_surface() {
         .await
         .expect("run_publisher");
 
-    // The real published EVENT itself, plus the started/completed facts
-    // this run_publisher call auto-publishes, may arrive in any order and
-    // interleaved with other real traffic on this shared public fleet —
-    // drain a bounded batch and confirm both fact topics landed, mirroring
-    // the batch-drain correlation discipline the core crate's own RPC
-    // telemetry facts test already established for the identical reason.
-    // These two fixed topics are global on this shared public fleet, and
-    // real, unrelated traffic on them is common enough that a real run of
-    // this test drained dozens of non-matching frames before reaching its
-    // own -- 500 attempts, not a smaller round number, to leave real
-    // headroom rather than tuning to whatever backlog happened to exist
-    // at write time.
-    let mut saw_started = false;
-    let mut saw_completed = false;
-    for _ in 0..500 {
-        if saw_started && saw_completed {
-            break;
-        }
-        let Ok(event) = watcher.recv_event(3_000).await else {
-            continue;
-        };
-        match event.topic.as_str() {
-            t if t.ends_with("pubsub.publish_started_v1") => saw_started = true,
-            t if t.ends_with("pubsub.publish_completed_v1") => saw_completed = true,
-            _ => {}
-        }
-    }
+    // Each subscription receives only its own fact topic, so the first event
+    // on each is a fact of that kind. These topics are global on this shared
+    // public fleet, so the test confirms one of each landed, as noted above.
+    let saw_started = started
+        .recv_event(10_000)
+        .await
+        .is_ok_and(|event| event.topic.ends_with("pubsub.publish_started_v1"));
+    let saw_completed = completed
+        .recv_event(10_000)
+        .await
+        .is_ok_and(|event| event.topic.ends_with("pubsub.publish_completed_v1"));
+    started.close().await;
+    completed.close().await;
     assert!(saw_started, "pubsub.publish_started_v1 should have landed");
     assert!(
         saw_completed,
@@ -573,15 +566,9 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
     let provider_id = FfiKeyPair::generate();
     // Two DISTINCT identities on the caller side: `resolver_id` for the
     // `caller` session (used only to query the DHT and stays open the
-    // whole test), `dial_id` for open_stream_direct's own internal fresh
-    // dial. Reusing one identity for both was a real bug in an earlier
-    // draft of this test -- this fleet kicks whichever connection reuses
-    // an identity second, so the resolver session and the internal dial
-    // fought over the same identity and one got closed out from under the
-    // other, surfacing as "peer closed the stream" on the caller's own
-    // stream. Same bug class already found and fixed elsewhere this
-    // session (see put_direct's own doc, and the content half of this
-    // same test below, which already used separate identities correctly).
+    // whole test), `dial_id` for open_stream_direct's own dial. Under one
+    // identity for both, open_stream_direct would run the stream on the
+    // caller session instead of dialing, and this test covers the dial.
     let resolver_id = FfiKeyPair::generate();
     let dial_id = FfiKeyPair::generate();
     let procedure = format!(
@@ -700,7 +687,7 @@ async fn streaming_and_content_direct_dial_through_the_ffi_surface() {
         }
         other => panic!("expected Data, got {other:?}"),
     }
-    opened.session.close(&dial_id).await;
+    opened.lease.release(&dial_id).await;
 
     // --- content ---
     let resolve_via_id = FfiKeyPair::generate();

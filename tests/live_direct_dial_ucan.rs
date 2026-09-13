@@ -80,11 +80,11 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
     )
     .expect("mint wrong-issuer token");
 
-    let mut provider = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &provider_id)
+    let provider = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &provider_id)
         .await
         .expect("provider handshake should succeed");
     direct_dial::advertise_direct(
-        &mut provider,
+        &provider,
         &provider_id,
         realm,
         &procedure,
@@ -148,11 +148,11 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
     });
 
     // 1. Unauthorized: plain `call` cannot even attach a token.
-    let mut resolver1 = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_id)
+    let resolver1 = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_id)
         .await
         .expect("caller handshake #1 should succeed");
     let resp = direct_dial::call(
-        &mut resolver1,
+        &resolver1,
         &caller_id,
         realm,
         &procedure,
@@ -168,7 +168,7 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
         }
     }
     println!("OBSERVED: plain call against a gated procedure was refused, as expected");
-    let mut provider = serve1
+    let provider = serve1
         .await
         .expect("serve task #1 should not panic")
         .expect("serve_one_call_gated (unauthorized tick) should not error");
@@ -184,11 +184,11 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         r.map(|_| provider)
     });
-    let mut resolver2 = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_id)
+    let resolver2 = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_id)
         .await
         .expect("caller handshake #2 should succeed");
     let resp = direct_dial::call_with_ucan(
-        &mut resolver2,
+        &resolver2,
         &caller_id,
         realm,
         &procedure,
@@ -207,7 +207,7 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
     println!(
         "OBSERVED: call_with_ucan with a token from the wrong issuer was refused, as expected"
     );
-    let mut provider = serve2
+    let provider = serve2
         .await
         .expect("serve task #2 should not panic")
         .expect("serve_one_call_gated (wrong-issuer tick) should not error");
@@ -221,11 +221,11 @@ async fn ucan_gated_capability_reachable_only_through_call_with_ucan() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         r
     });
-    let mut resolver3 = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_id)
+    let resolver3 = connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_id)
         .await
         .expect("caller handshake #3 should succeed");
     let call_fut = direct_dial::call_with_ucan(
-        &mut resolver3,
+        &resolver3,
         &caller_id,
         realm,
         &procedure,

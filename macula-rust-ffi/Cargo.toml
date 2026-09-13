@@ -1,6 +1,6 @@
 [package]
 name = "macula-rust-ffi"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
@@ -27,7 +27,7 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 
 [dependencies]
-macula-rust = { path = "..", version = "0.3" }
+macula-rust = { path = "..", version = "0.4" }
 uniffi = { version = "0.32", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"

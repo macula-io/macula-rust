@@ -566,7 +566,7 @@ fn deadline_ms(timeout: Duration) -> i128 {
 
 /// Stores a signed record in the mesh DHT. Mirrors `macula:put_record/2` —
 /// the relay validates the signature on receipt.
-pub async fn put_record(session: &mut Session, id: &KeyPair, rec: &Record) -> Result<(), DhtError> {
+pub async fn put_record(session: &Session, id: &KeyPair, rec: &Record) -> Result<(), DhtError> {
     let resp = session
         .call(
             PUT_RECORD_PROC,
@@ -590,7 +590,7 @@ pub async fn put_record(session: &mut Session, id: &KeyPair, rec: &Record) -> Re
 /// before the payload is trusted; this function does not verify on the
 /// caller's behalf.
 pub async fn find_record(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     key: [u8; 32],
 ) -> Result<Record, DhtError> {
@@ -622,7 +622,7 @@ pub async fn find_record(
 /// signature should be verified via [`verify`] before its payload is
 /// trusted; this function does not verify on the caller's behalf.
 pub async fn find_records(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     key: [u8; 32],
 ) -> Result<Vec<Record>, DhtError> {
@@ -645,7 +645,7 @@ pub async fn find_records(
 /// session is connected to. Coverage depends on that station's own view of
 /// the DHT. Mirrors `macula:find_records_by_type/2`.
 pub async fn find_records_by_type(
-    session: &mut Session,
+    session: &Session,
     id: &KeyPair,
     typ: u8,
 ) -> Result<Vec<Record>, DhtError> {

@@ -17,10 +17,10 @@
 //!
 //! The provider `Session` is moved back OUT of its `tokio::spawn` task
 //! and closed explicitly, rather than let it drop when the task ends --
-//! see [`macula_rust::connection::Session`]'s own doc for why: there is
-//! no `Drop` impl, so a bare drop gives quinn's send-scheduling no
-//! guarantee the RESULT this example just sent actually reached the
-//! peer before the connection is torn down. Confirmed live 2026-09-05:
+//! see [`macula_rust::connection::Session`]'s own doc for why: dropping
+//! the last handle closes the connection at once, which gives quinn's
+//! send-scheduling no guarantee the RESULT this example just sent
+//! actually reached the peer first. Confirmed live 2026-09-05:
 //! under `#[tokio::main]`'s default multi-threaded runtime, a spawned
 //! task with nothing after `serve_one_call().await` can complete (and
 //! drop the session) within microseconds of the write, losing the reply
@@ -44,14 +44,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,
         &provider_identity,
     )
     .await?;
-    let mut caller_session = connection::connect(
+    let caller_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,

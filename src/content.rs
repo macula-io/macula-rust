@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use crate::bolt4;
 use crate::cbor::Value;
-use crate::connection::{CallError, FrameStream, Session};
+use crate::connection::{FrameStream, Session, StreamCallError};
 use crate::identity::KeyPair;
 use crate::manifest::{self, Manifest, Mcid};
 
@@ -56,7 +56,7 @@ pub enum PutError {
     /// Opening the dedicated stream itself failed (e.g. the connection
     /// is already dead) — never got as far as making a call.
     OpenStream(quinn::ConnectionError),
-    Call(CallError),
+    Call(StreamCallError),
     /// The station rejected the call with a BOLT#4 ERROR.
     Remote {
         code: u8,
@@ -92,7 +92,7 @@ pub enum GetError {
     /// Opening the dedicated stream itself failed (e.g. the connection
     /// is already dead) — never got as far as making a call.
     OpenStream(quinn::ConnectionError),
-    Call(CallError),
+    Call(StreamCallError),
     Remote {
         code: u8,
         name: String,
@@ -136,16 +136,25 @@ impl std::error::Error for GetError {}
 /// matching `macula_content_transfer:put_single_block/3` — `name` is
 /// silently unused on that path, not an oversight.
 pub async fn put(
-    session: &mut Session,
+    session: &Session,
     data: &[u8],
     name: impl Into<String>,
     identity: &KeyPair,
 ) -> Result<Mcid, PutError> {
-    let mut stream = session
+    let stream = session
         .open_dedicated_stream()
         .await
         .map_err(PutError::OpenStream)?;
+    put_on(stream, data, name, identity).await
+}
 
+/// [`put`], over a dedicated stream already open to the station.
+pub(crate) async fn put_on(
+    mut stream: FrameStream,
+    data: &[u8],
+    name: impl Into<String>,
+    identity: &KeyPair,
+) -> Result<Mcid, PutError> {
     if data.len() <= manifest::DEFAULT_CHUNK_SIZE {
         let mcid = manifest::block_mcid(data);
         put_block(&mut stream, &mcid, data, identity).await?;
@@ -167,16 +176,20 @@ pub async fn put(
 }
 
 /// Fetch and verify the content addressed by `mcid`.
-pub async fn get(
-    session: &mut Session,
-    mcid: Mcid,
-    identity: &KeyPair,
-) -> Result<Vec<u8>, GetError> {
-    let mut stream = session
+pub async fn get(session: &Session, mcid: Mcid, identity: &KeyPair) -> Result<Vec<u8>, GetError> {
+    let stream = session
         .open_dedicated_stream()
         .await
         .map_err(GetError::OpenStream)?;
+    get_on(stream, mcid, identity).await
+}
 
+/// [`get`], over a dedicated stream already open to the station.
+pub(crate) async fn get_on(
+    mut stream: FrameStream,
+    mcid: Mcid,
+    identity: &KeyPair,
+) -> Result<Vec<u8>, GetError> {
     if !manifest::mcid_is_chunked(&mcid) {
         let data = get_block(&mut stream, &mcid, identity).await?;
         if manifest::block_mcid(&data) != mcid {
@@ -320,7 +333,7 @@ async fn call_with_retry(
     payload: Value,
     timeout: Duration,
     identity: &KeyPair,
-) -> Result<crate::frame::CallResponse, CallError> {
+) -> Result<crate::frame::CallResponse, StreamCallError> {
     let mut attempt = 0;
     loop {
         attempt += 1;

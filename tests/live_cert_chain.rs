@@ -104,7 +104,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     let caller_identity = KeyPair::generate_with_default_puzzle();
     let leaf_der = issue_leaf(&ca_issuer, provider_identity.node_id(), "acme-corp");
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         STATION_HOST,
         STATION_PORT,
         Trust::WebPki,
@@ -112,7 +112,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     )
     .await
     .expect("provider handshake should succeed");
-    let mut resolver_session =
+    let resolver_session =
         connection::connect(STATION_HOST, STATION_PORT, Trust::WebPki, &caller_identity)
             .await
             .expect("resolver handshake should succeed");
@@ -124,7 +124,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     );
 
     direct_dial::advertise_direct_with_cert_chain(
-        &mut provider_session,
+        &provider_session,
         &provider_identity,
         realm,
         &procedure,
@@ -135,7 +135,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     .expect("advertise_direct_with_cert_chain should publish the DHT record");
 
     let resolved = direct_dial::resolve_with_cert_chain(
-        &mut resolver_session,
+        &resolver_session,
         &caller_identity,
         realm,
         &procedure,
@@ -151,7 +151,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
 
     // Negative control on the SAME real, network-round-tripped record.
     let err = direct_dial::resolve_with_cert_chain(
-        &mut resolver_session,
+        &resolver_session,
         &caller_identity,
         realm,
         &procedure,
@@ -170,7 +170,7 @@ async fn cert_chain_survives_a_real_dht_round_trip() {
     // succeeding above, but pins down that verify_advertisement_cert_chain
     // itself (not just the resolve wrapper) is what's being exercised.
     let recs = macula_rust::dht::find_records(
-        &mut resolver_session,
+        &resolver_session,
         &caller_identity,
         macula_rust::dht::procedure_key(&macula_rust::dht::discovery_uri(realm, &procedure)),
     )

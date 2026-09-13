@@ -13,6 +13,156 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [0.4.0] - Unreleased
+
+#### Changed
+
+- **Direct dial tries every authorized provider.** `direct_dial::call`,
+  `call_with_ucan`, `call_with_cert_chain`, `open_stream_direct`,
+  `open_stream_direct_with_cert_chain` and `get_direct` try each advertised
+  provider in the order the DHT returns them, instead of only the first. A
+  provider that can't be reached before the request is sent is skipped for
+  the next one, and a request that has been sent is never sent again.
+  `get_direct` also retries while no provider has announced the content
+  yet, and a DHT lookup that fails is retried within the timeout instead of
+  ending the call.
+- **Breaking: the timeout bounds the whole call**, finding the provider
+  included. A timeout sized for the request alone can now run out during
+  resolution. `resolve` and `resolve_with_cert_chain` give up after 10
+  seconds, and `put_direct`'s timeout covers the endpoint lookup and the
+  dial.
+- **Breaking: new `GetDirectError::Timeout { last }`.** It reports a
+  `get_direct` whose timeout ran out during a transfer, where `last`, also
+  its `source()`, carries the failure before it, or before any provider
+  lookup was answered. An exhaustive `match` on `GetDirectError` needs the
+  new arm.
+- **Breaking: new `ResolveError::Timeout`, and a call reports what it
+  observed.** At its timeout a direct-dial call returns the last candidate
+  failure, else why an answered DHT lookup found nothing, else a failed
+  lookup's error, and `ResolveError::Timeout` only when nothing was
+  observed at all, where it used to report `ProcedureNotAdvertised` or
+  `StationEndpointNotFound`. A `station_endpoint` lookup follows the same
+  rule, reporting `StationEndpointNotFound` only when a lookup was
+  answered, and retries a lookup that fails within its budget. A record
+  that names no dialable address is looked up again too, and when it is
+  the latest answer the lookup reports the new
+  `ResolveError::MalformedStationEndpoint`. An exhaustive `match` on
+  `ResolveError` needs both new arms.
+- **Breaking: direct dial reuses a session this process already has open
+  to the provider's station under the same identity.** A station keeps one
+  connection per identity and closes the older one when a newer one
+  arrives, so a second dial used to close `resolve_via` or a `Pool` link.
+  `open_stream_direct`, `open_stream_direct_with_cert_chain`, `put_direct`
+  and `get_direct` now run on that open session, on a dedicated QUIC
+  stream, and leave it open. The stream functions return
+  `direct_dial::OpenedStream` (`stream`, `lease`) instead of a
+  `(Session, StreamHandle)` tuple; release its `SessionLease` once the
+  stream is done. `call`, `call_with_ucan` and `call_with_cert_chain` run
+  on an open session the same way.
+- **A direct call whose CALL was not sent tries the next candidate.** A call
+  whose session had ended, or whose turn to write didn't come in time, moves
+  on to the next candidate, and its station may be tried again on a later
+  pass. A call that was or may have been sent is returned as before.
+- **A CALL handler receives its caller.** A map payload reaches the handler
+  with the caller's 32-byte node id under `"caller"`, the caller the CALL's
+  signature was verified against, replacing any `"caller"` the sender put in
+  the payload. A payload that isn't a map reaches the handler unchanged and
+  carries no caller.
+- **Breaking: `StreamHandle::accept` refuses a STREAM_OPEN not signed by its
+  caller.** Stream handlers previously received the STREAM_OPEN's caller
+  field unverified; upgrade if a stream handler relies on it. A stream whose
+  first frame doesn't verify against the caller it names, has no signature
+  or caller, is of another type, or doesn't decode is aborted in both
+  directions with application error code 2 (`stream::REFUSED_STREAM`),
+  with nothing written, and accept waits for the next stream within its
+  timeout. `AcceptError::Parse` is removed. A provider that accepts a
+  stream and won't serve it refuses it with `StreamHandle::refuse`, which
+  writes a STREAM_ERROR, finishes the send half and stops reading with
+  code 2.
+- **A stream handler receives its caller.** Map args of an accepted
+  STREAM_OPEN carry the verified caller under `"caller"`, replacing any
+  `"caller"` the opener put there, as a CALL handler's payload does.
+- **Drop warnings.** A session logs a dropped CALL (`dropped_call`), a
+  RESULT or ERROR for no pending call (`dropped_reply`) and a refused stream
+  (`refused_stream_open`) with its `count`, `reason`, and `procedure` or
+  `call_id`. The first of a kind in an interval is logged at once, and the
+  rest are counted into one closing line when the interval ends.
+  `Session::set_drop_warning_interval` sets the interval, 60 seconds by
+  default.
+- **A frame that doesn't decode ends a session as `SessionEndReason::Malformed`**,
+  where it used to end as `StreamFailed`. An exhaustive `match` on
+  `SessionEndReason` needs the new arm.
+- **A session direct dial dialed is shared until its last request is done.**
+  A direct-dial request that finds it open uses it too, holding a lease of
+  its own, and the session closes when the last lease is released instead
+  of when the request that dialed it finishes. It is not reused once it is
+  closing.
+- **Breaking: a UCAN-gated procedure binds the token to its caller.**
+  `ucan::Policy::check` takes the CALL's `caller` as well as its token, and
+  a `Policy::required` procedure accepts a token only when its `aud` is
+  that caller's 32-byte node id as lowercase hex, with no `did:` prefix. A
+  token with another or no audience is refused as `unauthorized`
+  (`UcanError::WrongAudience`, and `UcanError::NoCaller` when `check` gets
+  no 32-byte caller; both new). Mint tokens for gated procedures with that
+  audience.
+- **An inbound CALL must be signed by the caller it names.**
+  `Session::serve_one_call` and `serve_one_call_gated` drop a CALL whose
+  signature doesn't verify against its `caller` field, without a reply and
+  before any policy or handler runs, matching the Erlang station link.
+- **Breaking: a `Session` is a cloneable handle with one reader.** Its
+  methods take `&self`, so calls, subscriptions, publishing and serving on
+  one session run at the same time. A reader task routes each RESULT or
+  ERROR to its call by call id, each EVENT to the subscriptions it matches,
+  and each inbound CALL to a queue of 64 that `serve_one_call` and
+  `serve_one_call_gated` take from. A slow subscriber never delays a call's
+  reply. The functions in `dht`, `content`, `stream` and `direct_dial` take
+  `&Session` instead of `&mut Session`.
+- **Breaking: `Session::subscribe` returns a `Subscription`** with its own
+  queue of 256 events, read with `recv_event(timeout)` and ended with
+  `close()`. A topic matches segment by segment on `/`, where `*` is exactly
+  one segment, and the realm must be equal. Closing the last subscription
+  for a realm and topic sends UNSUBSCRIBE. A subscription that falls more
+  than 256 events behind returns its queued events and then
+  `RecvEventError::Overflow`, and stays subscribed at the station until it
+  is closed. `Session::recv_event`, `unsubscribe`, `recv_frame`,
+  `recv_frame_timeout` and `leftover_bytes` are removed, and
+  `run_subscriber` runs on a `Subscription`.
+- **Breaking: new error types.** `Session::call` and `call_with_ucan`
+  return `CallError`: `Timeout { write_started }`,
+  `SessionEnded { reason, write_started }`, `SendTimeout`, `Encode`,
+  `Write` or `MalformedReply`, where `not_sent()` tells whether the CALL
+  can safely be sent again. `publish`, `advertise`, `unadvertise` and
+  `subscribe` return `SendError`, `RecvEventError` is `Timeout`, `Overflow`
+  or `SessionEnded`, `serve_one_call` returns `ServeCallError`, and
+  `FrameStream`'s call error is renamed `StreamCallError`.
+- **Writes are bounded.** A caller waits for its turn to write no longer
+  than its deadline, a call's timeout or else 30 seconds. A write that
+  takes longer than 30 seconds ends the session. The reader never waits on
+  a write: an inbound CALL that finds the queue full is answered with
+  `temporary_relay_failure` through a separate queue of 64 frames, and
+  serving carries on.
+- **How a session ends.** A GOODBYE, a HELLO or CONNECT after the handshake,
+  a frame that doesn't decode, a stalled write or the end of the control
+  stream ends the session: its pending calls fail with `SessionEnded`, its
+  connection closes, direct dial no longer reuses it, and the end is logged
+  once through the `log` crate, as a warning when the station or connection
+  ended it and as info when it was closed here, with both node ids.
+  `Session::end_reason` and `ended` report it. Frames no route claims are
+  counted by type in `unrouted_frame_counts`, with a log line at most once
+  a minute.
+- **`Pool::call` publishes no RPC facts.** A pooled call goes through the
+  link's session without the `rpc.sent_v1` and `rpc.completed_v1` facts
+  that `Session::call` publishes.
+- **Breaking: `Pool::call` tries another link only when the CALL was not
+  sent.** It moves on to the next connected link only while a call fails
+  before its CALL was written, so no CALL runs twice. A call that timed out
+  after its write started, and an ERROR reply, are returned as they are.
+  `PoolCallError::AllFailed` is replaced by `PoolCallError::Call`, the
+  failure that stopped the call.
+- **A pool link is dialed again when its session ends**, instead of when a
+  call or publish on it fails, so a call that times out on a link that is
+  still up no longer drops that link.
+
 ### [0.3.0] - 2026-09-05
 
 #### Added
@@ -278,6 +428,33 @@ this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
 same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
+
+### [ffi-0.4.0] - Unreleased
+
+#### Changed
+
+- Builds on `macula-rust` 0.4, with the dependency requirement moved to
+  `"0.4"`. The direct-dial calls on `FfiSession` therefore try every
+  authorized provider, and their `timeout_ms` now bounds finding the
+  provider as well. A `get_direct` whose transfer the timeout cuts off
+  reports `FfiError::Content` with the earlier failure in its reason.
+- `FfiSession::serve_one_call_gated` refuses a UCAN token whose `aud` isn't
+  the calling node's id as lowercase hex, and both serve calls drop a CALL
+  that isn't signed by its caller. Mint tokens for gated procedures with
+  `ucan_create` using that audience.
+- **Breaking: `FfiOpenedDirectStream` carries a `lease` instead of a
+  `session`.** The direct-dial stream and content calls on `FfiSession` run
+  on a session this process already has open to the provider's station
+  under the same identity, instead of dialing a second one that would close
+  it. Call `FfiSessionLease::release` once the stream is done: a session
+  direct dial dialed closes when no other direct-dial request still uses it.
+- **Breaking: `FfiSession::subscribe` returns an `FfiSubscription`**, read
+  with `recv_event(timeout_ms)` and ended with `close()`. Each subscription
+  has its own queue of 256 events and receives only the events its topic
+  and realm match. `FfiSession::recv_event` and `unsubscribe` are removed.
+- Methods on one `FfiSession` no longer wait for each other:
+  `serve_one_call`, `accept_stream`, calls and subscriptions on the same
+  session run at the same time.
 
 ### [ffi-0.3.1] - 2026-09-05
 

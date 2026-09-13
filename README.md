@@ -57,15 +57,16 @@ CLI, or WASM as any other Rust SDK.
 | Primitive | Caller | Provider | Notes |
 |---|---|---|---|
 | Handshake (CONNECT/HELLO) | ✅ | — | Ed25519 identity, S/Kademlia puzzle-hardened |
-| Unary RPC (CALL/RESULT/ERROR) | ✅ | ✅ | `Session::serve_one_call`, BOLT#4 error mapping live-verified |
-| PubSub (PUBLISH/SUBSCRIBE/EVENT) | ✅ | ✅ | A subscriber gets its own publish, verified live |
+| One session, many uses | ✅ | ✅ | `Session` is a cloneable handle with one reader: calls, subscriptions and serving on it run at the same time, and a slow consumer never stalls a call's reply |
+| Unary RPC (CALL/RESULT/ERROR) | ✅ | ✅ | `Session::serve_one_call`, BOLT#4 error mapping live-verified; a call that times out says whether its frame was sent |
+| PubSub (PUBLISH/SUBSCRIBE/EVENT) | ✅ | ✅ | `Session::subscribe` returns a `Subscription` with its own queue of 256 events; a subscriber gets its own publish, verified live |
 | Content transfer (single-block + chunked) | ✅ | ✅ | Content-addressed, BLAKE3/SHA-256 |
 | Streaming RPC (STREAM_OPEN/DATA/END/REPLY) | ✅ | ✅ | Both roles live-verified against the real fleet; `ClientStream` mode's reply path is SDK-correct but currently blocked by a `macula-station` bug — see [Known limitations](#known-limitations) |
 | RPC advertise/unadvertise | ✅ | — | |
 | Direct-dial (DHT resolve/publish) | ✅ | ✅ | `direct_dial::{resolve,call,advertise_direct}` — reaches a service without depending on advertise-gossip having propagated a route; plain + cert-chain-authorized (`*_with_cert_chain`) |
-| Direct-dial streaming/content | ✅ | ✅ | `direct_dial::{open_stream_direct,put_direct,get_direct}` — `get_direct` is correct but currently unreachable, see [Known limitations](#known-limitations) |
+| Direct-dial streaming/content | ✅ | ✅ | `direct_dial::{open_stream_direct,put_direct,get_direct}` — runs on a session already open to the same station under the same identity instead of dialing a second one, which the station would answer by closing the first; `get_direct` is correct but currently unreachable, see [Known limitations](#known-limitations) |
 | Periodic re-advertise | — | ✅ | `Session::keep_advertised` / `direct_dial::keep_advertised_direct` — a ctx-cancellable loop, since a station's registration doesn't survive the connection that sent it being replaced |
-| UCAN (mint/verify/introspect) | ✅ | ✅ | `ucan::{create,verify,decode,get_*}` are pure functions; `Session::call_with_ucan`/`serve_one_call_gated` live-verified end-to-end (see [`examples/ucan.rs`](examples/ucan.rs) and [Known limitations](#known-limitations) for the resolved investigation) |
+| UCAN (mint/verify/introspect) | ✅ | ✅ | `ucan::{create,verify,decode,get_*}` are pure functions; `Session::call_with_ucan`/`serve_one_call_gated` live-verified end-to-end; a gated provider accepts a token only when its `aud` is the calling node's id as lowercase hex, and drops a CALL not signed by its caller (see [`examples/ucan.rs`](examples/ucan.rs) and [Known limitations](#known-limitations) for the resolved investigation) |
 | Cert-chain (org/realm authorization) | ✅ | ✅ | `cert_chain::verify_advertisement_cert_chain` + `direct_dial::*_with_cert_chain` — opt-in, the plain direct-dial path is unaffected |
 | Supervised PubSub pair | ✅ | ✅ | `Session::run_publisher`/`run_subscriber` — addressable/cancellable wrappers over bare publish/subscribe, auto-publishing `pubsub.publish_*_v1` facts |
 | RPC telemetry auto-facts | ✅ | ✅ | `rpc.sent_v1`/`rpc.completed_v1` (caller), `rpc.received_v1`/`rpc.replied_v1` (provider) — always-on, fire-and-forget, fired automatically by `call`/`serve_one_call_gated` |
@@ -102,14 +103,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider_identity = KeyPair::generate_with_default_puzzle();
     let caller_identity = KeyPair::generate_with_default_puzzle();
 
-    let mut provider_session = connection::connect(
+    let provider_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,
         &provider_identity,
     )
     .await?;
-    let mut caller_session = connection::connect(
+    let caller_session = connection::connect(
         "station-de-frankfurt.macula.io",
         4433,
         Trust::WebPki,
@@ -148,10 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .serve_one_call(lookup, &provider_identity, Duration::from_secs(10))
             .await;
         // Close explicitly instead of letting provider_session drop when
-        // this task ends — see Session's own doc for why: there is no
-        // Drop impl, so a bare drop gives quinn's send-scheduling no
-        // guarantee the RESULT just sent actually reached the peer
-        // before the connection is torn down.
+        // this task ends — see Session's own doc for why: dropping the
+        // last handle closes the connection at once, which gives quinn's
+        // send-scheduling no guarantee the RESULT just sent actually
+        // reached the peer first.
         provider_session
             .close(
                 "normal",
@@ -401,20 +402,21 @@ traced directly to the Erlang SDK's source.
   broken. See `macula-rust-ffi/tests/live_cert_chain_direct_dial.rs`'s
   own comments for the ruled-out theories from the earlier rounds.
 - The demo fleet's `station_endpoint` DHT records carry a short TTL and
-  are not always freshly republished — a direct-dial resolve can
-  intermittently return `StationEndpointNotFound` for a station whose
-  record happens to be stale at that moment. Retrying, or trying a
-  different fleet station, resolves it; this is fleet infrastructure
-  state, not a code defect.
+  are not always freshly republished, so a station's record can be stale
+  for a while. Direct dial tries every advertised provider in turn and
+  keeps re-querying within the call's `timeout`; only when no provider's
+  station has a usable record before it runs out does the call return
+  `StationEndpointNotFound`. This is fleet infrastructure state, not a
+  code defect.
 - **RESOLVED**: an earlier draft of this section reported
   `serve_one_call_gated`/`call_with_ucan` failing 100% of live attempts
   while `serve_one_call` succeeded reliably in the same window, and left
   it as an open, unconfirmed question. Root-caused: it was a test-harness
   bug, not a real difference between gated and plain serving. The failing
   harness spawned the provider's `Session` into a task that dropped it
-  the instant `serve_one_call`/`serve_one_call_gated` returned; `Session`
-  has no `Drop` impl, so the underlying QUIC connection can close before
-  the just-sent reply frame is actually flushed to the peer — the exact
+  the instant `serve_one_call`/`serve_one_call_gated` returned; dropping
+  the last `Session` handle closes the underlying QUIC connection, which
+  can happen before the just-sent reply frame is flushed to the peer — the exact
   same class of race already documented on [`Session::close`], just
   never hit by drop instead of an explicit close before now. Confirmed
   by direct A/B: 8/8 plain AND 8/8 gated calls succeeded once the

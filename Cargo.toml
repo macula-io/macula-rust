@@ -3,7 +3,7 @@ members = ["macula-rust-ffi"]
 
 [package]
 name = "macula-rust"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
@@ -36,6 +36,10 @@ x509-parser = "0.18"
 rustls-webpki = { version = "0.103", features = ["ring"] }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v7"] }
+# control_channel.rs: a session end and dropped unrouted frames are reported
+# through the `log` facade, silent unless the application installs a logger.
+# Already in the graph through rustls's `logging` feature.
+log = "0.4"
 blake3 = "1.5"
 # ucan.rs: JWT-shaped token (de)serialization, matching the reference
 # macula_ucan_nif's own dependency choices exactly (its Cargo.toml has no
