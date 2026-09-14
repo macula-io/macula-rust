@@ -433,7 +433,28 @@ pub async fn connect(
 ) -> Result<Session, HandshakeError> {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        connect_inner(host, port, trust, identity, None),
+        connect_inner(host, port, trust, identity, None, Vec::new()),
+    )
+    .await
+    .unwrap_or(Err(HandshakeError::Timeout))
+}
+
+/// [`connect`], claiming membership in the given realms AT CONNECT
+/// TIME. Pub/sub delivery is realm-scoped at the connection level --
+/// the CONNECT frame carries the realm memberships (see
+/// plans/PLAN_WIRE_PROTOCOL.md §5) -- so a client that must receive a
+/// realm's topics has to claim it here; per-subscribe realm tags alone
+/// are not enough.
+pub async fn connect_in_realm(
+    host: &str,
+    port: u16,
+    trust: Trust,
+    identity: &KeyPair,
+    realms: &[[u8; 32]],
+) -> Result<Session, HandshakeError> {
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        connect_inner(host, port, trust, identity, None, realms.to_vec()),
     )
     .await
     .unwrap_or(Err(HandshakeError::Timeout))
@@ -452,7 +473,7 @@ pub(crate) async fn connect_leased(
     let leases = Some(crate::open_sessions::Leases::new());
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        connect_inner(host, port, trust, identity, leases),
+        connect_inner(host, port, trust, identity, leases, Vec::new()),
     )
     .await
     .unwrap_or(Err(HandshakeError::Timeout))
@@ -464,6 +485,7 @@ async fn connect_inner(
     trust: Trust,
     identity: &KeyPair,
     leases: Option<crate::open_sessions::Leases>,
+    realms: Vec<[u8; 32]>,
 ) -> Result<Session, HandshakeError> {
     let connection = transport::connect(host, port, trust)
         .await
@@ -474,8 +496,9 @@ async fn connect_inner(
         .await
         .map_err(HandshakeError::OpenStream)?;
 
-    let connect_spec =
+    let mut connect_spec =
         crate::frame::ConnectSpec::new(identity.node_id(), identity.puzzle_evidence());
+    connect_spec.realms = realms;
     let connect_frame = frame::sign(frame::connect(&connect_spec), identity);
     let encoded = frame::encode(&connect_frame).map_err(HandshakeError::Encode)?;
     send.write_all(&encoded)
