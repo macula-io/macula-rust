@@ -52,10 +52,12 @@ pub struct PubkeyPinVerifier {
 }
 
 impl PubkeyPinVerifier {
+    /// Verifies handshake signatures with `macula-pq`'s provider, the one
+    /// every connection this crate dials runs on.
     pub fn new(pinned_pubkey: [u8; 32]) -> Self {
         Self {
             pinned: pinned_pubkey,
-            crypto: Arc::new(rustls::crypto::ring::default_provider()),
+            crypto: macula_pq::client_builder().crypto_provider().clone(),
         }
     }
 }
@@ -129,8 +131,10 @@ impl rustls::client::danger::ServerCertVerifier for PubkeyPinVerifier {
 pub struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl SkipServerVerification {
+    /// States the signature schemes of `macula-pq`'s provider, the one every
+    /// connection this crate dials runs on.
     pub fn new() -> Self {
-        Self(Arc::new(rustls::crypto::ring::default_provider()))
+        Self(macula_pq::client_builder().crypto_provider().clone())
     }
 }
 

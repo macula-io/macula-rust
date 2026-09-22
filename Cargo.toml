@@ -26,7 +26,12 @@ ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 rand = "0.10"
 sha2 = "0.11"
 quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# The key exchange for every connection this crate dials: every TLS
+# configuration starts from macula-pq's client_builder(), which offers
+# SecP384r1MLKEM1024 then SecP256r1MLKEM768 and nothing classical. So
+# rustls selects no crypto provider of its own here. See transport.rs.
+macula-pq = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 webpki-roots = "1.0"
 x509-parser = "0.18"
 # cert_chain.rs: pure X.509 path validation (no hostname/SAN check, unlike
@@ -100,6 +105,9 @@ tempfile = "3"
 # rcgen-generated one (the leaf must bind the SAME key that signed the
 # advertisement) — SubjectPublicKeyInfo::from_der needs this feature.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
+# Test-only, transport.rs's own tests: the stations the dialler must still
+# reach, or must refuse, are built from aws-lc-rs's own groups.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 # Test-only, cert_chain.rs's own tests: rcgen's CertificateParams
 # not_before/not_after fields take this crate's OffsetDateTime directly;
 # not re-exported by rcgen, so declared explicitly (already transitively

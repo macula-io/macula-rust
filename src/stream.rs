@@ -499,7 +499,7 @@ mod tests {
             .self_signed(&key_pair)
             .expect("a self-signed certificate");
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
-        let mut crypto = rustls::ServerConfig::builder()
+        let mut crypto = macula_pq::server_builder()
             .with_no_client_auth()
             .with_single_cert(vec![certificate.der().clone()], key)
             .expect("a server certificate");

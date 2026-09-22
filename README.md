@@ -73,10 +73,11 @@ CLI, or WASM as any other Rust SDK.
 | Overridable `KeyStore` | ✅ | — | `keystore::KeyStore` trait + `KeyringStore`/`LinuxKeyutilsStore` — `KeyPair::save_to_keystore`/`load_from_keystore`; the raw-file `KeyPair::save` stays as a testing/parity convenience |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | Via [UniFFI](#mobile-bindings-uniffi) — provider role serves via `FfiCallHandler`, a foreign-implemented async trait (`suspend fun`/`async throws`), not a closure. Covers direct-dial, UCAN, cert-chain, content/stream direct-dial reuse, and `KeyStore`; deliberately NOT `keep_advertised`/`run_subscriber` (see the FFI crate's own module doc for why) |
 | Pubkey-pinned trust | ✅ | — | `Trust::Pinned` / `FfiTrust.Pinned` — the only mode that works at all for a station without a CA-issued cert |
+| Post-quantum key exchange | ✅ | — | Every dial, in every trust mode, via [`macula-pq`](https://crates.io/crates/macula-pq): `SecP384r1MLKEM1024`, then `SecP256r1MLKEM768`, nothing classical. A station on macula 11.5.0 or earlier offers only classical groups and cannot be reached. Key exchange only: certificates are still classically signed |
 
 `unsafe_code = "forbid"` at the crate level — the only unsafe in this
-workspace lives inside its pinned dependencies (`quinn`, `ring`), not
-here.
+workspace lives inside its dependencies (`quinn`, `ring`, `aws-lc-rs`),
+not here.
 
 ## Quick start
 

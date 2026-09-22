@@ -78,24 +78,7 @@ impl std::fmt::Display for ConnectError {
 impl std::error::Error for ConnectError {}
 
 fn client_config(trust: Trust) -> Result<ClientConfig, rustls::Error> {
-    let mut crypto = match trust {
-        Trust::Pinned(pubkey) => rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PubkeyPinVerifier::new(pubkey)))
-            .with_no_client_auth(),
-        Trust::WebPki => {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        }
-        Trust::Insecure => rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
-            .with_no_client_auth(),
-    };
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    let crypto = tls_client_config(trust);
 
     let mut transport = TransportConfig::default();
     transport.max_idle_timeout(Some(
@@ -109,6 +92,37 @@ fn client_config(trust: Trust) -> Result<ClientConfig, rustls::Error> {
     let mut config = ClientConfig::new(Arc::new(quic_crypto));
     config.transport_config(Arc::new(transport));
     Ok(config)
+}
+
+/// The rustls half of a dial's configuration, before quinn wraps it: a
+/// seam, so the tests drive the configuration this crate actually dials
+/// with rather than a copy built the same way.
+///
+/// The key exchange is `macula-pq`'s: its builder arrives with the groups
+/// and TLS 1.3 fixed, and keeps its provider where nothing here can edit
+/// it. A station offering only classical groups, as macula 11.5.0 and
+/// earlier do, cannot be reached.
+pub(crate) fn tls_client_config(trust: Trust) -> rustls::ClientConfig {
+    let builder = macula_pq::client_builder;
+    let mut crypto = match trust {
+        Trust::Pinned(pubkey) => builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PubkeyPinVerifier::new(pubkey)))
+            .with_no_client_auth(),
+        Trust::WebPki => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        Trust::Insecure => builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new()))
+            .with_no_client_auth(),
+    };
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto
 }
 
 /// Matches macula's own `apply_flow_control_defaults` in
@@ -155,4 +169,155 @@ fn resolve(host: &str, port: u16) -> Result<SocketAddr, ConnectError> {
         .map_err(ConnectError::Resolve)?
         .next()
         .ok_or(ConnectError::NoAddress)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The key exchange this crate dials with, asserted on real TLS 1.3
+    //! handshakes against the configuration `connect` actually uses.
+
+    use std::sync::Arc;
+
+    use rustls::crypto::aws_lc_rs::kx_group as aws;
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use rustls::{
+        ClientConnection, ConfigBuilder, Connection, NamedGroup, ServerConfig, ServerConnection,
+        WantsVerifier,
+    };
+
+    use super::{tls_client_config, Trust, ALPN};
+
+    /// `SecP384r1MLKEM1024`, code point `0x11ED`. rustls has no variant for
+    /// it and no rustls provider ships it: only `macula-pq` does.
+    const SECP384R1MLKEM1024: NamedGroup = NamedGroup::Unknown(0x11ED);
+
+    fn offered(provider: &CryptoProvider) -> Vec<NamedGroup> {
+        provider.kx_groups.iter().map(|g| g.name()).collect()
+    }
+
+    /// Every trust mode dials with `macula-pq`'s two groups and nothing
+    /// else. A mode that built its own provider would be the one path a
+    /// classical group could come back through.
+    #[test]
+    fn every_trust_mode_offers_exactly_macula_pqs_groups() {
+        for (mode, trust) in [
+            ("pinned", Trust::Pinned([7; 32])),
+            ("webpki", Trust::WebPki),
+            ("insecure", Trust::Insecure),
+        ] {
+            assert_eq!(
+                offered(tls_client_config(trust).crypto_provider()),
+                vec![SECP384R1MLKEM1024, NamedGroup::secp256r1MLKEM768],
+                "{mode}"
+            );
+        }
+    }
+
+    /// A station on `macula-pq`, as macula's own QUIC NIF now is.
+    #[test]
+    fn a_station_on_macula_pq_negotiates_secp384r1mlkem1024() {
+        let station = station(macula_pq::server_builder());
+        let agreed = handshake(tls_client_config(Trust::Insecure), station);
+        assert_eq!(agreed, Ok(SECP384R1MLKEM1024));
+    }
+
+    /// A station on `aws-lc-rs`'s post-quantum groups: `macula-pq`'s ML-KEM
+    /// against `aws-lc-rs`'s, on the group both offer.
+    #[test]
+    fn a_station_on_aws_lc_rs_post_quantum_groups_negotiates_secp256r1mlkem768() {
+        let list = CryptoProvider {
+            kx_groups: vec![
+                aws::SECP256R1MLKEM768,
+                aws::X25519MLKEM768,
+                aws::MLKEM1024,
+                aws::MLKEM768,
+            ],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        };
+        let agreed = handshake(tls_client_config(Trust::Insecure), station_on(list));
+        assert_eq!(agreed, Ok(NamedGroup::secp256r1MLKEM768));
+    }
+
+    /// ⛔ THE NEGATIVE CONTROL. A station offering only classical groups, as
+    /// macula 11.5.0 and earlier do, must NOT agree with this dialler. It
+    /// can only fail to agree if the dialler's group list is in force.
+    #[test]
+    fn a_classical_only_station_cannot_agree_with_us() {
+        let classical = CryptoProvider {
+            kx_groups: vec![aws::X25519, aws::SECP256R1, aws::SECP384R1],
+            ..rustls::crypto::aws_lc_rs::default_provider()
+        };
+        let outcome = handshake(tls_client_config(Trust::Insecure), station_on(classical));
+        assert!(
+            outcome.is_err(),
+            "a classical-only station agreed with us: {outcome:?}"
+        );
+    }
+
+    fn identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let key_pair = rcgen::KeyPair::generate().expect("a key pair");
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("certificate params")
+            .self_signed(&key_pair)
+            .expect("a self-signed certificate");
+        let key = PrivateKeyDer::Pkcs8(key_pair.serialize_der().into());
+        (vec![certificate.der().clone()], key)
+    }
+
+    fn station(builder: ConfigBuilder<ServerConfig, WantsVerifier>) -> ServerConfig {
+        let (chain, key) = identity();
+        let mut config = builder
+            .with_no_client_auth()
+            .with_single_cert(chain, key)
+            .expect("a server certificate");
+        config.alpn_protocols = vec![ALPN.to_vec()];
+        config
+    }
+
+    fn station_on(provider: CryptoProvider) -> ServerConfig {
+        station(
+            ServerConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .expect("versions"),
+        )
+    }
+
+    /// One in-memory handshake; the group both sides agreed on, or why
+    /// they did not. A failure to agree is what the negative control asserts.
+    fn handshake(client: rustls::ClientConfig, server: ServerConfig) -> Result<NamedGroup, String> {
+        let name = ServerName::try_from("localhost").expect("a server name");
+        let mut client = Connection::Client(
+            ClientConnection::new(Arc::new(client), name).map_err(|e| e.to_string())?,
+        );
+        let mut server =
+            Connection::Server(ServerConnection::new(Arc::new(server)).map_err(|e| e.to_string())?);
+        for _ in 0..20 {
+            let moved = pump(&mut client, &mut server)? + pump(&mut server, &mut client)?;
+            if moved == 0 && !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        if client.is_handshaking() || server.is_handshaking() {
+            return Err("handshake never completed".to_string());
+        }
+        let agreed = |c: &Connection| c.negotiated_key_exchange_group().map(|g| g.name());
+        match (agreed(&client), agreed(&server)) {
+            (Some(c), Some(s)) if c == s => Ok(c),
+            other => Err(format!("the two sides disagree on the group: {other:?}")),
+        }
+    }
+
+    fn pump(from: &mut Connection, to: &mut Connection) -> Result<usize, String> {
+        let mut buf = Vec::new();
+        while from.wants_write() {
+            from.write_tls(&mut buf).map_err(|e| e.to_string())?;
+        }
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        while (cursor.position() as usize) < buf.len() {
+            to.read_tls(&mut cursor).map_err(|e| e.to_string())?;
+            to.process_new_packets().map_err(|e| e.to_string())?;
+        }
+        Ok(buf.len())
+    }
 }
