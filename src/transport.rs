@@ -98,12 +98,12 @@ fn client_config(trust: Trust) -> Result<ClientConfig, rustls::Error> {
 /// seam, so the tests drive the configuration this crate actually dials
 /// with rather than a copy built the same way.
 ///
-/// The key exchange is `macula-pq`'s: its builder arrives with the groups
+/// The key exchange is `macula-pqc`'s: its builder arrives with the groups
 /// and TLS 1.3 fixed, and keeps its provider where nothing here can edit
 /// it. A station offering only classical groups, as macula 11.5.0 and
 /// earlier do, cannot be reached.
 pub(crate) fn tls_client_config(trust: Trust) -> rustls::ClientConfig {
-    let builder = macula_pq::client_builder;
+    let builder = macula_pqc::client_builder;
     let mut crypto = match trust {
         Trust::Pinned(pubkey) => builder()
             .dangerous()
@@ -189,18 +189,18 @@ mod tests {
     use super::{tls_client_config, Trust, ALPN};
 
     /// `SecP384r1MLKEM1024`, code point `0x11ED`. rustls has no variant for
-    /// it and no rustls provider ships it: only `macula-pq` does.
+    /// it and no rustls provider ships it: only `macula-pqc` does.
     const SECP384R1MLKEM1024: NamedGroup = NamedGroup::Unknown(0x11ED);
 
     fn offered(provider: &CryptoProvider) -> Vec<NamedGroup> {
         provider.kx_groups.iter().map(|g| g.name()).collect()
     }
 
-    /// Every trust mode dials with `macula-pq`'s two groups and nothing
+    /// Every trust mode dials with `macula-pqc`'s two groups and nothing
     /// else. A mode that built its own provider would be the one path a
     /// classical group could come back through.
     #[test]
-    fn every_trust_mode_offers_exactly_macula_pqs_groups() {
+    fn every_trust_mode_offers_exactly_macula_pqcs_groups() {
         for (mode, trust) in [
             ("pinned", Trust::Pinned([7; 32])),
             ("webpki", Trust::WebPki),
@@ -214,15 +214,15 @@ mod tests {
         }
     }
 
-    /// A station on `macula-pq`, as macula's own QUIC NIF now is.
+    /// A station on `macula-pqc`, as macula's own QUIC NIF now is.
     #[test]
-    fn a_station_on_macula_pq_negotiates_secp384r1mlkem1024() {
-        let station = station(macula_pq::server_builder());
+    fn a_station_on_macula_pqc_negotiates_secp384r1mlkem1024() {
+        let station = station(macula_pqc::server_builder());
         let agreed = handshake(tls_client_config(Trust::Insecure), station);
         assert_eq!(agreed, Ok(SECP384R1MLKEM1024));
     }
 
-    /// A station on `aws-lc-rs`'s post-quantum groups: `macula-pq`'s ML-KEM
+    /// A station on `aws-lc-rs`'s post-quantum groups: `macula-pqc`'s ML-KEM
     /// against `aws-lc-rs`'s, on the group both offer.
     #[test]
     fn a_station_on_aws_lc_rs_post_quantum_groups_negotiates_secp256r1mlkem768() {

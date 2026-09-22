@@ -27,10 +27,10 @@ rand = "0.10"
 sha2 = "0.11"
 quinn = "0.11"
 # The key exchange for every connection this crate dials: every TLS
-# configuration starts from macula-pq's client_builder(), which offers
+# configuration starts from macula-pqc's client_builder(), which offers
 # SecP384r1MLKEM1024 then SecP256r1MLKEM768 and nothing classical. So
 # rustls selects no crypto provider of its own here. See transport.rs.
-macula-pq = "0.1"
+macula-pqc = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 webpki-roots = "1.0"
 x509-parser = "0.18"

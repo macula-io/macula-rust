@@ -19,11 +19,11 @@ usually touches both, but their version numbers don't move in lockstep.
 
 - **Breaking on the wire: every dial now uses POST-QUANTUM KEY EXCHANGE, and
   nothing else.** Each TLS configuration starts from
-  [`macula-pq`](https://crates.io/crates/macula-pq) 0.1's `client_builder()`:
+  [`macula-pqc`](https://crates.io/crates/macula-pqc) 0.1's `client_builder()`:
   `SecP384r1MLKEM1024`, then `SecP256r1MLKEM768`, and no classical group,
   where the crate used rustls's `ring` defaults (X25519, P-256, P-384, all
   classical). A station on macula 11.5.0 or earlier offers only those and
-  **cannot be reached**; a station on macula's `macula-pq` QUIC NIF
+  **cannot be reached**; a station on macula's `macula-pqc` QUIC NIF
   negotiates `SecP384r1MLKEM1024`. Every trust mode is covered, and
   `PubkeyPinVerifier` and `SkipServerVerification` verify with the same
   provider. Key exchange only: certificates are still classically signed.
