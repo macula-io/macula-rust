@@ -23,11 +23,11 @@
 > ML-DSA-87 identities (in pq_hybrid, the fleet's profile, the ML-DSA-87 +
 > RSA-PSS-4096 composite), ML-KEM hybrid key exchange, and signed requests.
 > Calls and streams by direct dial, serving (under an org or in a node's own
-> namespace), publish/subscribe and the DHT are tested against in-process
-> macula 12 stations on every `cargo test`, and live against the fleet. Not
-> here yet: UCAN-gated calls and node-served content; see [Not yet
-> implemented](#not-yet-implemented). Releases before 0.4.0 speak the retired
-> 10.x wire and cannot reach the current fleet.
+> namespace), publish/subscribe, node-served content and the DHT are tested
+> against in-process macula 12 stations on every `cargo test`, and calls,
+> pubsub and the DHT live against the fleet. Not here yet: UCAN-gated calls;
+> see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
+> the retired 10.x wire and cannot reach the current fleet.
 
 ## What is this?
 
@@ -48,7 +48,7 @@ Swift. The core crate has no FFI dependency and no FFI-shaped types.
 
 ```toml
 [dependencies]
-macula-rust = "0.4"
+macula-rust = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -109,8 +109,8 @@ let served = pool
     .await?;
 ```
 
-Runnable versions are in [`examples/`](examples): `quickstart`, `serve` and
-`publish_subscribe`, each reading the environment described at the top of
+Runnable versions are in [`examples/`](examples): `quickstart`, `serve`,
+`publish_subscribe` and `content`, each reading the environment described at the top of
 [`examples/common/mod.rs`](examples/common/mod.rs).
 
 ### Coming from 0.3 and earlier
@@ -129,8 +129,10 @@ compatibility layer.
   `direct_dial::call` is simply `Pool::call`; `resolve` is `Pool::providers`;
   `serve_one_call` is `Pool::serve` with a handler; `Trust::WebPki` is gone:
   every station is pinned by its node_id.
-- `ucan`, `cert_chain` and the content-transfer modules are gone until
-  macula 12's own arrive (see [Not yet implemented](#not-yet-implemented)).
+- The 10.x content transfer (`content`, `manifest`, `put_direct`/`get_direct`)
+  is replaced by node-served content: `Pool::share_content`/`get_content`, with
+  macula 12's SHA-384 `manifest`. `ucan` and `cert_chain` are gone until macula
+  12's own arrive (see [Not yet implemented](#not-yet-implemented)).
 - Serving an org procedure needs the realm's org directory and the org's
   delegation to your node in the DHT: a realm admits orgs through a human.
 
@@ -145,6 +147,7 @@ compatibility layer.
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
 | Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links |
+| Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |
 | DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | Records verified before they are handed on |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | `macula-rust-ffi`, below |
 
@@ -165,8 +168,10 @@ integers within ±2^63, text or integer map keys, no duplicates).
 `macula-rust-ffi` wraps the pool with [UniFFI](https://mozilla.github.io/uniffi-rs/)
 proc macros: `FfiNodeKey`, `FfiPool`, `FfiSubscription`, `FfiStream`, and two
 handlers the app implements, `FfiCallHandler` and `FfiStreamHandler`
-(`suspend fun` in Kotlin, `async throws` in Swift). Every 32-byte id crosses as
-bytes and is checked.
+(`suspend fun` in Kotlin, `async throws` in Swift). `FfiPool` also shares and
+fetches content (`shareContent`, `getContent`, `FfiContentOptions`). Every id
+crosses as bytes and is checked for its length (32 bytes, or 50 for a content
+id).
 
 ```bash
 cargo build -p macula-rust-ffi --release
@@ -203,7 +208,6 @@ crate 1.89.
 
 - **UCAN-gated calls and serving.** macula 12 uses post-quantum UCANs; calls
   carry no token yet, and a gated procedure cannot be served.
-- **Node-served content** (macula 12's D27): planned for 0.5.0.
 - **Station discovery beyond the seeds.** macula's discovery call is not
   served by the fleet today (macula-io/macula#31); give the pool its seeds.
 

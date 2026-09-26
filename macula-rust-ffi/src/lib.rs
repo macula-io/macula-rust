@@ -10,7 +10,8 @@
 //! calls to a provider at its own station, serving a procedure with a
 //! handler the foreign side implements ([`FfiCallHandler`]), pubsub
 //! ([`FfiSubscription`]), streaming sessions on either side ([`FfiStream`],
-//! [`FfiStreamHandler`]), and DHT records.
+//! [`FfiStreamHandler`]), node-served content (`share_content`,
+//! `get_content`, [`FfiContentOptions`]), and DHT records.
 //!
 //! [`FfiValue`] mirrors every variant [`macula_rust::cbor::Value`] has,
 //! narrowed only where the FFI boundary forces it: `Int` is `i64`, and an
@@ -27,12 +28,14 @@
 //!     --language kotlin --out-dir bindings/kotlin
 //! ```
 
+mod content;
 mod node_key;
 mod pool;
 mod pubsub;
 mod serve;
 mod stream;
 
+pub use content::FfiContentOptions;
 pub use node_key::{FfiNodeKey, FfiProfile};
 pub use pool::{
     own_procedure, FfiLinkStatus, FfiPool, FfiPoolOptions, FfiProvider, FfiRealmKey, FfiRecord,
@@ -105,6 +108,14 @@ pub enum FfiError {
     /// An operation on a closed pool, subscription, stream or serving.
     #[error("closed")]
     Closed,
+    /// Content no node announces in the realm.
+    #[error("the content is not shared")]
+    NotShared,
+    /// Content every announcing sharer failed to give, and why each failed:
+    /// content that does not match its id, is over the fetch's bounds, or a
+    /// sharer that could not be reached.
+    #[error("{message}")]
+    ContentUnavailable { message: String },
     /// Anything else the core crate reports, as its text.
     #[error("{message}")]
     Other { message: String },
@@ -148,6 +159,10 @@ impl From<PoolError> for FfiError {
             PoolError::Link(link) => link.into(),
             PoolError::NoRealmKey => FfiError::NoRealmKey,
             PoolError::Closed => FfiError::Closed,
+            PoolError::NotShared => FfiError::NotShared,
+            e @ PoolError::ContentUnavailable(_) => FfiError::ContentUnavailable {
+                message: e.to_string(),
+            },
             e @ PoolError::NoProvider(_) => FfiError::NoProvider {
                 message: e.to_string(),
             },

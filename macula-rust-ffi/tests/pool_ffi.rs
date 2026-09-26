@@ -12,9 +12,9 @@ use std::time::Duration;
 use common::lab::{Lab, LabStation};
 use macula_rust::profile::Profile;
 use macula_rust_ffi::{
-    own_procedure, FfiCallHandler, FfiError, FfiNodeKey, FfiPool, FfiPoolOptions, FfiProfile,
-    FfiRealmKey, FfiRequest, FfiSeed, FfiStream, FfiStreamEvent, FfiStreamHandler, FfiStreamMode,
-    FfiValue,
+    own_procedure, FfiCallHandler, FfiContentOptions, FfiError, FfiNodeKey, FfiPool,
+    FfiPoolOptions, FfiProfile, FfiRealmKey, FfiRequest, FfiSeed, FfiStream, FfiStreamEvent,
+    FfiStreamHandler, FfiStreamMode, FfiValue,
 };
 
 const ORG_PROCEDURE: &str = "mcl-echo/echo";
@@ -360,5 +360,71 @@ async fn records_go_through_the_pool() {
             })
         ),
         "{bad_id:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn content_is_shared_by_one_node_and_fetched_by_another() {
+    let lab = Lab::start(Profile::PqPure);
+    let (sharing, fetching) = (
+        lab.station("ffi content sharing"),
+        lab.station("ffi content fetching"),
+    );
+    lab.share(&[&sharing, &fetching]);
+    let realm = vec![0x0c; 32];
+    let sharer = pool(
+        &FfiNodeKey::generate(FfiProfile::PqPure).unwrap(),
+        &sharing,
+        options(),
+    )
+    .await;
+    let fetcher = pool(
+        &FfiNodeKey::generate(FfiProfile::PqPure).unwrap(),
+        &fetching,
+        options(),
+    )
+    .await;
+    let data: Vec<u8> = (0..600_000usize).map(|i| (i % 251) as u8).collect();
+    let mcid = sharer
+        .share_content(realm.clone(), data.clone(), "blob.bin".into())
+        .await
+        .unwrap();
+    assert_eq!(mcid.len(), 50);
+    let got = fetcher
+        .get_content(realm.clone(), mcid.clone(), FfiContentOptions::default())
+        .await
+        .unwrap();
+    assert!(got == data, "{} bytes back", got.len());
+    let small = FfiContentOptions {
+        max_bytes: 1_000,
+        ..FfiContentOptions::default()
+    };
+    let refused = fetcher
+        .get_content(realm.clone(), mcid.clone(), small)
+        .await;
+    assert!(
+        matches!(refused, Err(FfiError::ContentUnavailable { .. })),
+        "{refused:?}"
+    );
+    sharer
+        .unshare_content(realm.clone(), mcid.clone())
+        .await
+        .unwrap();
+    let gone = fetcher
+        .get_content(realm.clone(), mcid.clone(), FfiContentOptions::default())
+        .await;
+    assert!(matches!(gone, Err(FfiError::NotShared)), "{gone:?}");
+    let bad = fetcher
+        .get_content(realm, vec![2; 49], FfiContentOptions::default())
+        .await;
+    assert!(
+        matches!(
+            bad,
+            Err(FfiError::WrongByteLength {
+                expected: 50,
+                actual: 49
+            })
+        ),
+        "{bad:?}"
     );
 }

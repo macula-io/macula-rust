@@ -13,7 +13,28 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [0.4.0] - Unreleased
+### [0.5.0] - Unreleased
+
+#### Added
+
+- Node-served content (macula 12's D27), ported from macula-go v0.12.0's
+  `pool/content.go`: `Pool::share_content` keeps the content, serves it on the
+  node's own `~<node_id>/content_v1` server stream and announces it in the DHT,
+  renewed at half its hour; `unshare_content` withdraws it with a tombstone;
+  `get_content` finds the announcements bound to their announcer's own content
+  procedure in the realm, dials each sharer's station, and checks the block,
+  the manifest and every chunk against the content id, within
+  `ContentOptions` (256 MiB, 16,384 chunks, 4 streams at a time, 15 s each by
+  default). No realm key on either side. `content_procedure_bound` is public.
+  New `PoolError`s: `NotShared`, `ContentUnavailable`, `ContentMismatch`,
+  `ContentTooLarge`, `ContentReply`.
+- `manifest`: macula 12's content manifests, byte for byte with macula's own
+  (`tests/vectors/manifest/erlang_manifests.json`): 256 KiB chunks, SHA-384,
+  50-byte content ids, the odd-leaf Merkle fold, and the wire form, read with
+  macula_manifest's checks (sha384 only, whole chunks, fields in range).
+- Example `content`.
+
+### [0.4.0] - 2026-09-26
 
 The macula 12 wire. **Breaking throughout**: a 0.3 node cannot reach a
 macula 12 station, and nothing of the 0.3 API carries over. See the README's
@@ -340,7 +361,20 @@ same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
 
-### [ffi-0.4.0] - Unreleased
+### [ffi-0.5.0] - Unreleased
+
+#### Added
+
+- `FfiPool::share_content`, `unshare_content` and `get_content`, with
+  `FfiContentOptions` (zero for macula's defaults). New `FfiError`s:
+  `NotShared` and `ContentUnavailable`, which names why each sharer failed; a
+  content id of another length than 50 bytes is `WrongByteLength`.
+
+#### Changed
+
+- Builds on `macula-rust` 0.5.
+
+### [ffi-0.4.0] - 2026-09-26
 
 **Breaking throughout**: rewritten on `macula-rust` 0.4's pool, the macula 12
 wire.
