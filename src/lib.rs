@@ -13,5 +13,7 @@ pub mod keystore;
 pub mod node_key;
 pub mod petname;
 pub mod profile;
+pub mod record;
 pub mod signed_object;
 pub mod transport;
+mod uuid_v7;

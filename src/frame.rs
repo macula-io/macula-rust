@@ -379,8 +379,8 @@ fn base(frame_type: &str) -> Vec<(Value, Value)> {
     vec![
         entry("version", Value::Int(i128::from(PROTOCOL_VERSION))),
         entry("frame_type", Value::text(frame_type)),
-        entry("frame_id", Value::Bytes(fresh_frame_id().to_vec())),
-        entry("sent_at_ms", uint(now_ms())),
+        entry("frame_id", Value::Bytes(crate::uuid_v7::new().to_vec())),
+        entry("sent_at_ms", uint(crate::uuid_v7::now_ms())),
         entry("capabilities", uint(0)),
         entry("realm", Value::Null),
         entry("call_id", Value::Null),
@@ -396,24 +396,4 @@ fn with_field(mut fields: Vec<(Value, Value)>, key: &str, value: Value) -> Vec<(
         None => fields.push(entry(key, value)),
     }
     fields
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// A UUID v7: 48 bits of Unix milliseconds, the version and variant bits, and
-/// 74 random bits.
-fn fresh_frame_id() -> [u8; 16] {
-    let mut id = [0u8; 16];
-    // A frame id is an identifier, not a secret: an id without randomness is
-    // still unique by its time, so a failure to draw is not an error here.
-    let _ = aws_lc_rs::rand::fill(&mut id[6..]);
-    id[..6].copy_from_slice(&now_ms().to_be_bytes()[2..]);
-    id[6] = (id[6] & 0x0f) | 0x70;
-    id[8] = (id[8] & 0x3f) | 0x80;
-    id
 }
