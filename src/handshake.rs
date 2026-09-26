@@ -614,7 +614,7 @@ fn decode(frame: &[u8], frame_type: &str, layouts: &[&[&str]]) -> Result<Fields,
     }
     let mut keys: Vec<&str> = fields.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    let has_layout = layouts.iter().any(|layout| *layout == keys.as_slice());
+    let has_layout = layouts.contains(&keys.as_slice());
     if non_text > 0 || !has_layout || !fields.iter().all(|(k, v)| field_typed(k, v)) {
         return Err(HandshakeError::Malformed);
     }

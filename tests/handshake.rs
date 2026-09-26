@@ -92,10 +92,20 @@ fn station_session(profile: Profile, challenge: &[u8], leaf: &[u8], now: i64) ->
     }
 }
 
+/// One profile's frames: a challenge macula made as a station, its node_id,
+/// and a CONNECT macula made answering a challenge macula-go made.
+struct ErlangEntry {
+    profile: Profile,
+    erlang_challenge: Vec<u8>,
+    station_node_id: [u8; 32],
+    go_challenge: Vec<u8>,
+    erlang_connect: Vec<u8>,
+}
+
 struct Erlang {
     now: i64,
     leaf: Vec<u8>,
-    entries: Vec<(Profile, Vec<u8>, [u8; 32], Vec<u8>, Vec<u8>)>,
+    entries: Vec<ErlangEntry>,
 }
 
 fn erlang() -> Erlang {
@@ -106,14 +116,12 @@ fn erlang() -> Erlang {
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| {
-            (
-                Profile::parse(&s(&e["profile"])).unwrap(),
-                unhex(&s(&e["erlang_challenge"])),
-                unhex(&s(&e["erlang_station_node_id"])).try_into().unwrap(),
-                unhex(&s(&e["go_challenge"])),
-                unhex(&s(&e["erlang_connect"])),
-            )
+        .map(|e| ErlangEntry {
+            profile: Profile::parse(&s(&e["profile"])).unwrap(),
+            erlang_challenge: unhex(&s(&e["erlang_challenge"])),
+            station_node_id: unhex(&s(&e["erlang_station_node_id"])).try_into().unwrap(),
+            go_challenge: unhex(&s(&e["go_challenge"])),
+            erlang_connect: unhex(&s(&e["erlang_connect"])),
         })
         .collect();
     assert_eq!(entries.len(), 2);
@@ -127,14 +135,14 @@ fn erlang() -> Erlang {
 #[test]
 fn a_challenge_macula_made_is_answered() {
     let h = erlang();
-    for (profile, erlang_challenge, station_node_id, _, _) in &h.entries {
-        let keys = client_keys(*profile, h.now);
+    for e in &h.entries {
+        let keys = client_keys(e.profile, h.now);
         let (connect, station) = answer_challenge(
-            erlang_challenge,
-            &session(&keys, *profile, *station_node_id, &h.leaf, h.now + 60_000),
+            &e.erlang_challenge,
+            &session(&keys, e.profile, e.station_node_id, &h.leaf, h.now + 60_000),
         )
         .unwrap();
-        assert_eq!(&station.node_id, station_node_id, "{profile:?}");
+        assert_eq!(station.node_id, e.station_node_id, "{:?}", e.profile);
         assert!(!connect.is_empty());
     }
 }
@@ -142,13 +150,13 @@ fn a_challenge_macula_made_is_answered() {
 #[test]
 fn a_connect_macula_made_is_accepted() {
     let h = erlang();
-    for (profile, _, _, go_challenge, erlang_connect) in &h.entries {
+    for e in &h.entries {
         let (accepted, hello) = accept_connect(
-            erlang_connect,
-            &station_session(*profile, go_challenge, &h.leaf, h.now + 60_000),
+            &e.erlang_connect,
+            &station_session(e.profile, &e.go_challenge, &h.leaf, h.now + 60_000),
         );
         let client = accepted.unwrap();
-        assert_eq!(read_hello(&hello).unwrap(), 5, "{profile:?}");
+        assert_eq!(read_hello(&hello).unwrap(), 5, "{:?}", e.profile);
         assert!(client.member_endorsement.is_empty());
     }
 }
