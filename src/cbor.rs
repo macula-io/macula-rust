@@ -412,7 +412,7 @@ impl Decoder<'_> {
                 self.count()?;
                 Ok(Value::Null)
             }
-            25 | 26 | 27 => {
+            25..=27 => {
                 let width = match ai {
                     25 => 2,
                     26 => 4,

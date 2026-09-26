@@ -30,7 +30,13 @@ quinn = "0.11"
 # configuration starts from macula-pqc's client_builder(), which offers
 # SecP384r1MLKEM1024 then SecP256r1MLKEM768 and nothing classical. So
 # rustls selects no crypto provider of its own here. See transport.rs.
-macula-pqc = "0.1"
+macula-pqc = "0.3"
+# ML-DSA-87 for every node key signature (profile.rs, node_key.rs): the same
+# implementation macula-pqc signs TLS with.
+macula-mldsa = "0.3"
+# The RSA-PSS-4096 half of pq_hybrid's LAMPS composite: already linked through
+# rustls for the key exchange, constant-time, and with a FIPS path.
+aws-lc-rs = "1"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 webpki-roots = "1.0"
 x509-parser = "0.18"
@@ -90,6 +96,11 @@ linux-keyutils-keyring-store = "1"
 # rather than risking two separate resolved versions.
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["protected"] }
+
+[target.'cfg(unix)'.dependencies]
+# node_key/key_file.rs: a key file must belong to the effective user, and is
+# opened without blocking; std has neither geteuid nor O_NONBLOCK without libc.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 hex = "0.4"

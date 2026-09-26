@@ -6,6 +6,7 @@
 //! work, not the ceiling on it — nothing below the eventual FFI binding
 //! layer is mobile-specific.
 
+pub mod binding;
 pub mod bolt4;
 pub mod cbor;
 pub mod cert;
@@ -19,9 +20,12 @@ pub mod frame;
 pub mod identity;
 pub mod keystore;
 pub mod manifest;
+pub mod node_key;
 mod open_sessions;
 pub mod petname;
 pub mod pool;
+pub mod profile;
+pub mod signed_object;
 pub mod stream;
 pub mod transport;
 pub mod ucan;

@@ -1,0 +1,6 @@
+{application, cross_verify_macula, [
+    {description, "macula 12.x's half of macula-rust's LAMPS composite cross-verification"},
+    {vsn, "1"},
+    {applications, [kernel, stdlib, crypto, public_key]},
+    {env, []}
+]}.
