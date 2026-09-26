@@ -10,6 +10,7 @@ pub mod cbor;
 pub mod frame;
 pub mod handshake;
 pub mod keystore;
+pub mod manifest;
 pub mod node_key;
 pub mod petname;
 pub mod pool;
