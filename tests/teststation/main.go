@@ -1,12 +1,18 @@
-// Command teststation runs in-process macula 12 stations for the PHP
-// tests: two stations sharing one DHT, and a test realm with one org. It
-// prints one JSON line, {stations: [{host, port, node_id}], realm_id,
+// Command teststation runs in-process macula 12 stations for the Rust
+// tests, in one of two modes.
+//
+// By default: two stations sharing one DHT, and a test realm with one org.
+// It prints one JSON line, {stations: [{host, port, node_id}], realm_id,
 // realm_key, org}, then reads commands on stdin until it closes:
 //
 //	admit <node_id hex>   the org delegates its procedures to that node
 //	relayed               how many streams the stations relay now
 //
-// answering each with one line. It exits when stdin closes.
+// With a second argument "lab": no stations yet, and the commands in lab.go,
+// which start and shape stations and realms one by one.
+//
+// Either mode answers each command with one line, and exits when stdin
+// closes.
 package main
 
 import (
@@ -51,6 +57,10 @@ func main() {
 			t.Fatalf("%v", err)
 		}
 		p = parsed
+	}
+	if len(os.Args) > 2 && os.Args[2] == "lab" {
+		runLab(t, p)
+		return
 	}
 	stations := []*teststation.Station{teststation.Start(t, p, "rust a"), teststation.Start(t, p, "rust b")}
 	teststation.ShareDHT(stations...)

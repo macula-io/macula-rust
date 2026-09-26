@@ -222,6 +222,8 @@ pub struct Link {
 }
 
 struct Inner {
+    /// Distinct for every link a process dials.
+    serial: u64,
     connection: quinn::Connection,
     _endpoint: quinn::Endpoint,
     control: FrameWriter,
@@ -277,6 +279,11 @@ impl Link {
     /// The node_id of the station the link reached.
     pub fn station_node_id(&self) -> [u8; 32] {
         self.inner.station.node_id
+    }
+
+    /// A number distinct for every link this process dials.
+    pub fn serial(&self) -> u64 {
+        self.inner.serial
     }
 
     /// The node_id this link connected as.
@@ -377,7 +384,9 @@ async fn handshaken(cfg: Config) -> Result<Link, LinkError> {
     let share = cfg
         .share
         .unwrap_or_else(|| format!("{}:{}", cfg.target.host, cfg.target.port));
+    static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let inner = Arc::new(Inner {
+        serial: SERIALS.fetch_add(1, Ordering::Relaxed),
         connection: dialed.connection,
         _endpoint: dialed.endpoint,
         control,
@@ -486,7 +495,7 @@ impl Inner {
             stream::StreamInner::end(&s, Some(err.clone()));
         }
         self.connection.close(0u32.into(), b"link ended");
-        let _ = self.done_tx.send(true);
+        let _ = self.done_tx.send_replace(true);
     }
 }
 

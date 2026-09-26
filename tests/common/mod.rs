@@ -1,9 +1,12 @@
-//! Two in-process macula 12 stations sharing a DHT and a test realm with one
-//! org, for a test file: macula-go's teststation, built to target/teststation
-//! by scripts/build-teststation.sh (or named by MACULA_TESTSTATION), driven
-//! over its stdin.
+//! In-process macula 12 stations for a test file: macula-go's teststation,
+//! built to target/teststation by scripts/build-teststation.sh (or named by
+//! MACULA_TESTSTATION), driven over its stdin. [`TestStations`] is two
+//! stations sharing a DHT and a test realm with one org; [`lab::Lab`] starts
+//! and shapes stations and realms one by one.
 
 #![allow(dead_code)]
+
+pub mod lab;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -36,22 +39,7 @@ impl TestStations {
     /// naming how to build it: a test that cannot reach its stations proves
     /// nothing, so it is never skipped.
     pub fn start(profile: Profile) -> TestStations {
-        let binary = std::env::var("MACULA_TESTSTATION").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/target/teststation").to_string()
-        });
-        assert!(
-            std::path::Path::new(&binary).exists(),
-            "{binary} is missing: run scripts/build-teststation.sh first"
-        );
-        let mut child = Command::new(&binary)
-            .arg(profile.name())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("the teststation starts");
-        let stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let (child, stdin, mut stdout) = spawn(&[profile.name()]);
         let mut line = String::new();
         stdout
             .read_line(&mut line)
@@ -113,13 +101,40 @@ impl TestStations {
     }
 
     fn ask(&self, command: &str) -> String {
-        let mut io = self.io.lock().unwrap();
-        writeln!(io.0, "{command}").unwrap();
-        io.0.flush().unwrap();
-        let mut line = String::new();
-        io.1.read_line(&mut line).unwrap();
-        line.trim_end().to_string()
+        ask(&self.io, command)
     }
+}
+
+/// Starts the teststation with `args`. A missing helper fails the test,
+/// naming how to build it: a test that cannot reach its stations proves
+/// nothing, so it is never skipped.
+fn spawn(args: &[&str]) -> (Child, ChildStdin, BufReader<ChildStdout>) {
+    let binary = std::env::var("MACULA_TESTSTATION")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target/teststation").to_string());
+    assert!(
+        std::path::Path::new(&binary).exists(),
+        "{binary} is missing: run scripts/build-teststation.sh first"
+    );
+    let mut child = Command::new(&binary)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("the teststation starts");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    (child, stdin, stdout)
+}
+
+/// One command to the teststation and its one-line answer.
+fn ask(io: &Mutex<(ChildStdin, BufReader<ChildStdout>)>, command: &str) -> String {
+    let mut io = io.lock().unwrap();
+    writeln!(io.0, "{command}").unwrap();
+    io.0.flush().unwrap();
+    let mut line = String::new();
+    io.1.read_line(&mut line).unwrap();
+    line.trim_end().to_string()
 }
 
 impl Drop for TestStations {

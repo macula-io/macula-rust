@@ -12,6 +12,7 @@ pub mod handshake;
 pub mod keystore;
 pub mod node_key;
 pub mod petname;
+pub mod pool;
 pub mod profile;
 pub mod record;
 pub mod signed_object;

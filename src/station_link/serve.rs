@@ -147,7 +147,8 @@ pub(super) struct ServedInner {
 
 /// A procedure this link serves, until [`Served::stop`] or the link ends, or
 /// until its advertisement lapses because its authorization could not be
-/// found again.
+/// found again. Cloning it shares the serving.
+#[derive(Clone)]
 pub struct Served {
     inner: Arc<ServedInner>,
 }
@@ -347,7 +348,7 @@ impl ServedInner {
                 state.served.remove(&self.key);
             }
         }
-        let _ = self.done_tx.send(true);
+        let _ = self.done_tx.send_replace(true);
     }
 }
 

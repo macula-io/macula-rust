@@ -431,7 +431,7 @@ impl StreamInner {
             .lock()
             .streams
             .retain(|w| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), Arc::as_ptr(this)));
-        let _ = this.done_tx.send(true);
+        let _ = this.done_tx.send_replace(true);
         this.notify.notify_waiters();
         this.notify.notify_one();
     }
