@@ -17,11 +17,13 @@
 //! (macula-io/macula#31).
 
 mod call;
+mod content;
 mod member;
 mod pubsub;
 mod serve;
 
 pub use call::{Call, Provider, StreamCall};
+pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};
 
@@ -86,6 +88,19 @@ pub enum PoolError {
     NotServed(Vec<LinkError>),
     /// A link's own failure, or a provider's or station's answer.
     Link(LinkError),
+    /// Content no node announces in the realm, or a sharer that does not
+    /// hold it.
+    NotShared,
+    /// Content every announcing sharer failed to give: each sharer's node
+    /// and why.
+    ContentUnavailable(Vec<([u8; 32], PoolError)>),
+    /// A block, manifest or whole that does not match the content id it was
+    /// asked for by, and which.
+    ContentMismatch(String),
+    /// Content over the fetch's bounds, and how large.
+    ContentTooLarge(String),
+    /// An answer a sharer never gives, and what it was.
+    ContentReply(String),
 }
 
 impl fmt::Display for PoolError {
@@ -99,6 +114,13 @@ impl fmt::Display for PoolError {
                 f.write_str("no trusted provider answered:")?;
                 for (p, e) in tried {
                     write!(f, " [{} at {}: {e}]", short(&p.node), short(&p.station))?;
+                }
+                Ok(())
+            }
+            PoolError::ContentUnavailable(tried) => {
+                f.write_str("no sharer gave the content:")?;
+                for (node, e) in tried {
+                    write!(f, " [{}: {e}]", short(node))?;
                 }
                 Ok(())
             }
@@ -209,6 +231,7 @@ pub(crate) struct PoolInner {
     dedup: Arc<EventDedup>,
     state: Mutex<State>,
     ticks: tokio::task::JoinHandle<()>,
+    content: content::Sharer,
 }
 
 struct State {
@@ -261,6 +284,7 @@ impl Pool {
                 closed: false,
             }),
             ticks,
+            content: content::Sharer::default(),
             opts,
         });
         let pool = Pool { inner };

@@ -375,7 +375,7 @@ impl PoolInner {
             .find(|l| l.station_node_id() == *station)
     }
 
-    async fn link_to(
+    pub(super) async fn link_to(
         self: &Arc<Self>,
         station: &[u8; 32],
         deadline: Instant,
@@ -447,7 +447,7 @@ impl PoolInner {
     /// Runs `ask` on the links in selection order and returns the first
     /// answer, moving on only when a link could not carry the request: a
     /// station's own answer, not_found included, is final.
-    async fn first_answer<'a, T, F, Fut>(&self, ask: F) -> Result<T, PoolError>
+    pub(super) async fn first_answer<'a, T, F, Fut>(&self, ask: F) -> Result<T, PoolError>
     where
         F: Fn(Link) -> Fut,
         Fut: Future<Output = Result<T, LinkError>> + 'a,
