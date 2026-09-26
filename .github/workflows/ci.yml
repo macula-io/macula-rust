@@ -28,7 +28,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: test
@@ -37,7 +37,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      # The integration tests dial macula-go's in-process stations
+      # (tests/teststation), built to target/teststation first.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      - run: ./scripts/build-teststation.sh
+      - run: cargo test --workspace --all-features --locked
 
   doc:
     name: docs (deny broken links)

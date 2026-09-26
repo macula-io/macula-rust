@@ -235,3 +235,40 @@ fn a_key_kept_in_a_key_store_loads_back_as_the_same_key_and_is_checked_as_a_file
         Err(KeyFileError::WrongProfile(Profile::PqHybrid))
     ));
 }
+
+#[test]
+fn load_or_create_makes_a_puzzle_solved_key_once_then_loads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keys/node.key");
+    let made = NodeKey::load_or_create(&path, Profile::PqPure).unwrap();
+    assert_eq!(made.purpose(), Purpose::Identity);
+    assert!(macula_rust::node_key::puzzle_solved(
+        &made.node_id().unwrap(),
+        macula_rust::node_key::PUZZLE_DIFFICULTY
+    ));
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o077, 0, "owner-only");
+    let again = NodeKey::load_or_create(&path, Profile::PqPure).unwrap();
+    assert_eq!(again.node_id().unwrap(), made.node_id().unwrap());
+}
+
+#[test]
+fn load_or_create_never_replaces_a_file_that_does_not_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.key");
+    write_owner_only(&path, b"not a key file");
+    assert!(matches!(
+        NodeKey::load_or_create(&path, Profile::PqPure),
+        Err(KeyFileError::BadKeyFile)
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), b"not a key file");
+    // A key of the other profile is refused, not replaced, too.
+    let hybrid = dir.path().join("hybrid.key");
+    NodeKey::load_or_create(&hybrid, Profile::PqHybrid).unwrap();
+    let before = std::fs::read(&hybrid).unwrap();
+    assert!(matches!(
+        NodeKey::load_or_create(&hybrid, Profile::PqPure),
+        Err(KeyFileError::WrongProfile(Profile::PqHybrid))
+    ));
+    assert_eq!(std::fs::read(&hybrid).unwrap(), before);
+}

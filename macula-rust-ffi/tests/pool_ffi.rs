@@ -92,6 +92,10 @@ fn a_node_key_is_made_in_either_profile_and_survives_its_key_file() {
         let loaded = FfiNodeKey::load(path.to_string_lossy().into(), profile).unwrap();
         assert_eq!(loaded.node_id(), key.node_id());
     }
+    let fresh = dir.path().join("fresh.key").to_string_lossy().into_owned();
+    let made = FfiNodeKey::load_or_create(fresh.clone(), FfiProfile::PqPure).unwrap();
+    let again = FfiNodeKey::load_or_create(fresh, FfiProfile::PqPure).unwrap();
+    assert_eq!(again.node_id(), made.node_id());
     let missing = FfiNodeKey::load(
         dir.path().join("none").to_string_lossy().into(),
         FfiProfile::PqPure,

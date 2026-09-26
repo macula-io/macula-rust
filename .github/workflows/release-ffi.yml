@@ -28,19 +28,25 @@ jobs:
             exit 1
           fi
 
-      # Same reasoning as release-core.yml: rebuild+retest from scratch
+      # Same reasoning as release-core.yml: rebuild and retest from scratch
       # (a tag push is a separate event from the branch push ci.yml
-      # already validated), no --locked anywhere (no committed Cargo.lock
-      # in this repo).
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace --all-features
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # validated), against the committed Cargo.lock.
+      # The integration tests dial macula-go's in-process stations
+      # (tests/teststation), built to target/teststation first.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      - run: ./scripts/build-teststation.sh
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo fmt --all -- --check
 
       # Dry-run needs no registry auth -- it only verifies metadata,
       # compresses the package, and checks the result, never uploads.
       # This is also the step that proves macula-rust-ffi's `macula-rust
-      # = { path = "..", version = "0.2" }` dependency actually resolves
+      # = { path = "..", version = "0.4" }` dependency actually resolves
       # against the REAL published macula-rust on crates.io, not just the
       # local workspace path -- `cargo publish` downloads and rebuilds
       # against the registry version during verification, confirmed

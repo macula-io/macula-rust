@@ -13,7 +13,7 @@ use aws_lc_rs::rsa::KeyPair as RsaKeyPair;
 use aws_lc_rs::signature::KeyPair as _;
 use macula_mldsa::{PrivateKey, Zeroizing, ML_DSA_87};
 
-use super::{der, verify, NodeKey, Purpose, RsaHalf};
+use super::{der, verify, KeyError, NodeKey, Purpose, RsaHalf};
 use crate::keystore::{KeyStore, KeyStoreError};
 use crate::profile::Profile;
 
@@ -60,6 +60,8 @@ pub enum KeyFileError {
     RoundTripFailed,
     /// The key store could not save or load the key.
     KeyStore(KeyStoreError),
+    /// A new key could not be made.
+    Generate(KeyError),
 }
 
 impl fmt::Display for KeyFileError {
@@ -87,6 +89,7 @@ impl fmt::Display for KeyFileError {
             }
             KeyFileError::RoundTripFailed => f.write_str("the key does not sign and verify"),
             KeyFileError::KeyStore(e) => write!(f, "key store: {e}"),
+            KeyFileError::Generate(e) => write!(f, "a new key: {e}"),
         }
     }
 }
@@ -136,6 +139,22 @@ impl NodeKey {
         let key = parse(&contents, purpose, profile)?;
         round_trip(&key)?;
         Ok(key)
+    }
+
+    /// The identity key at `path` in `profile`, or, when nothing is there, a
+    /// new one with the admission puzzle solved, saved there first. Anything
+    /// at `path` that does not load as such a key is refused and left as it
+    /// is, never replaced.
+    pub fn load_or_create(path: &Path, profile: Profile) -> Result<NodeKey, KeyFileError> {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let key = NodeKey::generate_identity(profile, super::PUZZLE_DIFFICULTY)
+                    .map_err(KeyFileError::Generate)?;
+                key.save(path)?;
+                Ok(key)
+            }
+            _ => NodeKey::load(path, Purpose::Identity, profile),
+        }
     }
 
     /// Keeps the key in `store`, as the bytes of its key file: the platform

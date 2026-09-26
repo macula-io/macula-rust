@@ -2,7 +2,7 @@
 name = "macula-rust-ffi"
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.91"
 authors = ["Macula <raf.lefever@erlef.org>"]
 description = "UniFFI mobile (Kotlin/Swift) bindings for macula-rust. Wraps the core crate; adds nothing to it."
 license = "Apache-2.0"

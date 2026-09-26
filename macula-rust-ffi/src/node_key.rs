@@ -84,6 +84,15 @@ impl FfiNodeKey {
         Ok(Arc::new(FfiNodeKey(Arc::new(key))))
     }
 
+    /// The identity key in the key file at `path`, or, when nothing is
+    /// there, a new one saved there first. A file that does not load as a
+    /// key of `profile` is refused and left as it is.
+    #[uniffi::constructor]
+    pub fn load_or_create(path: String, profile: FfiProfile) -> Result<Arc<Self>, FfiError> {
+        let key = NodeKey::load_or_create(Path::new(&path), profile.into())?;
+        Ok(Arc::new(FfiNodeKey(Arc::new(key))))
+    }
+
     /// The identity key the platform's secure store holds under `service`
     /// and `account`, as [`save_to_keystore`](Self::save_to_keystore) put it.
     #[uniffi::constructor]

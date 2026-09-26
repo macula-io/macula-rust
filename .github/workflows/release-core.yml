@@ -24,18 +24,20 @@ jobs:
             exit 1
           fi
 
-      # Rebuilds and re-runs the offline suite here rather than trusting
-      # an artifact from ci.yml's own run -- this workflow triggers off a
-      # tag push, a separate event from the branch push ci.yml already
-      # validated, so there's no prior run's output to reuse. Deliberately
-      # NOT --locked anywhere below: this repo doesn't commit Cargo.lock
-      # (library crate; a committed lock silently caps what a loose
-      # constraint resolves to on every later run -- see the workspace's
-      # own lockfile-hygiene convention), so a fresh checkout has no lock
-      # to be strict against.
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace --all-features
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Rebuilds and re-runs the suite here rather than trusting an artifact
+      # from ci.yml's run: a tag push is a separate event from the branch
+      # push ci.yml validated, so there is no prior run to reuse. --locked:
+      # the committed Cargo.lock is what was tested.
+      # The integration tests dial macula-go's in-process stations
+      # (tests/teststation), built to target/teststation first.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      - run: ./scripts/build-teststation.sh
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo fmt --all -- --check
 
       # Dry-run needs no registry auth -- it only verifies metadata,
