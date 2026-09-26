@@ -1,9 +1,9 @@
-//! Overridable, per-platform secure storage for a persisted identity seed.
+//! Overridable, per-platform secure storage for a node key.
 //!
-//! [`KeyPair::save`](crate::identity::KeyPair::save)/[`load`](crate::identity::KeyPair::load)
-//! write a raw file — explicitly documented there as "a testing/parity
-//! convenience," not what a real mobile binding should use. This module is
-//! the real answer: a small [`KeyStore`] trait plus [`KeyringStore`], a
+//! [`NodeKey::save`](crate::node_key::NodeKey::save)/[`load`](crate::node_key::NodeKey::load)
+//! write an owner-only key file, which suits a server or a desktop. A mobile
+//! app keeps its key in the platform's secure store instead: this module is
+//! a small [`KeyStore`] trait plus [`KeyringStore`], a
 //! default implementation backed by the `keyring` crate, which selects the
 //! actual native secure store per target automatically —
 //! Keychain (`Security.framework`) on macOS and iOS, Secret Service (D-Bus)
@@ -16,8 +16,8 @@
 //! [`KeyStore`] itself is deliberately not tied to `keyring` at all — a
 //! caller with a different secure-storage requirement (a hardware security
 //! module, a different vault) can implement the trait directly and hand it
-//! to [`KeyPair::save_to_keystore`](crate::identity::KeyPair::save_to_keystore)/
-//! [`load_from_keystore`](crate::identity::KeyPair::load_from_keystore) —
+//! to [`NodeKey::save_to_keystore`](crate::node_key::NodeKey::save_to_keystore)/
+//! [`load_from_keystore`](crate::node_key::NodeKey::load_from_keystore) —
 //! "overridable per target platform" is a property of the trait boundary,
 //! not something wired into this crate's own logic.
 //!
@@ -64,24 +64,27 @@
 //! real save/load/delete round trip in this environment.
 
 use keyring::Entry;
+use macula_mldsa::Zeroizing;
 
-/// Secure storage for a 32-byte identity seed. Implement this directly for
-/// a backend other than [`KeyringStore`] (a hardware security module, a
-/// different vault) — this is the override point "per target platform"
-/// hangs off, not a platform enum this crate switches on internally.
+/// Secure storage for one node key, as the bytes of its key file (the seed
+/// form: the ML-DSA-87 seed, and in pq_hybrid the RSA-PSS key too, a few KiB).
+/// Implement this directly for a backend other than [`KeyringStore`] (a
+/// hardware security module, a different vault) — this is the override point
+/// "per target platform" hangs off, not a platform enum this crate switches on
+/// internally.
 pub trait KeyStore {
-    /// Persist `seed`, overwriting any value already stored under this
+    /// Persist `key`, overwriting any value already stored under this
     /// store's identity.
-    fn save_seed(&self, seed: &[u8; 32]) -> Result<(), KeyStoreError>;
+    fn save_key(&self, key: &[u8]) -> Result<(), KeyStoreError>;
 
-    /// Retrieve a previously-[`save_seed`](Self::save_seed)d seed.
+    /// Retrieve a previously-[`save_key`](Self::save_key)d key.
     /// [`KeyStoreError::NotFound`] if nothing has been stored yet.
-    fn load_seed(&self) -> Result<[u8; 32], KeyStoreError>;
+    fn load_key(&self) -> Result<Zeroizing<Vec<u8>>, KeyStoreError>;
 
-    /// Remove a previously-stored seed, if any. Not required before a
-    /// [`save_seed`](Self::save_seed) (which overwrites), only for
+    /// Remove a previously-stored key, if any. Not required before a
+    /// [`save_key`](Self::save_key) (which overwrites), only for
     /// deliberately forgetting an identity.
-    fn delete_seed(&self) -> Result<(), KeyStoreError>;
+    fn delete_key(&self) -> Result<(), KeyStoreError>;
 }
 
 /// The default [`KeyStore`]: the platform-native secure store `keyring`
@@ -104,24 +107,20 @@ impl KeyringStore {
 }
 
 impl KeyStore for KeyringStore {
-    fn save_seed(&self, seed: &[u8; 32]) -> Result<(), KeyStoreError> {
-        self.entry.set_secret(seed)?;
+    fn save_key(&self, key: &[u8]) -> Result<(), KeyStoreError> {
+        self.entry.set_secret(key)?;
         Ok(())
     }
 
-    fn load_seed(&self) -> Result<[u8; 32], KeyStoreError> {
-        let secret = match self.entry.get_secret() {
-            Ok(secret) => secret,
-            Err(keyring::Error::NoEntry) => return Err(KeyStoreError::NotFound),
-            Err(e) => return Err(e.into()),
-        };
-        let actual = secret.len();
-        secret
-            .try_into()
-            .map_err(|_| KeyStoreError::InvalidSeedLength { actual })
+    fn load_key(&self) -> Result<Zeroizing<Vec<u8>>, KeyStoreError> {
+        match self.entry.get_secret() {
+            Ok(secret) => Ok(Zeroizing::new(secret)),
+            Err(keyring::Error::NoEntry) => Err(KeyStoreError::NotFound),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    fn delete_seed(&self) -> Result<(), KeyStoreError> {
+    fn delete_key(&self) -> Result<(), KeyStoreError> {
         match self.entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
@@ -164,24 +163,20 @@ impl LinuxKeyutilsStore {
 
 #[cfg(target_os = "linux")]
 impl KeyStore for LinuxKeyutilsStore {
-    fn save_seed(&self, seed: &[u8; 32]) -> Result<(), KeyStoreError> {
-        self.entry.set_secret(seed)?;
+    fn save_key(&self, key: &[u8]) -> Result<(), KeyStoreError> {
+        self.entry.set_secret(key)?;
         Ok(())
     }
 
-    fn load_seed(&self) -> Result<[u8; 32], KeyStoreError> {
-        let secret = match self.entry.get_secret() {
-            Ok(secret) => secret,
-            Err(keyring_core::Error::NoEntry) => return Err(KeyStoreError::NotFound),
-            Err(e) => return Err(e.into()),
-        };
-        let actual = secret.len();
-        secret
-            .try_into()
-            .map_err(|_| KeyStoreError::InvalidSeedLength { actual })
+    fn load_key(&self) -> Result<Zeroizing<Vec<u8>>, KeyStoreError> {
+        match self.entry.get_secret() {
+            Ok(secret) => Ok(Zeroizing::new(secret)),
+            Err(keyring_core::Error::NoEntry) => Err(KeyStoreError::NotFound),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    fn delete_seed(&self) -> Result<(), KeyStoreError> {
+    fn delete_key(&self) -> Result<(), KeyStoreError> {
         match self.entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring_core::Error::NoEntry) => Ok(()),
@@ -192,11 +187,8 @@ impl KeyStore for LinuxKeyutilsStore {
 
 #[derive(Debug)]
 pub enum KeyStoreError {
-    /// No seed has been stored yet under this store's identity.
+    /// No key has been stored yet under this store's identity.
     NotFound,
-    /// A stored secret existed but wasn't 32 bytes — corrupted, or written
-    /// by something other than [`KeyStore::save_seed`].
-    InvalidSeedLength { actual: usize },
     /// The underlying platform secure store rejected the operation.
     Backend(keyring::Error),
 }
@@ -204,10 +196,7 @@ pub enum KeyStoreError {
 impl std::fmt::Display for KeyStoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KeyStoreError::NotFound => write!(f, "no seed stored under this identity"),
-            KeyStoreError::InvalidSeedLength { actual } => {
-                write!(f, "stored secret is {actual} bytes, expected 32")
-            }
+            KeyStoreError::NotFound => write!(f, "no key stored under this identity"),
             KeyStoreError::Backend(e) => write!(f, "platform secure store error: {e}"),
         }
     }
@@ -268,19 +257,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn save_then_load_returns_the_same_seed() {
+    fn save_then_load_returns_the_same_key() {
         let _guard = KEYRING_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let store = test_store();
-        let seed = [0x42u8; 32];
+        let key = vec![0x42u8; 2400];
 
         let result = (|| -> Result<(), KeyStoreError> {
-            store.save_seed(&seed)?;
-            let loaded = store.load_seed()?;
-            assert_eq!(loaded, seed);
+            store.save_key(&key)?;
+            let loaded = store.load_key()?;
+            assert_eq!(*loaded, key);
             Ok(())
         })();
 
-        store.delete_seed().expect("cleanup delete should succeed");
+        store.delete_key().expect("cleanup delete should succeed");
         result.expect("save/load round trip should succeed");
     }
 
@@ -291,9 +280,9 @@ mod tests {
         let store = test_store();
         // Guard against a leftover entry from a prior failed run on this
         // machine before asserting NotFound.
-        let _ = store.delete_seed();
+        let _ = store.delete_key();
 
-        assert!(matches!(store.load_seed(), Err(KeyStoreError::NotFound)));
+        assert!(matches!(store.load_key(), Err(KeyStoreError::NotFound)));
     }
 
     #[cfg(target_os = "linux")]
@@ -301,12 +290,12 @@ mod tests {
     fn delete_is_idempotent() {
         let _guard = KEYRING_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let store = test_store();
-        store.save_seed(&[0x7Fu8; 32]).expect("save");
-        store.delete_seed().expect("first delete");
+        store.save_key(&[0x7Fu8; 32]).expect("save");
+        store.delete_key().expect("first delete");
         // A second delete of an already-absent entry must not error --
-        // KeyStore::delete_seed's own doc promises this.
+        // KeyStore::delete_key's own doc promises this.
         store
-            .delete_seed()
+            .delete_key()
             .expect("second delete on an absent entry");
     }
 }

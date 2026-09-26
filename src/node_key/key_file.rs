@@ -14,6 +14,7 @@ use aws_lc_rs::signature::KeyPair as _;
 use macula_mldsa::{PrivateKey, Zeroizing, ML_DSA_87};
 
 use super::{der, verify, NodeKey, Purpose, RsaHalf};
+use crate::keystore::{KeyStore, KeyStoreError};
 use crate::profile::Profile;
 
 /// Opens every key file this crate writes. macula's own key files hold the
@@ -57,6 +58,8 @@ pub enum KeyFileError {
     PublicKeyMismatch,
     /// The key does not sign and verify as a whole.
     RoundTripFailed,
+    /// The key store could not save or load the key.
+    KeyStore(KeyStoreError),
 }
 
 impl fmt::Display for KeyFileError {
@@ -83,6 +86,7 @@ impl fmt::Display for KeyFileError {
                 f.write_str("the stored public key is not the one its private key derives")
             }
             KeyFileError::RoundTripFailed => f.write_str("the key does not sign and verify"),
+            KeyFileError::KeyStore(e) => write!(f, "key store: {e}"),
         }
     }
 }
@@ -129,6 +133,28 @@ impl NodeKey {
     /// fails a sign-and-verify round trip are refused.
     pub fn load(path: &Path, purpose: Purpose, profile: Profile) -> Result<NodeKey, KeyFileError> {
         let contents = read_key_file(path)?;
+        let key = parse(&contents, purpose, profile)?;
+        round_trip(&key)?;
+        Ok(key)
+    }
+
+    /// Keeps the key in `store`, as the bytes of its key file: the platform
+    /// secure store a mobile app keeps its key in (see `crate::keystore`).
+    pub fn save_to_keystore(&self, store: &dyn KeyStore) -> Result<(), KeyFileError> {
+        store
+            .save_key(&self.file_bytes()?)
+            .map_err(KeyFileError::KeyStore)
+    }
+
+    /// The key kept in `store` for `purpose` in `profile`, checked as a key
+    /// file's is, but for the file's owner and permissions, which the store
+    /// keeps.
+    pub fn load_from_keystore(
+        store: &dyn KeyStore,
+        purpose: Purpose,
+        profile: Profile,
+    ) -> Result<NodeKey, KeyFileError> {
+        let contents = store.load_key().map_err(KeyFileError::KeyStore)?;
         let key = parse(&contents, purpose, profile)?;
         round_trip(&key)?;
         Ok(key)

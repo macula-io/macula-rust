@@ -7,12 +7,12 @@ version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Macula <raf.lefever@erlef.org>"]
-description = "Rust port of macula's SDK (client/leaf) wire protocol — mobile first, not mobile-only. See plans/PLAN_WIRE_PROTOCOL.md."
+description = "Rust SDK for the macula 12 mesh: ML-DSA-87 and LAMPS composite node keys, a post-quantum QUIC transport — mobile first, not mobile-only."
 license = "Apache-2.0"
 repository = "https://github.com/macula-io/macula-rust"
 homepage = "https://github.com/macula-io/macula-rust"
 readme = "README.md"
-keywords = ["mesh-network", "quic", "p2p", "ed25519", "decentralized"]
+keywords = ["mesh-network", "quic", "p2p", "post-quantum", "decentralized"]
 categories = ["network-programming", "cryptography"]
 
 [lints.rust]
@@ -22,14 +22,13 @@ unsafe_code = "forbid"
 all = { level = "deny", priority = -1 }
 
 [dependencies]
-ed25519-dalek = { version = "3.0", features = ["rand_core"] }
-rand = "0.10"
 sha2 = "0.11"
 quinn = "0.11"
 # The key exchange for every connection this crate dials: every TLS
 # configuration starts from macula-pqc's client_builder(), which offers
-# SecP384r1MLKEM1024 then SecP256r1MLKEM768 and nothing classical. So
-# rustls selects no crypto provider of its own here. See transport.rs.
+# SecP384r1MLKEM1024 then SecP256r1MLKEM768 and nothing classical, and whose
+# KeyPossessionVerifier accepts one ML-DSA-87 station certificate. So rustls
+# selects no crypto provider of its own here. See transport.rs.
 macula-pqc = "0.3"
 # ML-DSA-87 for every node key signature (profile.rs, node_key.rs): the same
 # implementation macula-pqc signs TLS with.
@@ -37,28 +36,9 @@ macula-mldsa = "0.3"
 # The RSA-PSS-4096 half of pq_hybrid's LAMPS composite: already linked through
 # rustls for the key exchange, constant-time, and with a FIPS path.
 aws-lc-rs = "1"
-rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
-webpki-roots = "1.0"
-x509-parser = "0.18"
-# cert_chain.rs: pure X.509 path validation (no hostname/SAN check, unlike
-# rustls's own ServerCertVerifier machinery in cert.rs) to a caller-supplied
-# realm CA — already transitively pulled in by rustls, declared directly
-# here since cert_chain.rs uses its EndEntityCert::verify_for_usage API.
-rustls-webpki = { version = "0.103", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
 tokio = { version = "1", features = ["full"] }
-uuid = { version = "1", features = ["v7"] }
-# control_channel.rs: a session end and dropped unrouted frames are reported
-# through the `log` facade, silent unless the application installs a logger.
-# Already in the graph through rustls's `logging` feature.
-log = "0.4"
-blake3 = "1.5"
-# ucan.rs: JWT-shaped token (de)serialization, matching the reference
-# macula_ucan_nif's own dependency choices exactly (its Cargo.toml has no
-# UCAN-spec crate either, only these same generic primitives).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.23"
-# keystore.rs: platform-native secure storage for a persisted seed
+# keystore.rs: platform-native secure storage for a node key
 # (Keychain via Security.framework on macOS/iOS, Secret Service via D-Bus
 # on Linux, Credential Manager on Windows, Keystore via JNI on Android —
 # each selected automatically per target by keyring's own Cargo.toml
@@ -105,22 +85,10 @@ rustix = { version = "1", features = ["fs", "process"] }
 [dev-dependencies]
 hex = "0.4"
 tempfile = "3"
-# Test-only: generates synthetic Ed25519 certs to unit-test
-# PubkeyPinVerifier's matching logic without needing a live station that
-# happens to present that cert type — see src/cert.rs's tests. Not a
-# runtime dependency of the crate itself (see src/cert.rs's module doc:
-# a dialing client never generates or presents a cert of its own).
-
-# Test-only, cert_chain.rs's own tests: signed_by() needs a SubjectPublicKeyInfo
-# constructed from a raw advertiser Ed25519 pubkey rather than a freshly
-# rcgen-generated one (the leaf must bind the SAME key that signed the
-# advertisement) — SubjectPublicKeyInfo::from_der needs this feature.
-rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
-# Test-only, transport.rs's own tests: the stations the dialler must still
-# reach, or must refuse, are built from aws-lc-rs's own groups.
+serde_json = "1"
+# Test-only, transport.rs's own tests: a station with a classical certificate,
+# which a dial must refuse.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+# Test-only, transport.rs's own tests: the stations the dialler must refuse
+# are built from aws-lc-rs's own groups.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-# Test-only, cert_chain.rs's own tests: rcgen's CertificateParams
-# not_before/not_after fields take this crate's OffsetDateTime directly;
-# not re-exported by rcgen, so declared explicitly (already transitively
-# present via rcgen itself).
-time = "0.3"

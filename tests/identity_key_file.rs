@@ -192,3 +192,46 @@ fn a_directory_or_an_oversized_file_is_refused() {
         Err(KeyFileError::TooLarge)
     ));
 }
+
+/// A key store of the caller's own, which the trait lets any backend be.
+struct InMemory(std::sync::Mutex<Option<Vec<u8>>>);
+
+impl macula_rust::keystore::KeyStore for InMemory {
+    fn save_key(&self, key: &[u8]) -> Result<(), macula_rust::keystore::KeyStoreError> {
+        *self.0.lock().unwrap() = Some(key.to_vec());
+        Ok(())
+    }
+    fn load_key(
+        &self,
+    ) -> Result<macula_mldsa::Zeroizing<Vec<u8>>, macula_rust::keystore::KeyStoreError> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .map(macula_mldsa::Zeroizing::new)
+            .ok_or(macula_rust::keystore::KeyStoreError::NotFound)
+    }
+    fn delete_key(&self) -> Result<(), macula_rust::keystore::KeyStoreError> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+#[test]
+fn a_key_kept_in_a_key_store_loads_back_as_the_same_key_and_is_checked_as_a_file_is() {
+    let store = InMemory(std::sync::Mutex::new(None));
+    assert!(matches!(
+        NodeKey::load_from_keystore(&store, Purpose::Identity, Profile::PqHybrid),
+        Err(KeyFileError::KeyStore(
+            macula_rust::keystore::KeyStoreError::NotFound
+        ))
+    ));
+    let key = NodeKey::generate(Purpose::Identity, Profile::PqHybrid).unwrap();
+    key.save_to_keystore(&store).unwrap();
+    let loaded = NodeKey::load_from_keystore(&store, Purpose::Identity, Profile::PqHybrid).unwrap();
+    assert_eq!(loaded.public_key(), key.public_key());
+    assert!(matches!(
+        NodeKey::load_from_keystore(&store, Purpose::Identity, Profile::PqPure),
+        Err(KeyFileError::WrongProfile(Profile::PqHybrid))
+    ));
+}

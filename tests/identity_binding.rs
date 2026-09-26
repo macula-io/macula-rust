@@ -12,6 +12,9 @@ use macula_rust::cbor;
 use macula_rust::node_key::{node_id_of, NodeKey, Purpose};
 use macula_rust::profile::Profile;
 
+/// A change to a signed structure that must leave it unverifiable.
+type Alteration = Box<dyn Fn(&SignedTbs) -> SignedTbs>;
+
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const MINUTE_MS: i64 = 60 * 1000;
 const MLDSA_SIGNATURE: usize = 4627;
@@ -173,11 +176,10 @@ fn a_binding_or_statement_macula_made_altered_by_one_byte_is_refused() {
         if p == Profile::PqHybrid {
             offsets.push(MLDSA_SIGNATURE + 10);
         }
-        let mut alterations: Vec<Box<dyn Fn(&SignedTbs) -> SignedTbs>> =
-            vec![Box::new(|s: &SignedTbs| SignedTbs {
-                tbs: flipped(&s.tbs, s.tbs.len() / 2),
-                signature: s.signature.clone(),
-            })];
+        let mut alterations: Vec<Alteration> = vec![Box::new(|s: &SignedTbs| SignedTbs {
+            tbs: flipped(&s.tbs, s.tbs.len() / 2),
+            signature: s.signature.clone(),
+        })];
         for offset in offsets {
             alterations.push(Box::new(move |s: &SignedTbs| SignedTbs {
                 tbs: s.tbs.clone(),
