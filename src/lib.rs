@@ -7,6 +7,7 @@
 
 pub mod binding;
 pub mod cbor;
+pub mod frame;
 pub mod handshake;
 pub mod keystore;
 pub mod node_key;
