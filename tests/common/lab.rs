@@ -142,6 +142,10 @@ impl Lab {
 
     /// A realm named `name` with the org `org`.
     pub fn realm(&self, name: &str, org: &str) -> LabRealm {
+        assert!(
+            !name.contains(char::is_whitespace) && !org.contains(char::is_whitespace),
+            "a realm name or org with whitespace would split the lab's command: {name:?} {org:?}"
+        );
         self.realm_line(&format!("realm {name} {org}"))
     }
 

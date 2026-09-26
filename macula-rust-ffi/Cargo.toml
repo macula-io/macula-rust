@@ -34,9 +34,8 @@ thiserror = "2"
 async-trait = "0.1"
 
 [dev-dependencies]
-# tests/live_cert_chain_direct_dial.rs's self-issued realm CA/leaf fixture,
-# mirroring ../tests/live_cert_chain.rs's own — versions matched to the
-# core crate's own pins.
-rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
-time = "0.3"
-base64 = "0.23"
+# tests/pool_ffi.rs drives the core crate's teststation lab
+# (../tests/common), which reads the helper's JSON and hex.
+hex = "0.4"
+serde_json = "1"
+tempfile = "3"

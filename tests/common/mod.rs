@@ -109,8 +109,18 @@ impl TestStations {
 /// naming how to build it: a test that cannot reach its stations proves
 /// nothing, so it is never skipped.
 fn spawn(args: &[&str]) -> (Child, ChildStdin, BufReader<ChildStdout>) {
-    let binary = std::env::var("MACULA_TESTSTATION")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/target/teststation").to_string());
+    // target/ of the workspace: this crate's own, or, for the FFI crate, its
+    // parent's.
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let binary = std::env::var("MACULA_TESTSTATION").unwrap_or_else(|_| {
+        [manifest, manifest.parent().unwrap_or(manifest)]
+            .iter()
+            .map(|dir| dir.join("target/teststation"))
+            .find(|path| path.exists())
+            .unwrap_or_else(|| manifest.join("target/teststation"))
+            .to_string_lossy()
+            .into_owned()
+    });
     assert!(
         std::path::Path::new(&binary).exists(),
         "{binary} is missing: run scripts/build-teststation.sh first"
