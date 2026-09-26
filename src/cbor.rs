@@ -5,12 +5,11 @@
 //! a direct Rust transcription of the hand-rolled canonical encoder macula
 //! actually ships in `native/macula_cbor_nif/src/deterministic.rs`
 //! (`macula-io/macula`), which `macula_frame.erl`'s wire codec calls as
-//! `pack_deterministic/1` / `unpack_deterministic/1`. Every frame's
-//! Ed25519 signature is computed over these exact bytes, so a divergence
+//! `pack_deterministic/1` / `unpack_deterministic/1`. Every signed frame,
+//! record and binding is signed over these exact bytes, so a divergence
 //! here silently breaks signature verification against real stations —
 //! this module's tests include fixtures captured directly from the real
-//! NIF (`rebar3 shell` against `macula-io/macula` at v10.10.0), not just
-//! hand-derived expectations.
+//! NIF, not just hand-derived expectations.
 //!
 //! Encoding rules (all verified against the reference, see `tests` below):
 //! - Integers: minimal-length encoding (inline for 0..=23, else the
@@ -40,12 +39,16 @@
 //!   "canonical CBOR" crate that follows the RFC's shortest-float rule
 //!   would silently produce non-matching, non-verifying bytes here.
 //!
-//! Decode is deliberately narrow to match the reference: major type 6
-//! (tags) is rejected outright, and major 7 only supports `null` and the
-//! three float widths (binary16/32/64, all promoted to `f64`) — no
-//! booleans, no "undefined" simple value. Every read is bounds-checked;
-//! nothing in this module panics on malformed or truncated input, since
-//! decode exists specifically to parse untrusted, network-received bytes.
+//! Decode applies macula 12's decoding rule, the rule every stack applies to
+//! what a peer sends (`tests/cbor_decoding_rule.rs` holds it to the shared
+//! vectors and to the reason macula's reference decoder gives for each
+//! refusal): lengths in any width, map keys in any order but only text or
+//! integers and never twice, integers within -2^63..=2^63-1, `null` and
+//! finite half, single and double floats, at most [`MAX_NESTING_DEPTH`]
+//! levels and [`MAX_ELEMENTS`] items. Tags, booleans and every other simple
+//! value are refused. Every read is bounds-checked; nothing in this module
+//! panics on malformed or truncated input, since decode exists specifically
+//! to parse untrusted, network-received bytes.
 
 use std::fmt;
 
@@ -62,8 +65,7 @@ pub enum Value {
     Text(String),
     List(Vec<Value>),
     /// Insertion order on construction; canonical key sort happens at
-    /// encode time, not here. Decode preserves last-write-wins on
-    /// duplicate keys, matching the reference decoder exactly.
+    /// encode time, not here. Decode refuses a duplicate key.
     Map(Vec<(Value, Value)>),
     Null,
     /// Always round-trips through binary64 — see the module doc's note
@@ -137,71 +139,44 @@ impl fmt::Display for IntOutOfRange {
 
 impl std::error::Error for IntOutOfRange {}
 
+/// Why [`decode`] refused an input: one variant for each reason macula's
+/// reference decoder (`macula_record_cbor:decode_strict/1`) gives, so an input
+/// is refused for the same reason in every stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The buffer ended before a complete value could be read.
-    Truncated,
-    /// Major type 6 (tags) — not part of macula's wire format.
-    UnsupportedMajorType(u8),
-    /// A major-7 additional-info value with no meaning here (only 22
-    /// \[null\] and 25/26/27 \[floats\] are supported).
-    UnsupportedAdditionalInfo(u8),
-    /// Additional-info 28-31 on any major type — reserved, unused.
-    UnsupportedAdditionalInfoEncoding(u8),
-    /// A single top-level value didn't consume the whole buffer.
+    /// Bytes after the top-level value.
     TrailingBytes,
-    /// A major-3 (text) value's bytes were not valid UTF-8. The reference
-    /// Erlang/Rust codec does not validate this on decode (it stores
-    /// whatever bytes arrived); this port deliberately diverges and
-    /// treats it as an error instead of losslessly carrying invalid
-    /// UTF-8, since every real macula text value is ASCII/UTF-8 by
-    /// construction and failing closed on malformed input from a peer is
-    /// the safer default. Documented, not accidental.
-    InvalidUtf8,
-    /// A half-float (binary16) with exponent 31 — NaN or infinity, which
-    /// has no representation as an ordinary `f64` value here (matches
-    /// the reference decoder's own behavior: no clause for it).
-    UnrepresentableFloat,
-    /// Lists/maps nested more than [`MAX_NESTING_DEPTH`] levels deep.
-    /// Not part of the wire format's own semantics — a defense against a
-    /// maliciously crafted frame: a list-of-one-list-of-one-list... can
-    /// encode extreme nesting in very few bytes (one byte per level),
-    /// and this decoder is plain recursive descent, so without a limit
-    /// a peer could crash the process with a stack overflow (not a
-    /// catchable panic) from a single frame well under
-    /// `frame::MAX_FRAME_BYTES`. No real macula wire value nests anywhere
-    /// close to this deep.
+    /// A map key that is neither text nor an integer.
+    BadKey,
+    /// A map key equal to an earlier key of its map: text with the same
+    /// bytes, or an integer of the same value, in any width.
+    DuplicateKey,
+    /// Text that is not valid UTF-8.
+    InvalidText,
+    /// Arrays and maps nested more than [`MAX_NESTING_DEPTH`] levels.
     NestingTooDeep,
+    /// An integer below -2^63 or above 2^63-1.
+    IntegerOutOfRange,
+    /// Input that holds more than [`MAX_ELEMENTS`] items.
+    TooManyElements,
+    /// Input that is not one complete item of what the rule allows: truncated
+    /// input, an indefinite length, a tag, a simple value other than null, or
+    /// a float that is NaN or infinite.
+    Malformed,
 }
 
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DecodeError::Truncated => write!(f, "truncated input"),
-            DecodeError::UnsupportedMajorType(m) => {
-                write!(
-                    f,
-                    "unsupported major type {m} (only 0-5 and 7 are valid here)"
-                )
-            }
-            DecodeError::UnsupportedAdditionalInfo(ai) => {
-                write!(f, "unsupported major-7 additional info {ai}")
-            }
-            DecodeError::UnsupportedAdditionalInfoEncoding(ai) => {
-                write!(
-                    f,
-                    "unsupported additional-info encoding {ai} (28-31 are reserved)"
-                )
-            }
-            DecodeError::TrailingBytes => write!(f, "trailing bytes after the top-level value"),
-            DecodeError::InvalidUtf8 => write!(f, "text value was not valid UTF-8"),
-            DecodeError::UnrepresentableFloat => {
-                write!(f, "half-float NaN/infinity has no f64 representation here")
-            }
-            DecodeError::NestingTooDeep => {
-                write!(f, "list/map nesting exceeds {MAX_NESTING_DEPTH} levels")
-            }
-        }
+        f.write_str(match self {
+            DecodeError::TrailingBytes => "bytes after the top-level value",
+            DecodeError::BadKey => "a map key that is neither text nor an integer",
+            DecodeError::DuplicateKey => "a duplicate map key",
+            DecodeError::InvalidText => "text that is not valid UTF-8",
+            DecodeError::NestingTooDeep => "arrays and maps nested more than 64 levels",
+            DecodeError::IntegerOutOfRange => "an integer below -2^63 or above 2^63-1",
+            DecodeError::TooManyElements => "more than 131072 items",
+            DecodeError::Malformed => "malformed",
+        })
     }
 }
 
@@ -311,325 +286,234 @@ fn encode_head(major: u8, n: u64, out: &mut Vec<u8>) {
     }
 }
 
-/// Recursive-descent nesting limit — see [`DecodeError::NestingTooDeep`]
-/// for why this exists. No real macula wire value nests remotely this
-/// deep; this only ever rejects an adversarial input.
-pub const MAX_NESTING_DEPTH: usize = 128;
+/// How many arrays and maps may nest inside each other, the outermost
+/// counted: 64 levels decode, and a 65th is refused, as in macula's decoding
+/// rule.
+pub const MAX_NESTING_DEPTH: usize = 64;
 
-/// Decode a single deterministic-CBOR value from `bytes`. The whole
-/// buffer must be consumed by exactly one top-level value — trailing
-/// bytes are an error, matching the reference decoder's own contract.
+/// How many CBOR items one [`decode`] may read: every item counts once, the
+/// top-level value, array elements, map keys and map values included. It is
+/// macula's element budget, so an input macula refuses for the items it holds
+/// is refused here too.
+pub const MAX_ELEMENTS: usize = 131_072;
+
+/// Decode `bytes` as exactly one value under macula's post-quantum decoding
+/// rule, the rule every stack applies to what a peer sends. Lengths are
+/// accepted in any width, map keys in any order, and half, single and double
+/// floats; everything else the rule refuses is refused with the reason
+/// macula's reference decoder gives. Every path returns an error rather than
+/// panicking, since the input is untrusted.
 pub fn decode(bytes: &[u8]) -> Result<Value, DecodeError> {
-    // Nobody consumes the top-level value's canonical bytes — don't
-    // build them (see `decode_one`'s `need_canon` param).
-    let (value, _canonical_bytes, pos) = decode_one(bytes, 0, 0, false)?;
-    if pos != bytes.len() {
+    let mut decoder = Decoder {
+        data: bytes,
+        pos: 0,
+        budget: MAX_ELEMENTS,
+    };
+    let value = decoder.item(0)?;
+    if decoder.pos != bytes.len() {
         return Err(DecodeError::TrailingBytes);
     }
     Ok(value)
 }
 
-fn need(buf: &[u8], pos: usize, n: usize) -> Result<(), DecodeError> {
-    match pos.checked_add(n) {
-        Some(end) if end <= buf.len() => Ok(()),
-        _ => Err(DecodeError::Truncated),
-    }
-}
-
-/// Decodes one value, and — only when `need_canon` is true — its own
-/// canonical (deterministic-CBOR) bytes, built bottom-up as decoding
-/// proceeds rather than re-derived by a separate encode pass afterward.
-/// See `decode_map`'s doc for why the bytes are needed at all (a map
-/// using another map as a key needs its key's canonical bytes to
-/// dedupe/sort by, and re-encoding a key from scratch at every ancestor
-/// level is itself an unbounded-work trap on nested input) and why
-/// `need_canon` exists (computing them for every value regardless of
-/// whether anything ever reads them — the common case, since most
-/// decoded values are never used as a map key at any level — turned out
-/// to be its own real cost: a value nested `depth` levels inside a
-/// value that never touches a map key at all still doesn't need canon
-/// bytes, but always building them anyway meant a large nested
-/// non-map-keyed value paid full canon-construction cost with nothing
-/// to show for it, confirmed to regress both time and peak memory on
-/// large deep lists/values with no map keys anywhere in them).
-/// `decode_map` is the only caller that ever passes different values
-/// for its two child calls: always `true` for a key (dedup needs it
-/// unconditionally, regardless of whether the map's OWN canon bytes are
-/// wanted) and its own `need_canon` for a value (only needed if this
-/// whole map is itself nested inside some ancestor's key).
-fn decode_one(
-    buf: &[u8],
+/// Reads one value from `data`: `pos` is how far it has read, and `budget`
+/// how many more items it may read.
+struct Decoder<'a> {
+    data: &'a [u8],
     pos: usize,
-    depth: usize,
-    need_canon: bool,
-) -> Result<(Value, Vec<u8>, usize), DecodeError> {
-    if depth > MAX_NESTING_DEPTH {
-        return Err(DecodeError::NestingTooDeep);
-    }
-    need(buf, pos, 1)?;
-    let byte0 = buf[pos];
-    let major = byte0 >> 5;
-    let ai = byte0 & 0x1F;
-
-    if major == 7 {
-        let (value, next) = decode_major7(buf, pos, ai)?;
-        return Ok(scalar_canonical_bytes(value, next, need_canon));
-    }
-
-    let (n, next) = decode_count(buf, pos + 1, ai)?;
-    match major {
-        0 => Ok(scalar_canonical_bytes(
-            Value::Int(n as i128),
-            next,
-            need_canon,
-        )),
-        1 => Ok(scalar_canonical_bytes(
-            Value::Int(-1i128 - n as i128),
-            next,
-            need_canon,
-        )),
-        2 => {
-            let len = n as usize;
-            need(buf, next, len)?;
-            let value = Value::Bytes(buf[next..next + len].to_vec());
-            Ok(scalar_canonical_bytes(value, next + len, need_canon))
-        }
-        3 => {
-            let len = n as usize;
-            need(buf, next, len)?;
-            let text = String::from_utf8(buf[next..next + len].to_vec())
-                .map_err(|_| DecodeError::InvalidUtf8)?;
-            Ok(scalar_canonical_bytes(
-                Value::Text(text),
-                next + len,
-                need_canon,
-            ))
-        }
-        4 => decode_list(buf, next, n, depth + 1, need_canon),
-        5 => decode_map(buf, next, n, depth + 1, need_canon),
-        _ => Err(DecodeError::UnsupportedMajorType(major)),
-    }
+    budget: usize,
 }
 
-/// `with_canonical_bytes`, but skipped (an empty `Vec` instead) when
-/// nothing will ever read it — see `decode_one`'s `need_canon` doc.
-fn scalar_canonical_bytes(value: Value, next: usize, need_canon: bool) -> (Value, Vec<u8>, usize) {
-    if need_canon {
-        with_canonical_bytes(value, next)
-    } else {
-        (value, Vec::new(), next)
-    }
+/// A map key's identity under the rule: its text, or an integer's value.
+#[derive(PartialEq, Eq, Hash)]
+enum KeyId {
+    Text(String),
+    Int(i128),
 }
 
-/// Computes a scalar (non-list/map) value's own canonical bytes via a
-/// plain, non-recursive `encode_value` call — cheap regardless of where
-/// in a nested structure it's called from, unlike `List`/`Map`, which
-/// build their canonical bytes by concatenating their CHILDREN's
-/// already-computed bytes (see `decode_list`/`decode_map`) instead of
-/// calling `encode_value` on themselves.
-fn with_canonical_bytes(value: Value, next: usize) -> (Value, Vec<u8>, usize) {
-    let mut canon = Vec::new();
-    encode_value(&value, &mut canon).expect("a value produced by this decoder is always encodable");
-    (value, canon, next)
-}
+/// The room a list or map is given before its elements decode: a declared
+/// count is not checked against the input, so it is never trusted as an
+/// allocation size.
+const MAX_SIZE_HINT: usize = 4;
 
-fn decode_count(buf: &[u8], pos: usize, ai: u8) -> Result<(u64, usize), DecodeError> {
-    match ai {
-        0..=23 => Ok((ai as u64, pos)),
-        24 => {
-            need(buf, pos, 1)?;
-            Ok((buf[pos] as u64, pos + 1))
+impl Decoder<'_> {
+    /// The item at `pos`, which sits inside `depth` arrays and maps. As in
+    /// macula's decoder, an item is counted against the budget once its head
+    /// and argument have been read, and before its own checks.
+    fn item(&mut self, depth: usize) -> Result<Value, DecodeError> {
+        let head = self.take(1)?[0];
+        let (major, ai) = (head >> 5, head & 0x1F);
+        if major == 7 {
+            return self.simple_or_float(ai);
         }
-        25 => {
-            need(buf, pos, 2)?;
-            Ok((u16::from_be_bytes([buf[pos], buf[pos + 1]]) as u64, pos + 2))
+        let arg = self.argument(ai)?;
+        self.count()?;
+        match major {
+            0 => integer(i128::from(arg), arg),
+            1 => integer(-1 - i128::from(arg), arg),
+            2 => Ok(Value::Bytes(self.take(arg)?.to_vec())),
+            3 => {
+                let bytes = self.take(arg)?;
+                std::str::from_utf8(bytes)
+                    .map(|text| Value::Text(text.to_owned()))
+                    .map_err(|_| DecodeError::InvalidText)
+            }
+            4 => self.list(arg, depth),
+            5 => self.map(arg, depth),
+            _ => Err(DecodeError::Malformed),
         }
-        26 => {
-            need(buf, pos, 4)?;
-            let b: [u8; 4] = buf[pos..pos + 4].try_into().expect("checked len");
-            Ok((u32::from_be_bytes(b) as u64, pos + 4))
-        }
-        27 => {
-            need(buf, pos, 8)?;
-            let b: [u8; 8] = buf[pos..pos + 8].try_into().expect("checked len");
-            Ok((u64::from_be_bytes(b), pos + 8))
-        }
-        28..=31 => Err(DecodeError::UnsupportedAdditionalInfoEncoding(ai)),
-        _ => unreachable!("additional info is a 5-bit field, 0..=31"),
     }
-}
 
-fn decode_major7(buf: &[u8], pos: usize, ai: u8) -> Result<(Value, usize), DecodeError> {
-    match ai {
-        22 => Ok((Value::Null, pos + 1)),
-        25 => {
-            need(buf, pos + 1, 2)?;
-            let half = u16::from_be_bytes([buf[pos + 1], buf[pos + 2]]);
-            Ok((Value::Float(half_to_f64(half)?), pos + 3))
+    /// Takes one item from the budget.
+    fn count(&mut self) -> Result<(), DecodeError> {
+        if self.budget == 0 {
+            return Err(DecodeError::TooManyElements);
         }
-        26 => {
-            need(buf, pos + 1, 4)?;
-            let b: [u8; 4] = buf[pos + 1..pos + 5].try_into().expect("checked len");
-            Ok((Value::Float(f32::from_be_bytes(b) as f64), pos + 5))
-        }
-        27 => {
-            need(buf, pos + 1, 8)?;
-            let b: [u8; 8] = buf[pos + 1..pos + 9].try_into().expect("checked len");
-            Ok((Value::Float(f64::from_be_bytes(b)), pos + 9))
-        }
-        _ => Err(DecodeError::UnsupportedAdditionalInfo(ai)),
+        self.budget -= 1;
+        Ok(())
     }
-}
 
-fn decode_list(
-    buf: &[u8],
-    mut pos: usize,
-    count: u64,
-    depth: usize,
-    need_canon: bool,
-) -> Result<(Value, Vec<u8>, usize), DecodeError> {
-    let mut items = Vec::with_capacity(count.min(1024) as usize);
-    let mut canon = Vec::new();
-    if need_canon {
-        encode_head(4, count, &mut canon);
-    }
-    for _ in 0..count {
-        let (item, item_canon, next) = decode_one(buf, pos, depth, need_canon)?;
-        if need_canon {
-            canon.extend_from_slice(&item_canon);
+    /// The next `n` bytes of the input, moving past them.
+    fn take(&mut self, n: u64) -> Result<&[u8], DecodeError> {
+        let remaining = (self.data.len() - self.pos) as u64;
+        if n > remaining {
+            return Err(DecodeError::Malformed);
         }
-        items.push(item);
-        pos = next;
+        let start = self.pos;
+        self.pos += n as usize;
+        Ok(&self.data[start..self.pos])
     }
-    Ok((Value::List(items), canon, pos))
-}
 
-/// Duplicate keys overwrite (last write wins), matching the reference
-/// decoder exactly — not treated as an error.
-///
-/// Looks up each key's slot by its own canonical bytes (from
-/// `decode_one`'s bottom-up construction — see that function's doc) in
-/// a `HashMap`, rather than a `Value`-equality linear scan over
-/// everything decoded so far: the scan made this function O(n²) on a
-/// map with many distinct keys — a single ~350 KB crafted frame (well
-/// under `frame::MAX_FRAME_BYTES`) pegged a CPU core for 50+ seconds
-/// decoding it, and the cost scaled quadratically toward the
-/// frame-size cap, all of it running before any signature check on the
-/// frame.
-///
-/// An earlier version of this fix looked up each key by calling
-/// `encode(&k)` fresh, per entry, instead of reusing the bytes
-/// `decode_one` already built while decoding that same key — that's
-/// sound for a FLAT map (fixed the 350 KB/50 s case, confirmed
-/// empirically), but reintroduced unbounded work for a map whose KEY is
-/// itself a large nested structure: re-encoding a key from scratch at
-/// every ancestor level costs O(depth × key size), and a 128-level
-/// chain of single-entry maps (`MAX_NESTING_DEPTH`) each keyed by a
-/// large blob turned back into tens of seconds of pre-auth CPU on a
-/// frame still under the size cap — confirmed empirically. Building
-/// canonical bytes bottom-up (each value's bytes computed exactly once,
-/// when it's decoded, then only ever concatenated/sorted by its
-/// ancestors — never re-derived) fixed that: the same 128-deep/15 MB
-/// case dropped from ~31 s to ~1 s. This is O(depth × size), the same
-/// bound `MAX_NESTING_DEPTH` already exists to enforce — NOT O(total
-/// input size) regardless of nesting shape, since a key containing a
-/// key still gets its bytes copied once per level it's nested under.
-/// It just can no longer exceed the depth cap's own bound, the same
-/// guarantee `NestingTooDeep` already gives the rest of this decoder.
-///
-/// Computing canon bytes unconditionally for every value (not just
-/// values that end up under a map key somewhere) was ALSO measured to
-/// be a real, separate cost — a large nested value that never touches
-/// a map key still paid full canon-construction cost for nothing;
-/// `need_canon` (threaded through `decode_one`/`decode_list`/this
-/// function) skips it. A key's canon is always needed, unconditionally
-/// (dedup requires it); a value's is only needed if this whole map is
-/// itself nested inside some ancestor's key, i.e. this map's OWN
-/// `need_canon`.
-///
-/// The still-remaining, deliberate, narrow divergences from a literal
-/// `Value`-equality scan, fuzzed against 500k adversarial inputs
-/// against both this and the pre-fix decoder: nested-map keys that
-/// differ only in wire insertion order now merge (the old scan kept
-/// both — wrong, since Erlang maps/this format's own key-sort are both
-/// unordered); `+0.0`/`-0.0` keys no longer merge (the old scan merged
-/// them via `PartialEq` — wrong, since neither Erlang's `=:=` nor the
-/// reference NIF's own byte-dedup merge them); bit-identical `NaN` keys
-/// now merge (the old scan never did, since `NaN != NaN` under
-/// `PartialEq` — matches the reference). All three move this decoder
-/// TOWARD the reference decoder's actual behavior, not away from it,
-/// and none of the three is reachable in practice: no real macula map
-/// key is ever a float or a nested map.
-fn decode_map(
-    buf: &[u8],
-    mut pos: usize,
-    count: u64,
-    depth: usize,
-    need_canon: bool,
-) -> Result<(Value, Vec<u8>, usize), DecodeError> {
-    let capacity = count.min(1024) as usize;
-    let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(capacity);
-    // Owns each distinct key's canonical bytes (moved in on first sight,
-    // never cloned) -> slot index into `pairs`/`vals_canon`.
-    let mut index_of_key: std::collections::HashMap<Vec<u8>, usize> =
-        std::collections::HashMap::with_capacity(capacity);
-    // Per-slot VALUE canon, kept in step with `pairs` (same index, same
-    // last-write-wins updates) -- only populated when `need_canon`, since
-    // a key's canon (owned by `index_of_key` above) is the only one ever
-    // needed just to make dedup itself work.
-    let mut vals_canon: Vec<Vec<u8>> = Vec::with_capacity(if need_canon { capacity } else { 0 });
-    for _ in 0..count {
-        // A key ALWAYS needs its canon bytes -- that's the dedup
-        // identity itself, independent of whether this map's OWN canon
-        // bytes (built below) are ever going to be read by anything.
-        let (k, key_canon, next1) = decode_one(buf, pos, depth, true)?;
-        let (v, val_canon, next2) = decode_one(buf, next1, depth, need_canon)?;
-        pos = next2;
-        use std::collections::hash_map::Entry;
-        match index_of_key.entry(key_canon) {
-            Entry::Occupied(e) => {
-                let i = *e.get();
-                pairs[i].1 = v;
-                if need_canon {
-                    vals_canon[i] = val_canon;
+    /// A head's argument, a value or a length: its additional information
+    /// itself up to 23, or the 1, 2, 4 or 8 bytes after the head, in whichever
+    /// width the sender chose. 28 to 31, every indefinite length among them,
+    /// is malformed.
+    fn argument(&mut self, ai: u8) -> Result<u64, DecodeError> {
+        let width = match ai {
+            0..=23 => return Ok(u64::from(ai)),
+            24 => 1,
+            25 => 2,
+            26 => 4,
+            27 => 8,
+            _ => return Err(DecodeError::Malformed),
+        };
+        Ok(self
+            .take(width)?
+            .iter()
+            .fold(0u64, |arg, &b| (arg << 8) | u64::from(b)))
+    }
+
+    /// Major type 7, counted once its bytes have been read: null, or a finite
+    /// half, single or double float. Every other simple value, a boolean
+    /// among them, is malformed.
+    fn simple_or_float(&mut self, ai: u8) -> Result<Value, DecodeError> {
+        match ai {
+            22 => {
+                self.count()?;
+                Ok(Value::Null)
+            }
+            25 | 26 | 27 => {
+                let width = match ai {
+                    25 => 2,
+                    26 => 4,
+                    _ => 8,
+                };
+                let bytes = self.take(width)?;
+                let value = match bytes.len() {
+                    2 => half_to_f64(u16::from_be_bytes([bytes[0], bytes[1]])),
+                    4 => f64::from(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+                    _ => f64::from_be_bytes(bytes.try_into().map_err(|_| DecodeError::Malformed)?),
+                };
+                self.count()?;
+                if value.is_finite() {
+                    Ok(Value::Float(value))
+                } else {
+                    Err(DecodeError::Malformed)
                 }
             }
-            Entry::Vacant(e) => {
-                e.insert(pairs.len());
-                pairs.push((k, v));
-                if need_canon {
-                    vals_canon.push(val_canon);
-                }
+            0..=24 => {
+                self.argument(ai)?;
+                self.count()?;
+                Err(DecodeError::Malformed)
             }
+            _ => Err(DecodeError::Malformed),
         }
     }
-    if !need_canon {
-        return Ok((Value::Map(pairs), Vec::new(), pos));
+
+    /// The room to give a list or map that declares `count` elements of at
+    /// least `items_per_element` items and bytes each: at most the count,
+    /// what the bytes and budget left could hold, and [`MAX_SIZE_HINT`], so
+    /// what decoding allocates follows the bytes present.
+    fn size_hint(&self, count: u64, items_per_element: usize) -> usize {
+        let bytes_left = (self.data.len() - self.pos) / items_per_element;
+        let budget_left = self.budget / items_per_element;
+        count
+            .min(bytes_left as u64)
+            .min(budget_left as u64)
+            .min(MAX_SIZE_HINT as u64) as usize
     }
-    // Matches `encode_map`'s own rule exactly: sort entries by the
-    // key's encoded bytes, plain lexicographic `Ord` on `Vec<u8>`.
-    let mut order: Vec<(&Vec<u8>, usize)> = index_of_key.iter().map(|(k, &i)| (k, i)).collect();
-    order.sort_by(|a, b| a.0.cmp(b.0));
-    let mut canon = Vec::new();
-    encode_head(5, order.len() as u64, &mut canon);
-    for (k, i) in order {
-        canon.extend_from_slice(k);
-        canon.extend_from_slice(&vals_canon[i]);
+
+    fn list(&mut self, count: u64, depth: usize) -> Result<Value, DecodeError> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(DecodeError::NestingTooDeep);
+        }
+        let mut items = Vec::with_capacity(self.size_hint(count, 1));
+        for _ in 0..count {
+            items.push(self.item(depth + 1)?);
+        }
+        Ok(Value::List(items))
     }
-    Ok((Value::Map(pairs), canon, pos))
+
+    /// A map of `count` entries. Each entry's value decodes before its key is
+    /// judged, as in the reference decoder, so an input that breaks two
+    /// checks is refused for the same one in every stack. Duplicates are found
+    /// through a hash set, so the work grows with the number of keys, not its
+    /// square.
+    fn map(&mut self, count: u64, depth: usize) -> Result<Value, DecodeError> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(DecodeError::NestingTooDeep);
+        }
+        let hint = self.size_hint(count, 2);
+        let mut pairs = Vec::with_capacity(hint);
+        let mut seen = std::collections::HashSet::with_capacity(hint);
+        for _ in 0..count {
+            let key = self.item(depth + 1)?;
+            let value = self.item(depth + 1)?;
+            let id = match &key {
+                Value::Text(text) => KeyId::Text(text.clone()),
+                Value::Int(n) => KeyId::Int(*n),
+                _ => return Err(DecodeError::BadKey),
+            };
+            if !seen.insert(id) {
+                return Err(DecodeError::DuplicateKey);
+            }
+            pairs.push((key, value));
+        }
+        Ok(Value::Map(pairs))
+    }
 }
 
-/// IEEE 754 binary16 → f64. Subnormals (exp=0) and normals (1..=30) use
-/// the standard formula; exp=31 (NaN/infinity) has no representation here
-/// — matches the reference decoder, which has no clause for it either.
-fn half_to_f64(half: u16) -> Result<f64, DecodeError> {
-    let sign: f64 = if (half >> 15) & 1 == 1 { -1.0 } else { 1.0 };
+/// An integer head's value, refused when its argument puts it outside -2^63
+/// to 2^63-1: an unsigned argument of 2^63 or more is above 2^63-1, and a
+/// negative one of 2^63 or more is below -2^63.
+fn integer(value: i128, arg: u64) -> Result<Value, DecodeError> {
+    if arg >= 1 << 63 {
+        return Err(DecodeError::IntegerOutOfRange);
+    }
+    Ok(Value::Int(value))
+}
+
+/// IEEE 754 binary16 to f64, infinities and NaN included; the caller refuses
+/// what is not finite.
+fn half_to_f64(half: u16) -> f64 {
+    let sign = if half >> 15 == 1 { -1.0 } else { 1.0 };
     let exp = (half >> 10) & 0x1F;
-    let frac = (half & 0x3FF) as f64;
+    let frac = f64::from(half & 0x3FF);
     match exp {
-        0 => Ok(sign * 2f64.powi(-14) * (frac / 1024.0)),
-        1..=30 => Ok(sign * 2f64.powi(exp as i32 - 15) * (1.0 + frac / 1024.0)),
-        _ => Err(DecodeError::UnrepresentableFloat),
+        0 => sign * 2f64.powi(-24) * frac,
+        31 if frac == 0.0 => sign * f64::INFINITY,
+        31 => f64::NAN,
+        _ => sign * 2f64.powi(i32::from(exp) - 15) * (1.0 + frac / 1024.0),
     }
 }
 
@@ -815,114 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_tags() {
-        // Major type 6, additional info 0 — a tag, not part of this wire
-        // format.
-        assert_eq!(decode(&[0xC0]), Err(DecodeError::UnsupportedMajorType(6)));
-    }
-
-    #[test]
     fn decode_rejects_trailing_bytes() {
         // A valid `0` (0x00) followed by a stray byte.
         assert_eq!(decode(&[0x00, 0xFF]), Err(DecodeError::TrailingBytes));
-    }
-
-    #[test]
-    fn decode_rejects_truncated_input() {
-        // Major 0, AI 24 (one more byte expected) but the buffer ends.
-        assert_eq!(decode(&[0x18]), Err(DecodeError::Truncated));
-    }
-
-    /// Builds a payload of `depth` one-element-list wrappers (major 4,
-    /// AI 1 — a single byte, `0x81`, per level) around one terminal
-    /// scalar (`0x00`, the integer 0). Before `MAX_NESTING_DEPTH` existed,
-    /// decoding this crashed the whole process with a real stack
-    /// overflow (verified against this exact decoder pre-fix, on a
-    /// realistic 2 MiB worker-thread stack, at a nesting depth of only
-    /// 100_000 -- well under 1% of what a single 16 MiB wire frame could
-    /// carry) rather than returning a decode error. A stack overflow
-    /// aborts the process; it is not a `panic!` `#[should_panic]` can
-    /// catch, so the tests below only exercise the now-clean error path.
-    fn nested_list_payload(depth: usize) -> Vec<u8> {
-        let mut buf = vec![0x81u8; depth];
-        buf.push(0x00);
-        buf
-    }
-
-    #[test]
-    fn decode_accepts_nesting_at_the_depth_limit() {
-        let bytes = nested_list_payload(MAX_NESTING_DEPTH);
-        assert!(decode(&bytes).is_ok());
-    }
-
-    #[test]
-    fn decode_rejects_nesting_one_past_the_depth_limit() {
-        let bytes = nested_list_payload(MAX_NESTING_DEPTH + 1);
-        assert_eq!(decode(&bytes), Err(DecodeError::NestingTooDeep));
-    }
-
-    #[test]
-    fn decode_rejects_extreme_nesting_without_crashing() {
-        // Far beyond the limit, and far beyond what actually crashed the
-        // pre-fix decoder -- this is the direct regression test for the
-        // stack-overflow finding. If this test process crashes instead of
-        // completing, the depth guard has regressed.
-        let bytes = nested_list_payload(100_000);
-        assert_eq!(decode(&bytes), Err(DecodeError::NestingTooDeep));
-    }
-
-    #[test]
-    fn decode_duplicate_map_keys_last_write_wins() {
-        // Two entries both keyed "a" (0x61 0x61), values 1 then 2.
-        let bytes = hex("A2616101616102");
-        let decoded = decode(&bytes).expect("valid map");
-        match decoded {
-            Value::Map(pairs) => {
-                assert_eq!(pairs.len(), 1);
-                assert_eq!(pairs[0], (Value::text("a"), Value::Int(2)));
-            }
-            other => panic!("expected a map, got {other:?}"),
-        }
-    }
-
-    /// A duplicate key in the middle of several distinct ones overwrites
-    /// in place — the duplicate's ORIGINAL insertion slot, not a new one
-    /// appended at the end — and every other key's position is
-    /// undisturbed. Guards `decode_map`'s HashMap-indexed dedup: it would
-    /// be easy for a faster implementation to accidentally reorder
-    /// entries or dedupe the wrong slot.
-    #[test]
-    fn decode_duplicate_map_key_overwrites_its_original_slot_not_the_end() {
-        let map = Value::Map(vec![
-            (Value::text("a"), Value::Int(1)),
-            (Value::text("b"), Value::Int(2)),
-            (Value::text("c"), Value::Int(3)),
-        ]);
-        let mut bytes = encode(&map).expect("encodable");
-        // Append one more entry, "b" -> 99, so the wire form has 4
-        // entries with "b" duplicated -- can't build this through
-        // `encode` directly since it only ever emits already-deduped
-        // maps; construct the extra entry's bytes by hand and bump the
-        // map's own entry count (the map header's low nibble, byte 0).
-        assert_eq!(bytes[0] & 0x1F, 3, "expected a 3-entry map header");
-        bytes[0] = (bytes[0] & 0xE0) | 4;
-        bytes.extend_from_slice(&encode(&Value::text("b")).unwrap());
-        bytes.extend_from_slice(&encode(&Value::Int(99)).unwrap());
-
-        let decoded = decode(&bytes).expect("valid map");
-        match decoded {
-            Value::Map(pairs) => {
-                assert_eq!(
-                    pairs,
-                    vec![
-                        (Value::text("a"), Value::Int(1)),
-                        (Value::text("b"), Value::Int(99)),
-                        (Value::text("c"), Value::Int(3)),
-                    ]
-                );
-            }
-            other => panic!("expected a map, got {other:?}"),
-        }
     }
 
     /// Regression guard for a real bug: `decode_map`'s duplicate-key
@@ -956,59 +735,6 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "decoding {n} distinct-keyed entries took {elapsed:?} -- \
              looks like decode_map regressed to O(n^2)"
-        );
-    }
-
-    /// A second, narrower regression this same bug had once already:
-    /// the first attempt at fixing the flat-map O(n^2) case above
-    /// re-encoded each key fresh (`encode(&k)`) to find its slot, which
-    /// fixed the flat case but reintroduced unbounded work for a map
-    /// whose KEY is itself a large nested structure -- re-encoding a
-    /// key from scratch at every ancestor level costs O(depth × key
-    /// size), and a `MAX_NESTING_DEPTH`-deep chain of single-entry maps
-    /// keyed by a large blob took real, measured tens of seconds even
-    /// though it's well under `frame::MAX_FRAME_BYTES`. This decodes a
-    /// nesting-depth-limit-deep chain wrapping a multi-megabyte blob key
-    /// in well under a second; if key canonicalization regresses to
-    /// re-deriving a key's bytes at every ancestor level instead of
-    /// reusing what decoding that key already computed, this test will
-    /// time out long before it fails its assertions.
-    #[test]
-    fn decode_map_with_a_large_deeply_nested_key_is_not_quadratic_in_depth() {
-        // `MAX_NESTING_DEPTH` copies of "a 1-entry map wrapping...",
-        // around one 4 MiB byte-string key, each level's own map then
-        // valued at `Int(0)` (innermost first).
-        let blob_len = 512 * 1024;
-        let mut bytes = vec![0xA1u8; MAX_NESTING_DEPTH];
-        bytes.push(0x5A); // major 2 (bytes), AI 26 -> 4-byte length follows
-        bytes.extend_from_slice(&(blob_len as u32).to_be_bytes());
-        bytes.extend(std::iter::repeat_n(0x41u8, blob_len));
-        bytes.extend(std::iter::repeat_n(0x00u8, MAX_NESTING_DEPTH));
-
-        let start = std::time::Instant::now();
-        let decoded = decode(&bytes).expect("valid, maximally-nested map-key chain");
-        let elapsed = start.elapsed();
-
-        // Sanity: really did decode the full nested-map chain down to
-        // the 4 MiB blob at its center, not bail out early on a
-        // malformed payload. `0xA1` nests a 1-entry map as each level's
-        // KEY, so the blob is `MAX_NESTING_DEPTH` levels of `Map` down.
-        let mut cursor = &decoded;
-        for _ in 0..MAX_NESTING_DEPTH {
-            match cursor {
-                Value::Map(pairs) if pairs.len() == 1 => cursor = &pairs[0].0,
-                other => panic!("expected a 1-entry map at this nesting level, got {other:?}"),
-            }
-        }
-        match cursor {
-            Value::Bytes(b) => assert_eq!(b.len(), blob_len),
-            other => panic!("expected the innermost key to be Bytes, got {other:?}"),
-        }
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "decoding a {MAX_NESTING_DEPTH}-deep map-key chain around a {blob_len}-byte blob \
-             took {elapsed:?} -- looks like key canonicalization regressed to re-deriving a \
-             key's bytes at every ancestor level instead of reusing decode_one's own"
         );
     }
 
