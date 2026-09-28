@@ -13,7 +13,23 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [0.5.0] - Unreleased
+### [0.5.1] - Unreleased
+
+#### Fixed
+
+- A CALL that went out is never sent again (#6). `Pool::call` moved to the
+  next candidate after any failure but a provider's answer, a timeout
+  included, and each attempt drew a fresh request id, so a handler slower than
+  one candidate's share of the deadline was entered twice and a handler that
+  is not idempotent ran its side effect twice. As macula's `call_work` and
+  `failure_scope/1` (and macula-go#8): the next candidate is tried only when a
+  candidate's station cannot be reached within its share, before anything is
+  sent; once the CALL or STREAM_OPEN is written, its outcome is returned as it
+  is, under the whole deadline. `Pool::open_stream` likewise: a stream the
+  link refuses (`StreamOpenTooLarge`) is no longer walked to every candidate.
+  A pool closed under a call ends it with `PoolError::Closed`.
+
+### [0.5.0] - 2026-09-26
 
 #### Added
 

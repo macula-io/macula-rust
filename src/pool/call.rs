@@ -6,9 +6,12 @@
 //! that node signed), and tries the freshest first: it dials the serving
 //! station the advertisement names, pinned by its node_id from the station's
 //! own station_endpoint record, and calls the provider there. It moves on to
-//! the next candidate when a station cannot be reached or reports it cannot
-//! relay the call, and returns a provider's own answer or error as it is. A
-//! candidate that answered is remembered until its advertisement expires.
+//! the next candidate only when a station cannot be reached within that
+//! candidate's share of the deadline, before anything is sent: once the CALL
+//! or STREAM_OPEN has gone out, under the whole deadline, its outcome is
+//! returned as it is, a timeout included, so one call reaches a provider at
+//! most once (macula's call_work and failure_scope/1). A candidate that
+//! answered is remembered until its advertisement expires.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -132,17 +135,16 @@ impl Pool {
         let mut tried = Vec::new();
         let count = candidates.len();
         for (i, cand) in candidates.into_iter().enumerate() {
-            let share = candidate_share(deadline, count - i);
-            let outcome = bounded(share, inner.call_at(&cand, &c, share)).await;
-            match outcome {
-                Ok(v) => {
-                    inner.remember(key, cand);
-                    return Ok(v);
+            match inner
+                .reach(&cand, candidate_share(deadline, count - i))
+                .await
+            {
+                Ok(link) => {
+                    let outcome =
+                        bounded(deadline, inner.call_at(&link, &cand, &c, deadline)).await;
+                    return inner.settled(key, cand, outcome);
                 }
-                Err(e @ PoolError::Link(LinkError::Provider { .. })) => {
-                    inner.remember(key, cand);
-                    return Err(e);
-                }
+                Err(PoolError::Closed) => return Err(PoolError::Closed),
                 Err(e) => {
                     inner.forget(&key);
                     tried.push((cand.provider, e));
@@ -174,8 +176,10 @@ impl Pool {
     }
 
     /// Opens a streaming session at a provider of the procedure, reached as
-    /// [`Pool::call`] reaches one. The stream is open once its STREAM_OPEN
-    /// is sent; a provider's or station's refusal arrives on its first recv.
+    /// [`Pool::call`] reaches one: the next candidate only when a station
+    /// cannot be reached, and the link's own outcome is final. The stream is
+    /// open once its STREAM_OPEN is sent; a provider's or station's refusal
+    /// arrives on its first recv.
     pub async fn open_stream(&self, c: StreamCall) -> Result<Stream, PoolError> {
         let inner = &self.inner;
         let realm_key = inner.realm_key_for(&c.realm, &c.procedure)?;
@@ -189,12 +193,15 @@ impl Pool {
         let mut tried = Vec::new();
         let count = candidates.len();
         for (i, cand) in candidates.into_iter().enumerate() {
-            let share = candidate_share(deadline, count - i);
-            match bounded(share, inner.open_at(&cand, &c, share)).await {
-                Ok(stream) => {
-                    inner.remember(key, cand);
-                    return Ok(stream);
+            match inner
+                .reach(&cand, candidate_share(deadline, count - i))
+                .await
+            {
+                Ok(link) => {
+                    let outcome = bounded(deadline, inner.open_at(&link, &cand, &c)).await;
+                    return inner.settled(key, cand, outcome);
                 }
+                Err(PoolError::Closed) => return Err(PoolError::Closed),
                 Err(e) => {
                     inner.forget(&key);
                     tried.push((cand.provider, e));
@@ -326,14 +333,38 @@ impl PoolInner {
         Ok(out)
     }
 
+    /// A link to the candidate's serving station, reached by `share`.
+    /// Nothing is sent.
+    async fn reach(self: &Arc<Self>, cand: &Candidate, share: Instant) -> Result<Link, PoolError> {
+        bounded(share, self.link_to(&cand.provider.station, share)).await
+    }
+
+    /// The outcome of a call or stream sent to `cand`, final whatever it is:
+    /// a CALL that went out is never sent again elsewhere. A candidate whose
+    /// provider answered is remembered, one that did not is forgotten.
+    fn settled<T>(
+        &self,
+        key: ResolvedKey,
+        cand: Candidate,
+        outcome: Result<T, PoolError>,
+    ) -> Result<T, PoolError> {
+        match &outcome {
+            Ok(_) | Err(PoolError::Link(LinkError::Provider { .. })) => self.remember(key, cand),
+            Err(_) => self.forget(&key),
+        }
+        outcome
+    }
+
+    /// Calls the candidate's provider on `link`, under what is left before
+    /// `deadline`.
     async fn call_at(
-        self: &Arc<Self>,
+        &self,
+        link: &Link,
         cand: &Candidate,
         c: &Call,
-        share: Instant,
+        deadline: Instant,
     ) -> Result<Value, PoolError> {
-        let link = self.link_to(&cand.provider.station, share).await?;
-        let left = share.saturating_duration_since(Instant::now());
+        let left = deadline.saturating_duration_since(Instant::now());
         Ok(link
             .call(station_link::Call {
                 realm: c.realm,
@@ -347,13 +378,13 @@ impl PoolInner {
             .await?)
     }
 
+    /// Opens the stream at the candidate's provider on `link`.
     async fn open_at(
-        self: &Arc<Self>,
+        &self,
+        link: &Link,
         cand: &Candidate,
         c: &StreamCall,
-        share: Instant,
     ) -> Result<Stream, PoolError> {
-        let link = self.link_to(&cand.provider.station, share).await?;
         Ok(link
             .open_stream(station_link::StreamCall {
                 realm: c.realm,
