@@ -7,6 +7,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -535,4 +536,129 @@ async fn a_procedure_in_the_node_s_own_namespace_needs_no_realm_key() {
         .call(call(realm, PROCEDURE, Value::Map(vec![])))
         .await;
     assert!(matches!(org, Err(PoolError::NoRealmKey)), "{org:?}");
+}
+
+/// Two providers of PROCEDURE with `offer`'s handler, each serving from its
+/// own station, the stations sharing a DHT, so a caller finds two
+/// candidates; and a caller linked to the first station. Answers the caller
+/// and the providers, which must outlive the test's calls.
+async fn two_station_providers(
+    lab: &Lab,
+    name: &str,
+    offer: impl Fn() -> Offer,
+) -> (Pool, LabRealm, Vec<Pool>) {
+    let (a, b) = (
+        lab.station(&format!("{name} a")),
+        lab.station(&format!("{name} b")),
+    );
+    lab.share(&[&a, &b]);
+    let realm = lab.realm(name, ORG);
+    let mut providers = Vec::new();
+    for s in [&a, &b] {
+        let pk = key(Profile::PqPure);
+        lab.admit(&realm, s, &[id(&pk)]);
+        let provider = connect(&pk, Some(&realm), &[s]).await;
+        provider.serve(offer_in(&realm, offer())).await.unwrap();
+        providers.push(provider);
+    }
+    let caller = connect(&key(Profile::PqPure), Some(&realm), &[&a]).await;
+    let mut found = 0;
+    for _ in 0..500 {
+        found = caller
+            .providers(&realm.id, PROCEDURE)
+            .await
+            .map(|p| p.len())
+            .unwrap_or(0);
+        if found == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(found, 2, "both candidates");
+    (caller, realm, providers)
+}
+
+// macula-io/macula-rust#6: a CALL that has gone out is never sent again. A
+// handler slower than one candidate's share of the deadline is entered once
+// and its answer returned, for the share bounds reaching a station, not the
+// call (macula's call_work and failure_scope/1; macula-go#8). A retry would
+// run a handler that is not idempotent twice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_that_went_out_is_never_sent_again() {
+    let lab = Lab::start(Profile::PqPure);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let counted = entered.clone();
+    let (caller, realm, _providers) = two_station_providers(&lab, "once", move || {
+        let counted = counted.clone();
+        Offer::unary(
+            [0; 32],
+            PROCEDURE,
+            handler(move |r| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    Ok(r.payload)
+                }
+            }),
+        )
+    })
+    .await;
+    let mut c = call(realm.id, PROCEDURE, Value::text("hello"));
+    c.timeout = Duration::from_secs(4);
+    let answered = caller.call(c).await;
+    assert!(
+        matches!(&answered, Ok(v) if *v == Value::text("hello")),
+        "the one provider's answer: {answered:?}"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        entered.load(Ordering::SeqCst),
+        1,
+        "the handler entered once"
+    );
+}
+
+// A stream the link refuses is not walked to the next candidate: every
+// candidate would refuse it alike, as macula scopes open_too_large to the
+// request.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_the_link_refuses_is_not_walked() {
+    let lab = Lab::start(Profile::PqPure);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let counted = entered.clone();
+    let (caller, realm, _providers) = two_station_providers(&lab, "once-stream", move || {
+        let counted = counted.clone();
+        Offer::stream(
+            [0; 32],
+            PROCEDURE,
+            StreamMode::ServerStream,
+            stream_handler(move |s| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    s.close().await.map_err(|e| e.to_string())
+                }
+            }),
+        )
+    })
+    .await;
+    let opened = caller
+        .open_stream(StreamCall {
+            realm: realm.id,
+            procedure: PROCEDURE.to_string(),
+            mode: StreamMode::ServerStream,
+            payload: Value::text("x".repeat(2 << 20)),
+            ..StreamCall::default()
+        })
+        .await;
+    assert!(
+        matches!(
+            opened,
+            Err(PoolError::Link(LinkError::StreamOpenTooLarge(_)))
+        ),
+        "the link's refusal alone: {:?}",
+        opened.map(|_| ())
+    );
+    assert_eq!(entered.load(Ordering::SeqCst), 0, "no handler entered");
 }
