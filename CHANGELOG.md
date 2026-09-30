@@ -13,6 +13,34 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [Unreleased]
+
+#### Fixed
+
+- A macula 13 advertisement that names its provider's KEM key is read, not
+  refused. macula 12.11 and later let an advertisement carry `kem_key` and
+  `kem_key_id` (E2E design, amendment A1), and this SDK held an advertisement
+  to exactly four or five fields, so a provider with `kem_advertise` on was
+  malformed here and its procedure had no trusted provider. The pair is now
+  checked as macula_record's `kem_key_pair/1` checks it: both or neither, a key
+  of a profile's size, its id the first 8 bytes of its SHA-384. Both fields
+  sit under the advertiser's signature, so a relay that strips or swaps them
+  fails verification.
+
+#### Added
+
+- `seal`: a KEM key's id and carried sizes, pinned by macula v13.3.0's
+  `e2e_seal_v1.json` (`tests/vectors/seal/`).
+- `ProcedureAdvertisement::kem_key` and `ProcedureAdvertisementOptions::kem_key`.
+- `Call::confidential` and `StreamCall::confidential`: `Confidentiality::Preferred`
+  (the default) or `Required`, parsed from "preferred" or "required" as
+  macula-go's call options are; "off" and anything else are refused. This SDK
+  seals nothing yet, so it never calls a provider whose advertisement names a
+  key in the clear, and `Required` calls no provider: when no candidate is
+  left the call fails before anything is sent, with
+  `PoolError::Confidentiality` naming `no_kem_key` and the advertised key ids.
+  A node this SDK serves from names no key.
+
 ### [0.5.1] - 2026-09-28
 
 #### Fixed
@@ -380,6 +408,10 @@ did, but the two have moved at different paces ever since).
 ### [ffi-0.5.0] - Unreleased
 
 #### Added
+
+- `FfiError::Confidentiality { reason, advertised }`: a call or an open to
+  providers that all name a KEM key this SDK cannot seal to yet, so nothing was
+  sent.
 
 - `FfiPool::share_content`, `unshare_content` and `get_content`, with
   `FfiContentOptions` (zero for macula's defaults). New `FfiError`s:

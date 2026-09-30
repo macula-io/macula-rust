@@ -14,3 +14,4 @@ draft's vector for id-MLDSA87-RSA4096-PSS-SHA512 as macula v12.7.0 carries it.
 | `frame/` | signed neighbour frames |
 | `record/` | own-namespace procedure advertisements and their verdicts |
 | `manifest/` | content manifests and their ids |
+| `seal/` | E2E seal scheme 1's recipient keys and ids, copied unchanged from macula v13.3.0's `test/vectors/e2e_seal_v1.json` |

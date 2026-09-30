@@ -394,6 +394,7 @@ fn chain(org_name: &str, delegate_to_other: bool, directory_ms: u64) -> Chain {
                 org_directory: directory,
                 procedure_delegation: delegation,
             },
+            kem_key: None,
             ttl_ms: 0,
         },
     )
@@ -474,4 +475,198 @@ fn an_org_procedure_without_an_authorization_is_refused() {
         verify_authorization(&v, &trust, now() as i64),
         Err(RecordError::NoAuthorization)
     ));
+}
+
+/// A recipient key and its id from macula's E2E seal vectors (v13.3.0).
+fn seal_vector_key(profile: &str) -> (Vec<u8>, [u8; 8]) {
+    let text = std::fs::read_to_string("tests/vectors/seal/e2e_seal_v1.json").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let r = &v["recipients"][profile];
+    let key = hex::decode(r["key_as_carried"].as_str().unwrap()).unwrap();
+    let id = hex::decode(r["key_id"].as_str().unwrap()).unwrap();
+    (key, id.try_into().unwrap())
+}
+
+/// An own-namespace advertisement's payload by `node_id`, with `extra`
+/// entries after its four fields.
+fn advertisement_payload(node_id: &[u8; 32], extra: Vec<(Value, Value)>) -> Value {
+    let mut entries = vec![
+        (Value::text("realm_id"), Value::Bytes(vec![3; 32])),
+        (
+            Value::text("procedure"),
+            Value::text(own_procedure(node_id, "sealed")),
+        ),
+        (
+            Value::text("advertiser_node"),
+            Value::Bytes(node_id.to_vec()),
+        ),
+        (Value::text("serving_station"), Value::Bytes(vec![4; 32])),
+    ];
+    entries.extend(extra);
+    Value::Map(entries)
+}
+
+fn kem_pair(key: &[u8], id: &[u8]) -> Vec<(Value, Value)> {
+    vec![
+        (Value::text("kem_key"), Value::Bytes(key.to_vec())),
+        (Value::text("kem_key_id"), Value::Bytes(id.to_vec())),
+    ]
+}
+
+#[test]
+fn a_kem_key_id_is_its_key_s_sha384_prefix_as_macula_names_it() {
+    for (profile, p) in [
+        ("pq_pure", Profile::PqPure),
+        ("pq_hybrid", Profile::PqHybrid),
+    ] {
+        let (key, id) = seal_vector_key(profile);
+        assert_eq!(
+            key.len(),
+            macula_rust::seal::carried_key_size(p),
+            "{profile}"
+        );
+        assert_eq!(macula_rust::seal::key_id(&key), id, "{profile}");
+    }
+}
+
+#[test]
+fn an_advertisement_names_a_provider_s_kem_key_with_its_id() {
+    let key = identity();
+    let node_id = key.node_id().unwrap();
+    for profile in ["pq_pure", "pq_hybrid"] {
+        let (kem_key, id) = seal_vector_key(profile);
+        let ad = new_procedure_advertisement(
+            &node_id,
+            &[3; 32],
+            "acme/echo",
+            &[4; 32],
+            &ProcedureAdvertisementOptions {
+                kem_key: Some(kem_key.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let v = verified(&encode(&sign(&ad, &key).unwrap()).unwrap());
+        let read = read_procedure_advertisement(v.record()).unwrap();
+        assert_eq!(read.kem_key, Some((kem_key, id)), "{profile}");
+    }
+    let plain = new_procedure_advertisement(
+        &node_id,
+        &[3; 32],
+        "acme/echo",
+        &[4; 32],
+        &ProcedureAdvertisementOptions::default(),
+    )
+    .unwrap();
+    let v = verified(&encode(&sign(&plain, &key).unwrap()).unwrap());
+    assert_eq!(
+        read_procedure_advertisement(v.record()).unwrap().kem_key,
+        None
+    );
+
+    let short = new_procedure_advertisement(
+        &node_id,
+        &[3; 32],
+        "acme/echo",
+        &[4; 32],
+        &ProcedureAdvertisementOptions {
+            kem_key: Some(vec![1; 32]),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(short, Err(RecordError::Malformed(_))), "{short:?}");
+}
+
+/// `altered`'s key and signed bytes under `original`'s signature: what a relay
+/// that rewrote a signed record would hand on.
+fn spliced(original: &[u8], altered: &[u8]) -> Vec<u8> {
+    let (Value::Map(o), Value::Map(a)) = (
+        cbor::decode(original).unwrap(),
+        cbor::decode(altered).unwrap(),
+    ) else {
+        panic!("a signed record is a map");
+    };
+    let signature = o
+        .iter()
+        .find(|(k, _)| *k == Value::text("signature"))
+        .unwrap()
+        .clone();
+    let fields: Vec<(Value, Value)> = a
+        .into_iter()
+        .map(|(k, v)| {
+            if k == Value::text("signature") {
+                signature.clone()
+            } else {
+                (k, v)
+            }
+        })
+        .collect();
+    cbor::encode(&Value::Map(fields)).unwrap()
+}
+
+#[test]
+fn a_kem_key_stripped_or_altered_on_the_way_fails_verification() {
+    let key = identity();
+    let node_id = key.node_id().unwrap();
+    let (kem_key, id) = seal_vector_key("pq_pure");
+    let (other_key, other_id) = seal_vector_key("pq_hybrid");
+    let t = now();
+    let sign_payload = |extra| {
+        hand_signed(
+            &key,
+            0x06,
+            advertisement_payload(&node_id, extra),
+            t,
+            MINUTE,
+        )
+    };
+    let original = sign_payload(kem_pair(&kem_key, &id));
+    assert!(verify(&original, P, t as i64).is_ok());
+    for altered in [
+        sign_payload(Vec::new()),
+        sign_payload(kem_pair(&other_key, &other_id)),
+    ] {
+        assert!(verify(&altered, P, t as i64).is_ok());
+        let relayed = verify(&spliced(&original, &altered), P, t as i64);
+        assert!(relayed.is_err(), "{relayed:?}");
+    }
+}
+
+#[test]
+fn a_lone_or_mismatched_kem_key_is_malformed() {
+    let key = identity();
+    let node_id = key.node_id().unwrap();
+    let (kem_key, id) = seal_vector_key("pq_pure");
+    let (_, other_id) = seal_vector_key("pq_hybrid");
+    let t = now();
+    let short = vec![1; 32];
+    for (what, extra) in [
+        ("a key alone", vec![kem_pair(&kem_key, &id)[0].clone()]),
+        ("an id alone", vec![kem_pair(&kem_key, &id)[1].clone()]),
+        ("another key's id", kem_pair(&kem_key, &other_id)),
+        (
+            "a key of no profile's size",
+            kem_pair(&short, &macula_rust::seal::key_id(&short)),
+        ),
+        (
+            "a key that is text",
+            vec![
+                (Value::text("kem_key"), Value::text("key")),
+                (Value::text("kem_key_id"), Value::Bytes(id.to_vec())),
+            ],
+        ),
+    ] {
+        let wire = hand_signed(
+            &key,
+            0x06,
+            advertisement_payload(&node_id, extra),
+            t,
+            MINUTE,
+        );
+        let refused = verify(&wire, P, t as i64);
+        assert!(
+            matches!(refused, Err(RecordError::Malformed(_))),
+            "{what}: {refused:?}"
+        );
+    }
 }

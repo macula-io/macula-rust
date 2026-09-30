@@ -16,6 +16,7 @@ pub mod petname;
 pub mod pool;
 pub mod profile;
 pub mod record;
+pub mod seal;
 pub mod signed_object;
 pub mod statement_issuer;
 pub mod station_link;

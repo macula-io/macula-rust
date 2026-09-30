@@ -4,6 +4,7 @@
 //! exactly their keys. A domain type's owner sets its rules.
 
 use crate::cbor::Value;
+use crate::seal;
 
 use super::{signed_by_some_key, RecordType};
 
@@ -48,7 +49,8 @@ pub(super) fn payload_ok(t: RecordType, payload: &Value) -> bool {
 }
 
 /// Exactly realm_id, procedure, advertiser_node and serving_station, with an
-/// authorization map when it carries one.
+/// authorization map when it carries one, and a KEM key pair when it names
+/// one.
 fn advertisement_ok(payload: &Value, size: usize) -> bool {
     if !is_id(payload.get("realm_id"))
         || !is_text(payload.get("procedure"))
@@ -57,10 +59,27 @@ fn advertisement_ok(payload: &Value, size: usize) -> bool {
     {
         return false;
     }
-    match payload.get("authorization") {
-        None => size == 4,
-        Some(Value::Map(_)) => size == 5,
-        Some(_) => false,
+    let authorization = match payload.get("authorization") {
+        None => 0,
+        Some(Value::Map(_)) => 1,
+        Some(_) => return false,
+    };
+    kem_key_pair(payload).is_some_and(|pair| size == 4 + authorization + pair)
+}
+
+/// A provider's KEM key and its id travel only as a pair (E2E design,
+/// amendment A1), as macula_record's kem_key_pair/1: the key as carried, of
+/// a profile's size, and its id. The two count 2, their absence 0; a lone
+/// field, a key of another size or an id that is not its key's is malformed.
+fn kem_key_pair(payload: &Value) -> Option<usize> {
+    match (payload.get("kem_key"), payload.get("kem_key_id")) {
+        (None, None) => Some(0),
+        (Some(Value::Bytes(key)), Some(Value::Bytes(id)))
+            if seal::is_carried_key_size(key.len()) && seal::key_id(key).as_slice() == id =>
+        {
+            Some(2)
+        }
+        _ => None,
     }
 }
 

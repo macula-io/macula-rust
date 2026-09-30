@@ -15,7 +15,10 @@ use common::lab::{Lab, LabRealm, LabStation};
 use macula_rust::cbor::Value;
 use macula_rust::frame::StreamMode;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Call, Offer, Opts, Pool, PoolError, Seed, StreamCall};
+use macula_rust::pool::{
+    Call, Confidentiality, ConfidentialityError, ConfidentialityReason, Offer, Opts, Pool,
+    PoolError, Seed, StreamCall,
+};
 use macula_rust::profile::Profile;
 use macula_rust::record::{
     self, new_node_record, new_procedure_advertisement, new_station_endpoint,
@@ -661,4 +664,71 @@ async fn a_stream_the_link_refuses_is_not_walked() {
         opened.map(|_| ())
     );
     assert_eq!(entered.load(Ordering::SeqCst), 0, "no handler entered");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_required_call_reaches_no_provider_that_names_no_kem_key() {
+    let lab = Lab::start(Profile::PqPure);
+    let s = lab.station("required");
+    let realm = [0x43; 32];
+    let pk = key(Profile::PqPure);
+    let provider = connect(&pk, None, &[&s]).await;
+    let ring = record::own_procedure(&provider.node_id(), "ring");
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    provider
+        .serve(Offer::unary(
+            realm,
+            &ring,
+            handler(move |r| {
+                let tx = tx.clone();
+                async move {
+                    tx.send(()).unwrap();
+                    Ok(r.payload)
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let caller = connect(&key(Profile::PqPure), None, &[&s]).await;
+
+    let required = caller
+        .call(Call {
+            confidential: Confidentiality::Required,
+            ..call(realm, &ring, Value::text("kept"))
+        })
+        .await;
+    assert!(
+        matches!(
+            &required,
+            Err(PoolError::Confidentiality(ConfidentialityError {
+                reason: ConfidentialityReason::NoKemKey,
+                advertised,
+            })) if advertised.is_empty()
+        ),
+        "{required:?}"
+    );
+    let opened = caller
+        .open_stream(StreamCall {
+            realm,
+            procedure: ring.clone(),
+            confidential: Confidentiality::Required,
+            ..StreamCall::default()
+        })
+        .await;
+    assert!(
+        matches!(opened, Err(PoolError::Confidentiality(_))),
+        "{:?}",
+        opened.err()
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "a refused call reached the provider"
+    );
+
+    let preferred = caller
+        .call(call(realm, &ring, Value::text("clear")))
+        .await
+        .unwrap();
+    assert_eq!(preferred, Value::text("clear"));
+    assert!(rx.try_recv().is_ok());
 }

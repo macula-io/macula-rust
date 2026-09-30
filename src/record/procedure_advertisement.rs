@@ -5,6 +5,7 @@
 //! forms (see `authorization`).
 
 use crate::cbor::Value;
+use crate::seal::{self, KEY_ID_SIZE};
 
 use super::{entry, id_field, malformed, text_field, unsigned, Record, RecordError, RecordType};
 
@@ -28,11 +29,14 @@ pub enum Authorization {
     Malformed,
 }
 
-/// A procedure advertisement's optional fields: its authorization, and
-/// `ttl_ms`, 0 for the default and maximum, 5 minutes.
+/// A procedure advertisement's optional fields: its authorization, the
+/// provider's KEM key as carried, which the advertisement names with its id
+/// (macula 13, E2E design amendment A1), and `ttl_ms`, 0 for the default and
+/// maximum, 5 minutes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcedureAdvertisementOptions {
     pub authorization: Authorization,
+    pub kem_key: Option<Vec<u8>>,
     pub ttl_ms: u64,
 }
 
@@ -70,6 +74,16 @@ pub fn new_procedure_advertisement(
         Authorization::Unsupported => return Err(RecordError::AuthorizationFormUnsupported),
         Authorization::Malformed => return Err(malformed("an authorization in no form")),
     }
+    if let Some(key) = &opts.kem_key {
+        if !seal::is_carried_key_size(key.len()) {
+            return Err(malformed("a KEM key of no profile's size"));
+        }
+        entries.push(entry("kem_key", Value::Bytes(key.clone())));
+        entries.push(entry(
+            "kem_key_id",
+            Value::Bytes(seal::key_id(key).to_vec()),
+        ));
+    }
     Ok(unsigned(
         RecordType::PROCEDURE_ADVERTISEMENT,
         Value::Map(entries),
@@ -77,7 +91,9 @@ pub fn new_procedure_advertisement(
     ))
 }
 
-/// A procedure advertisement's payload.
+/// A procedure advertisement's payload. `kem_key` is the provider's KEM key
+/// as carried and its id, when the advertisement names one: a verified
+/// record's pair is well formed, the key's id its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProcedureAdvertisement {
     pub realm_id: [u8; 32],
@@ -85,6 +101,7 @@ pub struct ProcedureAdvertisement {
     pub advertiser_node: [u8; 32],
     pub serving_station: [u8; 32],
     pub authorization: Authorization,
+    pub kem_key: Option<(Vec<u8>, [u8; KEY_ID_SIZE])>,
 }
 
 /// Reads a procedure advertisement's payload.
@@ -99,7 +116,17 @@ pub fn read_procedure_advertisement(r: &Record) -> Result<ProcedureAdvertisement
         advertiser_node: id_field(p, "advertiser_node"),
         serving_station: id_field(p, "serving_station"),
         authorization: read_authorization(p),
+        kem_key: read_kem_key(p),
     })
+}
+
+fn read_kem_key(payload: &Value) -> Option<(Vec<u8>, [u8; KEY_ID_SIZE])> {
+    match (payload.get("kem_key"), payload.get("kem_key_id")) {
+        (Some(Value::Bytes(key)), Some(Value::Bytes(id))) => {
+            Some((key.clone(), id.as_slice().try_into().ok()?))
+        }
+        _ => None,
+    }
 }
 
 fn read_authorization(payload: &Value) -> Authorization {

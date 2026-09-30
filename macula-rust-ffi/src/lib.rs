@@ -93,6 +93,14 @@ pub enum FfiError {
     /// No answer within the timeout.
     #[error("timed out")]
     Timeout,
+    /// A call or an open that could not be kept confidential, so nothing was
+    /// sent: macula's reason (`no_kem_key`) and the 8-byte key ids the
+    /// trusted providers' advertisements named.
+    #[error("confidentiality: {reason}")]
+    Confidentiality {
+        reason: String,
+        advertised: Vec<Vec<u8>>,
+    },
     /// A record the DHT does not hold.
     #[error("record not found")]
     RecordNotFound,
@@ -160,6 +168,10 @@ impl From<PoolError> for FfiError {
             PoolError::NoRealmKey => FfiError::NoRealmKey,
             PoolError::Closed => FfiError::Closed,
             PoolError::NotShared => FfiError::NotShared,
+            PoolError::Confidentiality(e) => FfiError::Confidentiality {
+                reason: e.reason.name().to_string(),
+                advertised: e.advertised.iter().map(|id| id.to_vec()).collect(),
+            },
             e @ PoolError::ContentUnavailable(_) => FfiError::ContentUnavailable {
                 message: e.to_string(),
             },

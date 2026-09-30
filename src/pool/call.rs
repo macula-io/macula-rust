@@ -13,7 +13,9 @@
 //! most once (macula's call_work and failure_scope/1). A candidate that
 //! answered is remembered until its advertisement expires.
 
+use std::fmt;
 use std::future::Future;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,6 +24,7 @@ use tokio::time::Instant;
 use crate::cbor::Value;
 use crate::frame::StreamMode;
 use crate::record::{self, RecordType, Trust, Verified};
+use crate::seal::KEY_ID_SIZE;
 use crate::station_link::{self, Link, LinkError, Stream, DEFAULT_CALL_TIMEOUT};
 use crate::transport::Target;
 
@@ -30,10 +33,86 @@ use super::{Pool, PoolError, PoolInner};
 /// No candidate gets less than a second of a call's time.
 const MIN_CANDIDATE_SHARE: Duration = Duration::from_secs(1);
 
+/// How a call or an open must be kept, as macula-go's options name it
+/// (macula 13, E2E design §8): `Preferred`, the default, or `Required`.
+/// There is no `off`: only an advertisement naming no key is called in the
+/// clear. This SDK seals nothing yet, so a provider whose advertisement names
+/// a KEM key is never called, and `Required` calls no provider: a lookup can
+/// deny a call, never downgrade it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Confidentiality {
+    /// A provider whose advertisement names no KEM key is called in the
+    /// clear.
+    #[default]
+    Preferred,
+    /// Only a sealed call, which this SDK does not make yet.
+    Required,
+}
+
+impl FromStr for Confidentiality {
+    type Err = PoolError;
+
+    /// "preferred" (or "", the default) or "required"; "off" and anything
+    /// else are refused, as macula-go's call options refuse them.
+    fn from_str(s: &str) -> Result<Self, PoolError> {
+        match s {
+            "" | "preferred" => Ok(Confidentiality::Preferred),
+            "required" => Ok(Confidentiality::Required),
+            "off" => Err(PoolError::InvalidOpts(
+                "confidential off is refused for a call or an open: it is preferred or required"
+                    .into(),
+            )),
+            other => Err(PoolError::InvalidOpts(format!(
+                "confidential is preferred or required, not {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Why a call could not be kept confidential, as macula's
+/// {error, {confidentiality, Reason}} names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfidentialityReason {
+    /// Every trusted provider names a KEM key this node cannot seal to, or
+    /// the call requires a seal and none can be made.
+    NoKemKey,
+}
+
+impl ConfidentialityReason {
+    /// The reason as macula names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfidentialityReason::NoKemKey => "no_kem_key",
+        }
+    }
+}
+
+/// A call or an open that could not be kept confidential, and so was not
+/// made: nothing was sent. `advertised` holds the key ids the trusted
+/// providers' advertisements named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfidentialityError {
+    pub reason: ConfidentialityReason,
+    pub advertised: Vec<[u8; KEY_ID_SIZE]>,
+}
+
+impl fmt::Display for ConfidentialityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "confidentiality: {}", self.reason.name())?;
+        for id in &self.advertised {
+            f.write_str(" ")?;
+            for b in id {
+                write!(f, "{b:02x}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A call to a procedure: its realm and name, the provider to call (any
 /// trusted one when zero), the payload, how long to wait
-/// ([`DEFAULT_CALL_TIMEOUT`] when zero), and a UCAN and its proofs for a
-/// gated procedure.
+/// ([`DEFAULT_CALL_TIMEOUT`] when zero), a UCAN and its proofs for a gated
+/// procedure, and how it must be kept.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     pub realm: [u8; 32],
@@ -43,6 +122,7 @@ pub struct Call {
     pub timeout: Duration,
     pub token: Option<Vec<u8>>,
     pub proofs: Vec<Vec<u8>>,
+    pub confidential: Confidentiality,
 }
 
 impl Default for Call {
@@ -55,14 +135,15 @@ impl Default for Call {
             timeout: Duration::ZERO,
             token: None,
             proofs: Vec::new(),
+            confidential: Confidentiality::Preferred,
         }
     }
 }
 
 /// A streaming session to open: its realm and name, the provider (any
 /// trusted one when zero), the mode, the open's payload, its deadline (the
-/// link's default when zero), and a UCAN and its proofs for a gated
-/// procedure. Its default mode is server_stream.
+/// link's default when zero), a UCAN and its proofs for a gated procedure,
+/// and how it must be kept. Its default mode is server_stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamCall {
     pub realm: [u8; 32],
@@ -73,6 +154,7 @@ pub struct StreamCall {
     pub deadline: Duration,
     pub token: Option<Vec<u8>>,
     pub proofs: Vec<Vec<u8>>,
+    pub confidential: Confidentiality,
 }
 
 impl Default for StreamCall {
@@ -86,6 +168,7 @@ impl Default for StreamCall {
             deadline: Duration::ZERO,
             token: None,
             proofs: Vec::new(),
+            confidential: Confidentiality::Preferred,
         }
     }
 }
@@ -97,12 +180,14 @@ pub struct Provider {
     pub station: [u8; 32],
 }
 
-/// A trusted advertisement: its provider, serving station and times.
+/// A trusted advertisement: its provider, serving station, times, and the
+/// id of the KEM key it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Candidate {
     provider: Provider,
     expires_at: u64,
     created_at: u64,
+    kem_key_id: Option<[u8; KEY_ID_SIZE]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -132,6 +217,7 @@ impl Pool {
             provider: c.provider,
         };
         let candidates = bounded(deadline, inner.candidates(&key, realm_key)).await?;
+        let candidates = callable(candidates, c.confidential)?;
         let mut tried = Vec::new();
         let count = candidates.len();
         for (i, cand) in candidates.into_iter().enumerate() {
@@ -190,6 +276,7 @@ impl Pool {
             provider: c.provider,
         };
         let candidates = bounded(deadline, inner.candidates(&key, realm_key)).await?;
+        let candidates = callable(candidates, c.confidential)?;
         let mut tried = Vec::new();
         let count = candidates.len();
         for (i, cand) in candidates.into_iter().enumerate() {
@@ -323,6 +410,7 @@ impl PoolInner {
                     },
                     expires_at: v.record().expires_at,
                     created_at: v.record().created_at,
+                    kem_key_id: ad.kem_key.map(|(_, id)| id),
                 })
             })
             .collect();
@@ -534,4 +622,118 @@ async fn bounded<T>(
 
 fn now_ms() -> i64 {
     crate::uuid_v7::now_ms() as i64
+}
+
+/// The candidates a call or an open under `confidential` may reach, in their
+/// order, before anything is sent: under `Preferred` those whose
+/// advertisement names no KEM key, under `Required` none, since this SDK
+/// seals nothing yet. A provider that names a key is never called in the
+/// clear. None left is a [`ConfidentialityError`] naming the advertised key
+/// ids.
+fn callable(
+    candidates: Vec<Candidate>,
+    confidential: Confidentiality,
+) -> Result<Vec<Candidate>, PoolError> {
+    let advertised: Vec<[u8; KEY_ID_SIZE]> =
+        candidates.iter().filter_map(|c| c.kem_key_id).collect();
+    let clear: Vec<Candidate> = match confidential {
+        Confidentiality::Preferred => candidates
+            .into_iter()
+            .filter(|c| c.kem_key_id.is_none())
+            .collect(),
+        Confidentiality::Required => Vec::new(),
+    };
+    if clear.is_empty() {
+        return Err(PoolError::Confidentiality(ConfidentialityError {
+            reason: ConfidentialityReason::NoKemKey,
+            advertised,
+        }));
+    }
+    Ok(clear)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(node: u8, kem_key_id: Option<[u8; KEY_ID_SIZE]>) -> Candidate {
+        Candidate {
+            provider: Provider {
+                node: [node; 32],
+                station: [9; 32],
+            },
+            expires_at: 0,
+            created_at: 0,
+            kem_key_id,
+        }
+    }
+
+    fn refused(r: Result<Vec<Candidate>, PoolError>) -> ConfidentialityError {
+        match r {
+            Err(PoolError::Confidentiality(e)) => e,
+            other => panic!("not a confidentiality refusal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preferred_calls_only_the_providers_that_name_no_key() {
+        let kept = callable(
+            vec![cand(1, Some([7; 8])), cand(2, None), cand(3, None)],
+            Confidentiality::Preferred,
+        )
+        .unwrap();
+        assert_eq!(kept, vec![cand(2, None), cand(3, None)]);
+    }
+
+    #[test]
+    fn a_provider_that_names_a_key_is_never_called_in_the_clear() {
+        let e = refused(callable(
+            vec![cand(1, Some([7; 8])), cand(2, Some([8; 8]))],
+            Confidentiality::Preferred,
+        ));
+        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
+        assert_eq!(e.advertised, vec![[7; 8], [8; 8]]);
+        assert_eq!(
+            e.to_string(),
+            "confidentiality: no_kem_key 0707070707070707 0808080808080808"
+        );
+    }
+
+    #[test]
+    fn required_calls_no_provider_until_this_sdk_seals() {
+        let e = refused(callable(
+            vec![cand(1, None), cand(2, Some([7; 8]))],
+            Confidentiality::Required,
+        ));
+        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
+        assert_eq!(e.advertised, vec![[7; 8]]);
+        let e = refused(callable(vec![cand(1, None)], Confidentiality::Required));
+        assert!(e.advertised.is_empty());
+    }
+
+    #[test]
+    fn confidential_is_preferred_or_required_and_off_is_refused() {
+        assert_eq!(Confidentiality::default(), Confidentiality::Preferred);
+        assert_eq!(
+            "".parse::<Confidentiality>().unwrap(),
+            Confidentiality::Preferred
+        );
+        assert_eq!(
+            "preferred".parse::<Confidentiality>().unwrap(),
+            Confidentiality::Preferred
+        );
+        assert_eq!(
+            "required".parse::<Confidentiality>().unwrap(),
+            Confidentiality::Required
+        );
+        for refused in ["off", "Required", "none", "optional"] {
+            assert!(
+                matches!(
+                    refused.parse::<Confidentiality>(),
+                    Err(PoolError::InvalidOpts(_))
+                ),
+                "{refused}"
+            );
+        }
+    }
 }

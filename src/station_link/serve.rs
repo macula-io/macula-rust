@@ -211,9 +211,12 @@ impl Link {
     ) -> Result<(Record, Vec<u8>), LinkError> {
         let inner = &self.inner;
         let max_ttl_ms = max_ttl.as_millis() as u64;
+        // This node opens no sealed request, so its advertisement names no
+        // KEM key: callers reach it in the clear.
         let opts = if record::in_own_namespace(&o.procedure) {
             ProcedureAdvertisementOptions {
                 authorization: Authorization::None,
+                kem_key: None,
                 ttl_ms: max_ttl_ms,
             }
         } else {
@@ -240,6 +243,7 @@ impl Link {
                     org_directory: record::encode(directory.record())?,
                     procedure_delegation: record::encode(delegation.record())?,
                 },
+                kem_key: None,
                 ttl_ms: ttl as u64,
             }
         };

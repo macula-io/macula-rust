@@ -22,7 +22,9 @@ mod member;
 mod pubsub;
 mod serve;
 
-pub use call::{Call, Provider, StreamCall};
+pub use call::{
+    Call, Confidentiality, ConfidentialityError, ConfidentialityReason, Provider, StreamCall,
+};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};
@@ -101,12 +103,16 @@ pub enum PoolError {
     ContentTooLarge(String),
     /// An answer a sharer never gives, and what it was.
     ContentReply(String),
+    /// A call or an open that could not be kept confidential, so nothing
+    /// was sent.
+    Confidentiality(ConfidentialityError),
 }
 
 impl fmt::Display for PoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PoolError::Link(e) => write!(f, "{e}"),
+            PoolError::Confidentiality(e) => write!(f, "{e}"),
             PoolError::NoProvider(tried) if tried.is_empty() => {
                 f.write_str("no trusted provider advertises the procedure")
             }
