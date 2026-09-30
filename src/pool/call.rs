@@ -13,6 +13,7 @@
 //! most once (macula's call_work and failure_scope/1). A candidate that
 //! answered is remembered until its advertisement expires.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
@@ -625,21 +626,27 @@ fn now_ms() -> i64 {
 }
 
 /// The candidates a call or an open under `confidential` may reach, in their
-/// order, before anything is sent: under `Preferred` those whose
-/// advertisement names no KEM key, under `Required` none, since this SDK
-/// seals nothing yet. A provider that names a key is never called in the
-/// clear. None left is a [`ConfidentialityError`] naming the advertised key
-/// ids.
+/// order, before anything is sent: under `Preferred` the providers none of
+/// whose advertisements names a KEM key, under `Required` none, since this
+/// SDK seals nothing yet. A provider that names a key is never called in the
+/// clear, not even through an older keyless advertisement the DHT still
+/// serves while it rotates. None left is a [`ConfidentialityError`] naming
+/// the advertised key ids.
 fn callable(
     candidates: Vec<Candidate>,
     confidential: Confidentiality,
 ) -> Result<Vec<Candidate>, PoolError> {
     let advertised: Vec<[u8; KEY_ID_SIZE]> =
         candidates.iter().filter_map(|c| c.kem_key_id).collect();
+    let keyed: HashSet<[u8; 32]> = candidates
+        .iter()
+        .filter(|c| c.kem_key_id.is_some())
+        .map(|c| c.provider.node)
+        .collect();
     let clear: Vec<Candidate> = match confidential {
         Confidentiality::Preferred => candidates
             .into_iter()
-            .filter(|c| c.kem_key_id.is_none())
+            .filter(|c| !keyed.contains(&c.provider.node))
             .collect(),
         Confidentiality::Required => Vec::new(),
     };
@@ -697,6 +704,21 @@ mod tests {
             e.to_string(),
             "confidentiality: no_kem_key 0707070707070707 0808080808080808"
         );
+    }
+
+    #[test]
+    fn a_provider_that_names_a_key_is_not_called_through_its_older_keyless_ad() {
+        let e = refused(callable(
+            vec![cand(1, Some([7; 8])), cand(1, None)],
+            Confidentiality::Preferred,
+        ));
+        assert_eq!(e.advertised, vec![[7; 8]]);
+        let kept = callable(
+            vec![cand(1, Some([7; 8])), cand(1, None), cand(2, None)],
+            Confidentiality::Preferred,
+        )
+        .unwrap();
+        assert_eq!(kept, vec![cand(2, None)]);
     }
 
     #[test]
