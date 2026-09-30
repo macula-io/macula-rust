@@ -651,7 +651,7 @@ fn received(inner: &Arc<Inner>, payload: &[u8], recv_seq: &mut u64) -> Result<()
             .store(expires_at + STATUS_GRACE_MS, Ordering::SeqCst);
         return Ok(());
     }
-    if let Some((kind, nonce)) = frame::liveness_nonce(&v) {
+    if let Some((kind, nonce)) = liveness_frame(inner.version, &v)? {
         return liveness(inner, kind, nonce);
     }
     let opened = opened(inner, &v, &frame_type, recv_seq)?;
@@ -697,17 +697,31 @@ fn opened(
     Ok(opened)
 }
 
+/// A liveness frame as a link of `version` reads it: its kind and nonce, or
+/// `None` for any other frame. It exists only on v5, and there it is read as
+/// every v5 frame is, so one that carries a neighbour signature ends the link
+/// as malformed, as on v4 any liveness frame does.
+fn liveness_frame(
+    version: i64,
+    v: &Value,
+) -> Result<Option<(Liveness, [u8; frame::LIVENESS_NONCE_SIZE])>, LinkError> {
+    let Some(found) = frame::liveness_nonce(v) else {
+        return Ok(None);
+    };
+    if version != VERSION_5 {
+        return Err(LinkError::Frame(FrameError::Malformed));
+    }
+    frame::verify_session_frame(v)?;
+    Ok(Some(found))
+}
+
 /// Answers the station's liveness_ping with a liveness_pong of the same
-/// nonce, and hands a liveness_pong to the probe. Neither goes further, and
-/// on a v4 link neither exists.
+/// nonce, and hands a liveness_pong to the probe. Neither goes further.
 fn liveness(
     inner: &Arc<Inner>,
     kind: Liveness,
     nonce: [u8; frame::LIVENESS_NONCE_SIZE],
 ) -> Result<(), LinkError> {
-    if inner.version != VERSION_5 {
-        return Err(LinkError::Frame(FrameError::Malformed));
-    }
     match kind {
         Liveness::Ping => {
             let inner = inner.clone();
@@ -772,4 +786,46 @@ fn frame_type_of(v: &Value) -> String {
 
 fn now_ms() -> i64 {
     crate::uuid_v7::now_ms() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_neighbour(v: Value) -> Value {
+        let Value::Map(mut pairs) = v else {
+            panic!("a frame is a map");
+        };
+        pairs.push((Value::text("neighbour"), Value::Map(Vec::new())));
+        Value::Map(pairs)
+    }
+
+    /// macula-go 2294f25: liveness frames are read after the session-mode
+    /// check, so a neighbour-signed one ends a v5 link.
+    #[test]
+    fn a_liveness_frame_is_read_as_every_v5_frame_and_exists_only_on_v5() {
+        let nonce = [9; frame::LIVENESS_NONCE_SIZE];
+        let ping = frame::liveness_ping_frame(&nonce);
+        let pong = frame::liveness_pong_frame(&nonce);
+        assert_eq!(
+            liveness_frame(VERSION_5, &ping),
+            Ok(Some((Liveness::Ping, nonce)))
+        );
+        assert_eq!(
+            liveness_frame(VERSION_5, &pong),
+            Ok(Some((Liveness::Pong, nonce)))
+        );
+        for signed in [with_neighbour(ping.clone()), with_neighbour(pong.clone())] {
+            assert_eq!(
+                liveness_frame(VERSION_5, &signed),
+                Err(LinkError::Frame(FrameError::Malformed))
+            );
+        }
+        assert_eq!(
+            liveness_frame(VERSION, &ping),
+            Err(LinkError::Frame(FrameError::Malformed))
+        );
+        let goodbye = frame::goodbye_frame("bye", None).unwrap();
+        assert_eq!(liveness_frame(VERSION_5, &goodbye), Ok(None));
+    }
 }
