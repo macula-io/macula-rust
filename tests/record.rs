@@ -670,3 +670,38 @@ fn a_lone_or_mismatched_kem_key_is_malformed() {
         );
     }
 }
+
+/// Keyed advertisements macula v13.3.0 signed, held to its verdicts: the
+/// keyed one reads with its key and id, every other is malformed.
+#[test]
+fn macula_s_keyed_advertisements_verify_as_macula_rules() {
+    let text =
+        std::fs::read_to_string("tests/vectors/seal/e2e_seal_v1_advertisements.json").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let mut checked = 0;
+    for (name, p) in v["profiles"].as_object().unwrap() {
+        let profile = Profile::parse(name).unwrap();
+        let now_ms = p["now_ms"].as_i64().unwrap();
+        for case in p["cases"].as_array().unwrap() {
+            let what = format!("{name} {}", case["name"]);
+            let wire = hex::decode(case["record"].as_str().unwrap()).unwrap();
+            let verified = verify(&wire, profile, now_ms);
+            match case["verdict"].as_str().unwrap() {
+                "accepted" => {
+                    let record = verified.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    let read = read_procedure_advertisement(record.record()).unwrap();
+                    let key = hex::decode(case["kem_key"].as_str().unwrap()).unwrap();
+                    let id = hex::decode(case["kem_key_id"].as_str().unwrap()).unwrap();
+                    assert_eq!(read.kem_key, Some((key, id.try_into().unwrap())), "{what}");
+                }
+                "malformed" => assert!(
+                    matches!(verified, Err(RecordError::Malformed(_))),
+                    "{what}: {verified:?}"
+                ),
+                other => panic!("{what}: an unknown verdict {other}"),
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 10);
+}
