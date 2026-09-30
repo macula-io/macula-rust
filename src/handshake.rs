@@ -14,8 +14,19 @@
 //! Every frame decodes under the decoding rule and must hold exactly the keys
 //! of its type, each of its type and length. Close reasons are local: a
 //! refusing station sends only a HELLO with one coarse refusal code.
+//!
+//! Version 5 (macula 13.2, DESIGN_NEIGHBOUR_CHANNEL_BINDING) binds both ends
+//! to the TLS session. The opener and the challenge stay version 4; the client
+//! picks 4 or 5 in CONNECT, and the station answers HELLO in the same version.
+//! In version 5 the CONNECT proof (V2) also covers E, the session's TLS
+//! exporter value, and the client's capabilities, and HELLO carries the
+//! station's session proof, signed by its identity key over E, both frames and
+//! both node_ids, only after every check on CONNECT has passed. A station with
+//! no exporter answers a v5 CONNECT as an old station does, with
+//! `unsupported_version`.
 
 use std::fmt;
+use std::sync::Arc;
 
 use sha2::{Digest, Sha384};
 
@@ -28,14 +39,33 @@ use crate::node_key::{
 };
 use crate::profile::Profile;
 
+#[cfg(test)]
+mod v5_tests;
+
 /// The handshake's frame version: 4, as macula 12's. A peer on another version
 /// hears `unsupported_version`.
 pub const VERSION: i64 = 4;
 
+/// The channel-bound handshake: both proofs over the TLS session's exporter
+/// value.
+pub const VERSION_5: i64 = 5;
+
+/// The TLS 1.3 exporter label (RFC 8446 section 7.5) handshake v5 binds to,
+/// over the context client node_id || station node_id, 32 bytes.
+pub const EXPORTER_LABEL: &str = "EXPORTER-macula-session-v1";
+
 const NONCE_SIZE: usize = 32;
+const EXPORTER_SIZE: usize = 32;
 const MAX_PROTOCOL_INT: i64 = 1 << 53;
 const MLDSA_KEY_SIZE: usize = 2592;
 const CONNECT_PROOF_LABEL: &[u8] = b"MACULA-PQ-CONNECT-PROOF-V1";
+const CONNECT_PROOF_LABEL_V2: &[u8] = b"MACULA-PQ-CONNECT-PROOF-V2";
+const SESSION_PROOF_LABEL: &[u8] = b"MACULA-PQ-SESSION-PROOF-V1";
+
+/// A TLS 1.3 session's exporter: label, context and length to bytes, or
+/// `None` when the session gives none. Both ends of one session export the
+/// same bytes.
+pub type Exporter = dyn Fn(&str, &[u8], usize) -> Option<Vec<u8>> + Send + Sync;
 
 const OPENER_KEYS: &[&str] = &["frame_type", "version"];
 const CHALLENGE_KEYS: &[&str] = &[
@@ -69,6 +99,13 @@ const HELLO_REFUSED_KEYS: &[&str] = &[
     "refusal_code",
     "version",
 ];
+const HELLO_PROVED_KEYS: &[&str] = &[
+    "accepted",
+    "capabilities",
+    "frame_type",
+    "session_proof",
+    "version",
+];
 const STATUS_KEYS: &[&str] = &["frame_type", "statement", "version"];
 
 /// The one coarse reason a refusing HELLO carries.
@@ -78,6 +115,9 @@ pub enum RefusalCode {
     UnsupportedVersion,
     /// A node_id that misses the puzzle, which the client can check itself.
     PuzzleInvalid,
+    /// A v5 CONNECT past the station's session proof budget. Only a v5 HELLO
+    /// carries it.
+    SessionProofRate,
     /// A CONNECT that failed any other check.
     NotAccepted,
 }
@@ -87,6 +127,7 @@ impl RefusalCode {
         match self {
             RefusalCode::UnsupportedVersion => "unsupported_version",
             RefusalCode::PuzzleInvalid => "puzzle_invalid",
+            RefusalCode::SessionProofRate => "session_proof_rate",
             RefusalCode::NotAccepted => "not_accepted",
         }
     }
@@ -95,6 +136,7 @@ impl RefusalCode {
         match name {
             "unsupported_version" => Some(RefusalCode::UnsupportedVersion),
             "puzzle_invalid" => Some(RefusalCode::PuzzleInvalid),
+            "session_proof_rate" => Some(RefusalCode::SessionProofRate),
             "not_accepted" => Some(RefusalCode::NotAccepted),
             _ => None,
         }
@@ -130,6 +172,17 @@ pub enum HandshakeError {
     Refused(RefusalCode),
     /// A station session with a puzzle difficulty the design does not have.
     InvalidStationSession,
+    /// A v5 HELLO whose session proof does not verify under the station's
+    /// identity key over this session.
+    SessionProofInvalid,
+    /// A v5 HELLO that accepts without a session proof.
+    SessionProofMissing,
+    /// A station past its session proof budget.
+    SessionProofRate,
+    /// A v4 HELLO that accepts a v5 CONNECT: never taken as a v4 connection.
+    V4HelloToV5Connect,
+    /// A v5 session whose TLS exporter gave no value.
+    ExporterUnavailable,
     /// A binding or status statement that did not verify.
     Binding(BindingError),
     /// A key that could not sign, or randomness that could not be drawn.
@@ -158,6 +211,15 @@ impl fmt::Display for HandshakeError {
             HandshakeError::InvalidStationSession => {
                 f.write_str("the station session has an unknown puzzle difficulty")
             }
+            HandshakeError::SessionProofInvalid => f.write_str("the session proof does not verify"),
+            HandshakeError::SessionProofMissing => {
+                f.write_str("the HELLO carries no session proof")
+            }
+            HandshakeError::SessionProofRate => {
+                f.write_str("the station's session proof budget is spent")
+            }
+            HandshakeError::V4HelloToV5Connect => f.write_str("a v4 HELLO accepted a v5 CONNECT"),
+            HandshakeError::ExporterUnavailable => f.write_str("the TLS exporter is unavailable"),
             HandshakeError::Binding(e) => write!(f, "{e}"),
             HandshakeError::Key(e) => write!(f, "{e}"),
         }
@@ -233,8 +295,10 @@ pub fn challenge(m: &StationMaterial) -> Result<Vec<u8>, HandshakeError> {
 /// What a client brings to a handshake: its profile, the node_id it dialed,
 /// the leaf DER it received in this TLS handshake, its carried identity key,
 /// its CONNECT key with binding and status statement, its capability bits,
-/// the time in milliseconds, and the realm membership endorsement CONNECT
-/// carries, empty for a node that holds none.
+/// the time in milliseconds, the realm membership endorsement CONNECT
+/// carries, empty for a node that holds none, the version CONNECT carries
+/// ([`VERSION`] or [`VERSION_5`]), and this connection's TLS exporter, which
+/// version 5 needs.
 pub struct ClientSession<'a> {
     pub profile: Profile,
     pub expected_node_id: [u8; 32],
@@ -246,9 +310,13 @@ pub struct ClientSession<'a> {
     pub capabilities: u64,
     pub now_ms: i64,
     pub member_endorsement: Vec<u8>,
+    pub version: i64,
+    pub export: Option<&'a Exporter>,
 }
 
-/// What a client knows of the station once it has checked the challenge.
+/// What a client knows of the station once it has checked the challenge, and
+/// what its HELLO must answer: the version the CONNECT carried and, in
+/// version 5, what the session proof covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Station {
     pub node_id: [u8; 32],
@@ -256,6 +324,12 @@ pub struct Station {
     pub tls_binding: SignedTbs,
     pub status_expires_at: i64,
     pub binding_not_after: i64,
+    pub version: i64,
+    profile: Profile,
+    exporter_value: Vec<u8>,
+    challenge: Vec<u8>,
+    connect: Vec<u8>,
+    client_node_id: [u8; 32],
 }
 
 /// Checks a challenge and, when every check passes, returns the CONNECT to
@@ -299,17 +373,22 @@ pub fn answer_challenge(
         s.now_ms,
     )?;
     let client_node_id = node_id_of(&s.identity_key, s.profile);
+    let e = session_exported(s.version, s.export, &client_node_id, &station_node_id)?;
     let proof = s
         .connect_key
         .sign(&proof_message(
+            s.version,
             f.bytes("nonce"),
             &station_node_id,
             &client_node_id,
             s.leaf,
             challenge,
+            &e,
+            s.capabilities,
         ))
         .map_err(HandshakeError::Key)?;
-    let connect = encode_frame(
+    let connect = encode_frame_version(
+        s.version,
         "connect",
         vec![
             entry("identity_key", Value::Bytes(s.identity_key.clone())),
@@ -325,20 +404,49 @@ pub fn answer_challenge(
         ],
     );
     Ok((
-        connect,
+        connect.clone(),
         Station {
             node_id: station_node_id,
             identity_key: station_key.to_vec(),
             tls_binding,
             status_expires_at: expires_at,
             binding_not_after: binding.not_after,
+            version: s.version,
+            profile: s.profile,
+            exporter_value: e,
+            challenge: challenge.to_vec(),
+            connect,
+            client_node_id,
         },
     ))
 }
 
+/// E for a v5 session, with the client's node_id first in the context (the
+/// initiator's), and nothing for version 4.
+fn session_exported(
+    version: i64,
+    export: Option<&Exporter>,
+    client_node_id: &[u8; 32],
+    station_node_id: &[u8; 32],
+) -> Result<Vec<u8>, HandshakeError> {
+    match (version, export) {
+        (VERSION, _) => Ok(Vec::new()),
+        (VERSION_5, Some(export)) => {
+            let context = [client_node_id.as_slice(), station_node_id].concat();
+            match export(EXPORTER_LABEL, &context, EXPORTER_SIZE) {
+                Some(e) if e.len() == EXPORTER_SIZE => Ok(e),
+                _ => Err(HandshakeError::ExporterUnavailable),
+            }
+        }
+        (VERSION_5, None) => Err(HandshakeError::ExporterUnavailable),
+        _ => Err(HandshakeError::UnsupportedVersion),
+    }
+}
+
 /// What a station brings to a CONNECT check: its profile, the challenge bytes
 /// it sent, the leaf DER this connection presented, its puzzle difficulty and
-/// mode, its capability bits, and the time in milliseconds.
+/// mode, its capability bits, the time in milliseconds, and what it binds a v5
+/// session with. Without `v5` it answers only version 4.
 #[derive(Debug, Clone)]
 pub struct StationSession {
     pub profile: Profile,
@@ -348,6 +456,27 @@ pub struct StationSession {
     pub puzzle_mode: PuzzleMode,
     pub capabilities: u64,
     pub now_ms: i64,
+    pub v5: Option<StationV5>,
+}
+
+/// Signs a v5 session proof with the station's identity key for the client
+/// named, within the station's budget ([`HandshakeError::SessionProofRate`]
+/// past it).
+pub type SessionProofSigner =
+    dyn Fn(&[u8; 32], &[u8]) -> Result<Vec<u8>, HandshakeError> + Send + Sync;
+
+/// A station's means to bind a v5 session: this connection's TLS exporter,
+/// and its session proof signer.
+#[derive(Clone)]
+pub struct StationV5 {
+    pub export: Arc<Exporter>,
+    pub sign_session_proof: Arc<SessionProofSigner>,
+}
+
+impl fmt::Debug for StationV5 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("StationV5")
+    }
 }
 
 /// What a station knows of an accepted client.
@@ -364,6 +493,8 @@ pub struct Client {
     /// The endorsement the CONNECT carried, empty when the client holds none.
     /// Nothing here checks it: that is the station's policy.
     pub member_endorsement: Vec<u8>,
+    /// The version the CONNECT carried, 4 or 5.
+    pub version: i64,
 }
 
 /// Checks a CONNECT, and returns the verdict with the HELLO to send. It
@@ -373,28 +504,49 @@ pub struct Client {
 /// proof against the challenge this station sent and the leaf it presented. A
 /// refusal is the local close reason, and the HELLO refuses with one coarse
 /// code.
+///
+/// A station with `v5` answers version 4 and 5, HELLO in the CONNECT's
+/// version; in version 5 it signs the session proof only once every check has
+/// passed. Without it, a v5 CONNECT is refused `unsupported_version` in
+/// version 4, as an old station refuses it.
 pub fn accept_connect(
     connect: &[u8],
     s: &StationSession,
 ) -> (Result<Client, HandshakeError>, Vec<u8>) {
-    match check_connect(connect, s) {
-        Ok(client) => (Ok(client), hello(None, s.capabilities)),
+    let mut version = VERSION;
+    match check_connect(connect, s, &mut version) {
+        Ok((client, session_proof)) => {
+            let hello = hello(client.version, None, s.capabilities, session_proof);
+            (Ok(client), hello)
+        }
         Err(e) => {
             let code = match e {
                 HandshakeError::UnsupportedVersion => RefusalCode::UnsupportedVersion,
                 HandshakeError::PuzzleInvalid => RefusalCode::PuzzleInvalid,
+                HandshakeError::SessionProofRate => RefusalCode::SessionProofRate,
                 _ => RefusalCode::NotAccepted,
             };
-            (Err(e), hello(Some(code), s.capabilities))
+            (Err(e), hello(version, Some(code), s.capabilities, None))
         }
     }
 }
 
-fn check_connect(connect: &[u8], s: &StationSession) -> Result<Client, HandshakeError> {
+/// The client and, in version 5, the session proof. `version` is set to the
+/// CONNECT's once it decodes, so a refusal answers in it.
+fn check_connect(
+    connect: &[u8],
+    s: &StationSession,
+    version: &mut i64,
+) -> Result<(Client, Option<Vec<u8>>), HandshakeError> {
     if s.puzzle_difficulty > 256 {
         return Err(HandshakeError::InvalidStationSession);
     }
-    let f = decode(connect, "connect", &[CONNECT_KEYS])?;
+    let versions: &[i64] = match s.v5 {
+        Some(_) => &[VERSION, VERSION_5],
+        None => &[VERSION],
+    };
+    let f = decode_versioned(connect, "connect", versions, &[CONNECT_KEYS])?;
+    *version = f.version();
     let (identity_key, connect_key, proof) = (
         f.bytes("identity_key"),
         f.bytes("connect_key"),
@@ -433,66 +585,122 @@ fn check_connect(connect: &[u8], s: &StationSession) -> Result<Client, Handshake
         s.profile,
         s.now_ms,
     )?;
-    if !proof_verifies(s, &node_id, connect_key, proof) {
-        return Err(HandshakeError::ProofInvalid);
-    }
-    Ok(Client {
-        node_id,
-        identity_key: identity_key.to_vec(),
-        connect_key: connect_key.to_vec(),
-        connect_binding,
-        capabilities: f.uint("capabilities"),
-        status_expires_at: expires_at,
-        binding_not_after: binding.not_after,
-        puzzle,
-        member_endorsement: f.bytes("member_endorsement").to_vec(),
-    })
-}
-
-/// A CONNECT proof checked against the challenge the station sent and the
-/// leaf it presented. The station's own challenge decodes: it built it.
-fn proof_verifies(
-    s: &StationSession,
-    client_node_id: &[u8; 32],
-    connect_key: &[u8],
-    proof: &[u8],
-) -> bool {
-    let Ok(challenge) = decode(&s.challenge, "challenge", &[CHALLENGE_KEYS]) else {
-        return false;
-    };
+    // The station's own challenge decodes: it built it.
+    let challenge = decode(&s.challenge, "challenge", &[CHALLENGE_KEYS])
+        .map_err(|_| HandshakeError::ProofInvalid)?;
     let station_node_id = node_id_of(challenge.bytes("identity_key"), s.profile);
+    let export = s.v5.as_ref().map(|v5| v5.export.as_ref());
+    let e = session_exported(*version, export, &node_id, &station_node_id)?;
+    let capabilities = f.uint("capabilities");
     let message = proof_message(
+        *version,
         challenge.bytes("nonce"),
         &station_node_id,
-        client_node_id,
+        &node_id,
         &s.leaf,
         &s.challenge,
+        &e,
+        capabilities,
     );
-    verify(&message, proof, connect_key, s.profile)
+    if !verify(&message, proof, connect_key, s.profile) {
+        return Err(HandshakeError::ProofInvalid);
+    }
+    let session_proof = match (&s.v5, *version) {
+        (Some(v5), VERSION_5) => Some((v5.sign_session_proof)(
+            &node_id,
+            &session_proof_message(
+                &e,
+                &s.challenge,
+                connect,
+                &station_node_id,
+                &node_id,
+                s.capabilities,
+            ),
+        )?),
+        _ => None,
+    };
+    Ok((
+        Client {
+            node_id,
+            identity_key: identity_key.to_vec(),
+            connect_key: connect_key.to_vec(),
+            connect_binding,
+            capabilities,
+            status_expires_at: expires_at,
+            binding_not_after: binding.not_after,
+            puzzle,
+            member_endorsement: f.bytes("member_endorsement").to_vec(),
+            version: *version,
+        },
+        session_proof,
+    ))
 }
 
 /// What the CONNECT proof signs: the label, a zero byte, the nonce, the
 /// station's and the client's node_ids, the SHA-384 of the leaf DER and the
-/// SHA-384 of the challenge bytes as received.
+/// SHA-384 of the challenge bytes as received. Version 5 (V2) appends E and
+/// the client's capabilities, 8 bytes big-endian: every field has a fixed
+/// width, so no two field sequences encode to the same bytes.
+#[allow(clippy::too_many_arguments)]
 fn proof_message(
+    version: i64,
     nonce: &[u8],
     station_node_id: &[u8; 32],
     client_node_id: &[u8; 32],
     leaf: &[u8],
     challenge: &[u8],
+    e: &[u8],
+    capabilities: u64,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(CONNECT_PROOF_LABEL.len() + 1 + nonce.len() + 64 + 96);
-    out.extend_from_slice(CONNECT_PROOF_LABEL);
+    let label = match version {
+        VERSION_5 => CONNECT_PROOF_LABEL_V2,
+        _ => CONNECT_PROOF_LABEL,
+    };
+    let mut out = Vec::with_capacity(label.len() + 1 + nonce.len() + 64 + 96 + EXPORTER_SIZE + 8);
+    out.extend_from_slice(label);
     out.push(0);
     out.extend_from_slice(nonce);
     out.extend_from_slice(station_node_id);
     out.extend_from_slice(client_node_id);
     out.extend_from_slice(&Sha384::digest(leaf));
     out.extend_from_slice(&Sha384::digest(challenge));
+    if version == VERSION_5 {
+        out.extend_from_slice(e);
+        out.extend_from_slice(&capabilities.to_be_bytes());
+    }
     out
 }
 
-fn hello(refusal: Option<RefusalCode>, capabilities: u64) -> Vec<u8> {
+/// What the station's session proof signs: the label, a zero byte, E, the
+/// SHA-384 of the challenge and of CONNECT, the station's and the client's
+/// node_ids, and the station's capabilities, 8 bytes big-endian. The SHA-384
+/// of CONNECT covers the client's capabilities.
+fn session_proof_message(
+    e: &[u8],
+    challenge: &[u8],
+    connect: &[u8],
+    station_node_id: &[u8; 32],
+    client_node_id: &[u8; 32],
+    capabilities: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SESSION_PROOF_LABEL.len() + 1 + EXPORTER_SIZE + 96 + 64 + 8);
+    out.extend_from_slice(SESSION_PROOF_LABEL);
+    out.push(0);
+    out.extend_from_slice(e);
+    out.extend_from_slice(&Sha384::digest(challenge));
+    out.extend_from_slice(&Sha384::digest(connect));
+    out.extend_from_slice(station_node_id);
+    out.extend_from_slice(client_node_id);
+    out.extend_from_slice(&capabilities.to_be_bytes());
+    out
+}
+
+fn hello(
+    version: i64,
+    refusal: Option<RefusalCode>,
+    capabilities: u64,
+    session_proof: Option<Vec<u8>>,
+) -> Vec<u8> {
     let mut entries = vec![
         entry("accepted", Value::Int(i128::from(refusal.is_none()))),
         entry("capabilities", Value::Int(i128::from(capabilities))),
@@ -500,19 +708,61 @@ fn hello(refusal: Option<RefusalCode>, capabilities: u64) -> Vec<u8> {
     if let Some(code) = refusal {
         entries.push(entry("refusal_code", Value::text(code.name())));
     }
-    encode_frame("hello", entries)
+    if let Some(proof) = session_proof {
+        entries.push(entry("session_proof", Value::Bytes(proof)));
+    }
+    encode_frame_version(version, "hello", entries)
 }
 
-/// The client's reading of HELLO: the station's capability bits, or
-/// [`HandshakeError::Refused`] with its refusal code.
-pub fn read_hello(frame: &[u8]) -> Result<u64, HandshakeError> {
-    let f = decode(frame, "hello", &[HELLO_ACCEPTED_KEYS, HELLO_REFUSED_KEYS])?;
-    let accepted = f.int("accepted");
-    match (accepted, f.0.get("refusal_code")) {
-        (1, None) => Ok(f.uint("capabilities")),
-        (0, Some(Value::Text(code))) => Err(HandshakeError::Refused(
-            RefusalCode::parse(code).ok_or(HandshakeError::Malformed)?,
-        )),
+/// The client's reading of HELLO against the version its CONNECT carried
+/// (`station`, as [`answer_challenge`] returned it): the station's capability
+/// bits, or why not. After a v5 CONNECT an accepting HELLO must be version 5
+/// with a session proof that verifies under the station's identity key over
+/// this session. A v4 refusal is how an old station answers
+/// ([`HandshakeError::Refused`]); a v4 acceptance is never taken as a v4
+/// connection.
+pub fn read_hello(frame: &[u8], station: &Station) -> Result<u64, HandshakeError> {
+    let (versions, layouts): (&[i64], &[&[&str]]) = match station.version {
+        VERSION_5 => (
+            &[VERSION, VERSION_5],
+            &[HELLO_PROVED_KEYS, HELLO_ACCEPTED_KEYS, HELLO_REFUSED_KEYS],
+        ),
+        _ => (&[VERSION], &[HELLO_ACCEPTED_KEYS, HELLO_REFUSED_KEYS]),
+    };
+    let f = decode_versioned(frame, "hello", versions, layouts)?;
+    let refusal = f.0.get("refusal_code");
+    let proof = f.0.get("session_proof");
+    match (f.int("accepted"), refusal) {
+        (0, Some(Value::Text(code))) => {
+            return Err(HandshakeError::Refused(
+                RefusalCode::parse(code).ok_or(HandshakeError::Malformed)?,
+            ))
+        }
+        (1, None) => {}
+        _ => return Err(HandshakeError::Malformed),
+    }
+    let capabilities = f.uint("capabilities");
+    match (f.version(), station.version, proof) {
+        (VERSION, VERSION_5, _) => Err(HandshakeError::V4HelloToV5Connect),
+        (VERSION, _, None) => Ok(capabilities),
+        (VERSION_5, VERSION_5, None) => Err(HandshakeError::SessionProofMissing),
+        (VERSION_5, VERSION_5, Some(Value::Bytes(proof))) => {
+            if proof.len() != signature_size(station.profile) {
+                return Err(HandshakeError::Malformed);
+            }
+            let message = session_proof_message(
+                &station.exporter_value,
+                &station.challenge,
+                &station.connect,
+                &station.node_id,
+                &station.client_node_id,
+                capabilities,
+            );
+            if !verify(&message, proof, &station.identity_key, station.profile) {
+                return Err(HandshakeError::SessionProofInvalid);
+            }
+            Ok(capabilities)
+        }
         _ => Err(HandshakeError::Malformed),
     }
 }
@@ -574,6 +824,10 @@ impl Fields {
         u64::try_from(self.int(key)).unwrap_or(0)
     }
 
+    fn version(&self) -> i64 {
+        i64::try_from(self.int("version")).unwrap_or(-1)
+    }
+
     fn signed(&self, key: &str) -> SignedTbs {
         self.0
             .get(key)
@@ -589,6 +843,17 @@ impl Fields {
 /// version, the frame type, exactly the keys of one of the layouts, then the
 /// type and length of every field.
 fn decode(frame: &[u8], frame_type: &str, layouts: &[&[&str]]) -> Result<Fields, HandshakeError> {
+    decode_versioned(frame, frame_type, &[VERSION], layouts)
+}
+
+/// `decode` in any of `versions`: another version is
+/// [`HandshakeError::UnsupportedVersion`].
+fn decode_versioned(
+    frame: &[u8],
+    frame_type: &str,
+    versions: &[i64],
+    layouts: &[&[&str]],
+) -> Result<Fields, HandshakeError> {
     let Ok(Value::Map(pairs)) = cbor::decode(frame) else {
         return Err(HandshakeError::Malformed);
     };
@@ -603,7 +868,7 @@ fn decode(frame: &[u8], frame_type: &str, layouts: &[&[&str]]) -> Result<Fields,
         }
     }
     match fields.get("version") {
-        Some(Value::Int(v)) if *v == i128::from(VERSION) => {}
+        Some(Value::Int(v)) if versions.iter().any(|known| *v == i128::from(*known)) => {}
         Some(Value::Int(_)) => return Err(HandshakeError::UnsupportedVersion),
         _ => return Err(HandshakeError::Malformed),
     }
@@ -626,7 +891,7 @@ fn field_typed(key: &str, v: &Value) -> bool {
         "version" | "frame_type" => true,
         "profile" => matches!(v, Value::Text(_)),
         "nonce" => matches!(v, Value::Bytes(b) if b.len() == NONCE_SIZE),
-        "identity_key" | "connect_key" | "proof" | "member_endorsement" => {
+        "identity_key" | "connect_key" | "proof" | "member_endorsement" | "session_proof" => {
             matches!(v, Value::Bytes(_))
         }
         "tls_binding" | "tls_status" | "connect_binding" | "connect_status" | "statement" => {
@@ -660,8 +925,14 @@ fn shares_a_half(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn encode_frame(frame_type: &str, entries: Vec<(Value, Value)>) -> Vec<u8> {
+    encode_frame_version(VERSION, frame_type, entries)
+}
+
+/// `encode_frame` in a given version: CONNECT and HELLO carry the version the
+/// client chose; opener, challenge and status are always 4.
+fn encode_frame_version(version: i64, frame_type: &str, entries: Vec<(Value, Value)>) -> Vec<u8> {
     let mut all = vec![
-        entry("version", Value::Int(i128::from(VERSION))),
+        entry("version", Value::Int(i128::from(version))),
         entry("frame_type", Value::text(frame_type)),
     ];
     all.extend(entries);

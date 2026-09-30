@@ -595,6 +595,7 @@ fn unreachable(e: &LinkError) -> bool {
         LinkError::CallTimeout
             | LinkError::Closed
             | LinkError::LivenessLost
+            | LinkError::V5DowngradeRefused
             | LinkError::Io(_)
             | LinkError::Goodbye(_)
             | LinkError::StatusExpired

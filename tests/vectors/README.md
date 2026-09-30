@@ -10,7 +10,7 @@ draft's vector for id-MLDSA87-RSA4096-PSS-SHA512 as macula v12.7.0 carries it.
 |-----------|--------------|
 | `cbor/` | the decoding rule every stack applies to what a peer sends |
 | `identity/` | TLS and CONNECT bindings, status statements, the LAMPS composite |
-| `handshake/` | the version-4 handshake |
+| `handshake/` | the version-4 and version-5 handshake, from macula-go's `handshake/testdata/erlang_handshake.json`, which macula 8b8bb80a (13.2.0's handshake) generated; version 5 uses the HMAC-SHA256 exporter stand-in both stacks share |
 | `frame/` | signed neighbour frames |
 | `record/` | own-namespace procedure advertisements and their verdicts |
 | `manifest/` | content manifests and their ids |

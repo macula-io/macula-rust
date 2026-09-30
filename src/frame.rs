@@ -13,6 +13,7 @@ mod neighbour;
 mod publication;
 mod reply;
 mod request;
+mod session;
 mod stream;
 
 pub use check_payload::{
@@ -30,6 +31,10 @@ pub use reply::{
 pub use request::{
     request_fields_accepted, sign_call, sign_stream_open, verify_request, RequestSpec, RequestType,
     VerifiedRequest, MAX_PROOFS, MAX_PROOFS_BYTES,
+};
+pub use session::{
+    liveness_nonce, liveness_ping_frame, liveness_pong_frame, verify_session_frame, Liveness,
+    LIVENESS_NONCE_SIZE,
 };
 pub use stream::{
     open_stream, sign_caller_stream, sign_provider_stream, verify_caller_stream,

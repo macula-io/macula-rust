@@ -1,7 +1,7 @@
-//! macula 12's version-4 handshake: opener, challenge, CONNECT, HELLO and
+//! macula's version-4 handshake: opener, challenge, CONNECT, HELLO and
 //! status frames. Held to the frames macula itself made
 //! (tests/vectors/handshake/erlang_handshake.json, macula_handshake at macula
-//! v12.1.0) both ways, then driven end to end between this crate's client and
+//! 8b8bb80a) both ways, then driven end to end between this crate's client and
 //! station halves, and refused where macula refuses.
 
 use macula_rust::binding::{
@@ -11,7 +11,7 @@ use macula_rust::cbor::{self, Value};
 use macula_rust::handshake::{
     accept_connect, answer_challenge, challenge, opener, read_hello, read_opener, read_status,
     status_frame, ClientSession, HandshakeError, Peer, PuzzleMode, PuzzleResult, RefusalCode,
-    StationMaterial, StationSession,
+    Station, StationMaterial, StationSession, VERSION,
 };
 use macula_rust::node_key::{NodeKey, Purpose};
 use macula_rust::profile::Profile;
@@ -62,7 +62,23 @@ fn session<'a>(
         capabilities: 3,
         now_ms: now,
         member_endorsement: Vec::new(),
+        version: VERSION,
+        export: None,
     }
+}
+
+/// What a v4 client knows of a fresh station, to read a v4 HELLO against.
+fn v4_station(profile: Profile) -> Station {
+    let now = 1_789_000_000_000;
+    let leaf = b"a leaf".to_vec();
+    let (station_key, material) = station(profile, &leaf, now);
+    let keys = client_keys(profile, now);
+    answer_challenge(
+        &challenge(&material).unwrap(),
+        &session(&keys, profile, station_key.node_id().unwrap(), &leaf, now),
+    )
+    .unwrap()
+    .1
 }
 
 /// A station: its identity key, and the material it challenges with for
@@ -89,6 +105,7 @@ fn station_session(profile: Profile, challenge: &[u8], leaf: &[u8], now: i64) ->
         puzzle_mode: PuzzleMode::Enforce,
         capabilities: 5,
         now_ms: now,
+        v5: None,
     }
 }
 
@@ -156,7 +173,12 @@ fn a_connect_macula_made_is_accepted() {
             &station_session(e.profile, &e.go_challenge, &h.leaf, h.now + 60_000),
         );
         let client = accepted.unwrap();
-        assert_eq!(read_hello(&hello).unwrap(), 5, "{:?}", e.profile);
+        assert_eq!(
+            read_hello(&hello, &v4_station(e.profile)).unwrap(),
+            5,
+            "{:?}",
+            e.profile
+        );
         assert!(client.member_endorsement.is_empty());
     }
 }
@@ -185,7 +207,7 @@ fn a_client_and_a_station_complete_the_handshake_and_renew_status() {
         assert_eq!(client.node_id, keys.identity.node_id().unwrap());
         assert_eq!(client.capabilities, 3);
         assert_eq!(client.puzzle, PuzzleResult::Solved);
-        assert_eq!(read_hello(&hello).unwrap(), 5);
+        assert_eq!(read_hello(&hello, &seen).unwrap(), 5);
 
         // A renewed statement on the open connection.
         let renewed = status_statement(
@@ -299,7 +321,7 @@ fn a_station_refuses_with_one_coarse_code() {
     let (station_key, material) = station(Profile::PqPure, &leaf, now);
     let frame = challenge(&material).unwrap();
     let keys = client_keys(Profile::PqPure, now);
-    let (connect, _) = answer_challenge(
+    let (connect, seen) = answer_challenge(
         &frame,
         &session(
             &keys,
@@ -318,7 +340,7 @@ fn a_station_refuses_with_one_coarse_code() {
     );
     assert_eq!(refused.unwrap_err(), HandshakeError::ProofInvalid);
     assert_eq!(
-        read_hello(&hello).unwrap_err(),
+        read_hello(&hello, &seen).unwrap_err(),
         HandshakeError::Refused(RefusalCode::NotAccepted)
     );
 
@@ -328,7 +350,7 @@ fn a_station_refuses_with_one_coarse_code() {
     let (refused, hello) = accept_connect(&connect, &hard);
     assert_eq!(refused.unwrap_err(), HandshakeError::PuzzleInvalid);
     assert_eq!(
-        read_hello(&hello).unwrap_err(),
+        read_hello(&hello, &seen).unwrap_err(),
         HandshakeError::Refused(RefusalCode::PuzzleInvalid)
     );
 
@@ -365,7 +387,7 @@ fn a_frame_is_read_strictly_in_macula_s_order() {
     let extra = rewritten(&first, |p| p.push((Value::text("more"), Value::Int(1))));
     assert_eq!(read_opener(&extra).unwrap_err(), HandshakeError::Malformed);
     assert_eq!(
-        read_hello(&first).unwrap_err(),
+        read_hello(&first, &v4_station(Profile::PqPure)).unwrap_err(),
         HandshakeError::UnexpectedFrame
     );
     assert_eq!(read_opener(b"\xff").unwrap_err(), HandshakeError::Malformed);

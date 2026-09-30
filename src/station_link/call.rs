@@ -2,7 +2,7 @@
 //! the RESULT or ERROR that verifies for it: a provider reply signed by its
 //! target, or a relay error the connected station signed. A reply that does
 //! not verify is counted and ignored, and the call keeps waiting, as macula's
-//! link does. The liveness probe is a call too.
+//! link does. On a v4 link the liveness probe is a call too.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::cbor::Value;
 use crate::frame::{self, ReplyType, RequestSpec, VerifiedRequest};
+use crate::handshake::VERSION_5;
 
 use super::{now_ms, Inner, Link, LinkError};
 
@@ -173,8 +174,11 @@ fn verified_outcome(
     }))
 }
 
-/// A liveness probe every 30 seconds; two misses in a row end the link. Any
-/// verified answer counts: it proves the station is there.
+/// A liveness probe every 30 seconds; two misses in a row end the link. On v5
+/// the probe is a liveness_ping, answered by the station's connection with a
+/// liveness_pong of its nonce, and nothing is signed. On v4 it is a
+/// `_macula.ping` call: any verified answer counts, a provider's or a relay
+/// error from the station alike, as it proves the station is there.
 pub(super) async fn probe(link: Weak<Inner>) {
     let mut misses = 0;
     loop {
@@ -186,15 +190,19 @@ pub(super) async fn probe(link: Weak<Inner>) {
             _ = tokio::time::sleep(LIVENESS_EVERY) => {}
         }
         let Some(inner) = link.upgrade() else { return };
-        let outcome = call(
-            &inner,
-            Call {
-                procedure: LIVENESS_PROCEDURE.to_string(),
-                timeout: LIVENESS_TIMEOUT,
-                ..Call::default()
-            },
-        )
-        .await;
+        let outcome = match inner.version {
+            VERSION_5 => probe_v5(&inner).await,
+            _ => call(
+                &inner,
+                Call {
+                    procedure: LIVENESS_PROCEDURE.to_string(),
+                    timeout: LIVENESS_TIMEOUT,
+                    ..Call::default()
+                },
+            )
+            .await
+            .map(|_| ()),
+        };
         misses = if matches!(outcome, Err(LinkError::CallTimeout)) {
             misses + 1
         } else {
@@ -203,6 +211,35 @@ pub(super) async fn probe(link: Weak<Inner>) {
         if misses >= 2 {
             inner.end(LinkError::LivenessLost);
             return;
+        }
+    }
+}
+
+/// One v5 liveness probe: answered when a liveness_pong of its nonce arrives
+/// within [`LIVENESS_TIMEOUT`], [`LinkError::CallTimeout`] when none does.
+async fn probe_v5(inner: &Inner) -> Result<(), LinkError> {
+    let mut nonce = [0u8; frame::LIVENESS_NONCE_SIZE];
+    aws_lc_rs::rand::fill(&mut nonce).map_err(|_| LinkError::Io("no randomness".into()))?;
+    let mut pongs = inner.pongs_rx.lock().await;
+    // A pong that arrived after its probe's deadline must not take the place
+    // of this probe's.
+    while pongs.try_recv().is_ok() {}
+    inner
+        .send_control(&frame::liveness_ping_frame(&nonce))
+        .await?;
+    let mut done = inner.done_rx.clone();
+    let answered = async {
+        while let Some(pong) = pongs.recv().await {
+            if pong == nonce {
+                return Ok(());
+            }
+        }
+        Err(LinkError::Closed)
+    };
+    tokio::select! {
+        _ = done.wait_for(|ended| *ended) => Err(LinkError::Closed),
+        outcome = tokio::time::timeout(LIVENESS_TIMEOUT, answered) => {
+            outcome.unwrap_or(Err(LinkError::CallTimeout))
         }
     }
 }

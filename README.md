@@ -25,7 +25,9 @@
 > Calls and streams by direct dial, serving (under an org or in a node's own
 > namespace), publish/subscribe, node-served content and the DHT are tested
 > against in-process macula 12 stations on every `cargo test`, and calls,
-> pubsub and the DHT live against the fleet. Not here yet: UCAN-gated calls;
+> pubsub and the DHT live against the fleet. Every link runs macula 13.2's
+> handshake v5, bound to its TLS session, and falls back to v4 only for a
+> station never seen on v5. Not here yet: UCAN-gated calls;
 > see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
 > the retired 10.x wire and cannot reach the current fleet.
 
@@ -142,7 +144,7 @@ compatibility layer.
 |---|---|---|---|
 | Node keys (`node_key::NodeKey`) | ✅ | ✅ | `pq_hybrid` (the fleet's) or `pq_pure`; key files readable by the owner only, or the platform's secure store (`keystore`); pq_hybrid checked against the LAMPS draft's own vector and cross-verified with macula 12.8.0 |
 | Pool of station links (`pool::Pool`) | ✅ | ✅ | Seeds pinned by node_id; realm keys pinned; links redialed with subscriptions and served procedures replayed |
-| One station link (`station_link::Link`) | ✅ | ✅ | The v4 handshake, status statements both ways, neighbour signatures in pq_hybrid, a liveness probe |
+| One station link (`station_link::Link`) | ✅ | ✅ | Handshake v5 bound to the TLS session (v4 once after `unsupported_version`, never after a node was seen on v5), status statements both ways, neighbour signatures on v4 links in pq_hybrid, a liveness probe |
 | Calls by direct dial (`call`, `providers`) | ✅ | ✅ | Candidates tried freshest first; errors arrive as `LinkError::Provider` / `LinkError::Relay` |
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
@@ -220,8 +222,8 @@ cargo test --workspace
 
 The integration tests (`tests/station_link.rs`, `tests/pool.rs`,
 `macula-rust-ffi/tests/pool_ffi.rs`) run against `tests/teststation`, a Go
-helper around macula-go's `teststation`. It starts in-process macula 12
-stations, realms and orgs as each test asks, and reports what a station sees
+helper around macula-go's `teststation`. It starts in-process macula 13.2
+stations, which answer handshake v5, realms and orgs as each test asks, and reports what a station sees
 (who is connected, what is advertised or subscribed, how many streams it
 relays). A test fails, not skips, when the helper is missing. No network is
 needed. Go ≥ 1.27 builds the helper.

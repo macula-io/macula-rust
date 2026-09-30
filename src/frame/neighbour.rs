@@ -215,7 +215,7 @@ fn control_table(frame_type: &str) -> Option<Vec<(&'static str, Rule)>> {
 }
 
 /// A frame map's frame_type, version, and whether it carries neighbour.
-fn control_header(pairs: &[(Value, Value)]) -> (String, Value, bool) {
+pub(super) fn control_header(pairs: &[(Value, Value)]) -> (String, Value, bool) {
     let mut frame_type = String::new();
     let mut version = Value::Int(i128::from(PROTOCOL_VERSION));
     let mut has_neighbour = false;

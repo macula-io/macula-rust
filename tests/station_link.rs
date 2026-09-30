@@ -17,8 +17,8 @@ use macula_rust::profile::Profile;
 use macula_rust::record::{self, new_node_record, NodeRecordOptions, RecordType};
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    handler, stream_handler, Call, Config, Link, LinkError, Offer, Publication, StreamCall,
-    StreamEvent,
+    handler, handshake_counters, stream_handler, Call, Config, Link, LinkError, Offer, Publication,
+    StreamCall, StreamEvent,
 };
 
 /// A link as a new node: its own identity key and issuer.
@@ -49,6 +49,10 @@ async fn a_node_links_to_a_station_it_pinned_in_either_profile() {
         let env = TestStations::start(profile);
         let link = node(&env, 0).await;
         assert_eq!(link.station_node_id(), env.stations[0].node_id);
+        // A macula 13.2 station answers v5, so the link is bound to its
+        // session, and the handshake counters say so.
+        assert_eq!(link.handshake_version(), 5, "{profile:?}");
+        assert!(handshake_counters()["v5_connections"] > 0);
         link.close("done").await.unwrap();
         assert!(matches!(link.error(), Some(LinkError::Closed)));
     }

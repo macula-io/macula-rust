@@ -1,15 +1,19 @@
-//! A client's link to one macula 12 station, as macula_station_link and
+//! A client's link to one macula station, as macula_station_link and
 //! macula-go's stationlink are: a QUIC connection dialed to the station its
-//! target pins, one bidirectional control stream, the v4 handshake on it, then
-//! status statements both ways and every frame of the session.
+//! target pins, one bidirectional control stream, the connection handshake on
+//! it (v5, or v4 once after a station refuses v5), then status statements
+//! both ways and every frame of the session.
 //!
 //! After HELLO the link sends its own status statement at every reissue of
 //! the node's statement issuer, and ends when the station's statement is five
 //! minutes past its expiry or the station's TLS binding reaches its
-//! not_after. In pq_hybrid every control frame is neighbour-signed with a
-//! sequence number per direction, from 0 after HELLO; a frame out of sequence
-//! ends the link. A liveness probe, a `_macula.ping` call every 30 seconds,
-//! ends the link after two misses in a row.
+//! not_after. On a v5 link no frame carries a neighbour signature: the
+//! session proofs authenticated the station once, and a neighbour-signed
+//! frame ends the link. On a v4 link, in pq_hybrid, every control frame is
+//! neighbour-signed with a sequence number per direction, from 0 after HELLO;
+//! a frame out of sequence ends the link. A liveness probe every 30 seconds
+//! ends the link after two misses in a row: on v5 a liveness_ping, on v4 a
+//! `_macula.ping` call.
 
 mod admission;
 mod call;
@@ -18,6 +22,7 @@ mod framing;
 mod pubsub;
 mod serve;
 mod stream;
+mod versions;
 
 pub use admission::{Admission, AdmissionLimits};
 pub use call::{Call, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
@@ -26,6 +31,7 @@ pub use serve::{handler, BoxFuture, Handler, Offer, Request, Served, StreamOffer
 pub use stream::{
     stream_handler, Stream, StreamCall, StreamEvent, StreamHandler, DEFAULT_STREAM_DEADLINE,
 };
+pub use versions::{forget_v5_peer, handshake_counters};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -37,8 +43,10 @@ use sha2::{Digest, Sha384};
 use tokio::sync::watch;
 
 use crate::cbor::{self, Value};
-use crate::frame::{self, FrameError, NeighbourLink, NeighbourPeer};
-use crate::handshake::{self, ClientSession, HandshakeError, Peer, Station};
+use crate::frame::{self, FrameError, Liveness, NeighbourLink, NeighbourPeer};
+use crate::handshake::{
+    self, ClientSession, Exporter, HandshakeError, Peer, RefusalCode, Station, VERSION, VERSION_5,
+};
 use crate::node_key::NodeKey;
 use crate::profile::Profile;
 use crate::record::RecordError;
@@ -91,6 +99,10 @@ pub enum LinkError {
     Goodbye(String),
     /// The station missed two liveness probes in a row.
     LivenessLost,
+    /// A station this process completed handshake v5 with that now answers
+    /// v4, or a v4 link to it that a v5 completion ended: refused, not
+    /// retried, until [`forget_v5_peer`].
+    V5DowngradeRefused,
     /// No verified reply answered the call within its timeout.
     CallTimeout,
     /// A provider's ERROR for the call.
@@ -233,6 +245,11 @@ struct Inner {
     station: Station,
     station_capabilities: u64,
     connection_hash: [u8; 48],
+    /// The handshake version the link completed: 4 or 5.
+    version: i64,
+    /// v5 liveness answers, for the probe.
+    pongs: tokio::sync::mpsc::Sender<[u8; frame::LIVENESS_NONCE_SIZE]>,
+    pongs_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<[u8; frame::LIVENESS_NONCE_SIZE]>>,
     /// Orders a neighbour signature's seq with its write.
     send_seq: tokio::sync::Mutex<u64>,
     status_deadline: AtomicI64,
@@ -258,8 +275,12 @@ struct State {
 }
 
 impl Link {
-    /// Dials `cfg.target`, runs the v4 handshake as a client, and returns the
-    /// link once the station's HELLO accepts it, within
+    /// Dials `cfg.target`, runs the handshake as a client, and returns the
+    /// link once the station's HELLO accepts it. It dials with version 5
+    /// unless the station refused v5 in the last 10 minutes; a station never
+    /// seen on v5 that refuses v5 with `unsupported_version` is dialled once
+    /// more, on a new connection, with v4. A station seen on v5 that answers
+    /// v4 is [`LinkError::V5DowngradeRefused`]. Each handshake is bounded by
     /// [`HANDSHAKE_TIMEOUT`].
     pub async fn dial(cfg: Config) -> Result<Link, LinkError> {
         if cfg.identity.profile() != cfg.target.profile {
@@ -270,10 +291,25 @@ impl Link {
         if let Some(admission) = &cfg.admission {
             admission.limits().validate()?;
         }
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshaken(cfg))
-            .await
-            .map_err(|_| LinkError::HandshakeTimeout)
-            .and_then(|linked| linked)
+        let node_id = cfg.target.expected_node_id;
+        let version = versions::dial_version(&node_id, std::time::Instant::now());
+        let linked = dial_once(&cfg, version).await;
+        match linked {
+            Err(LinkError::Handshake(HandshakeError::Refused(RefusalCode::UnsupportedVersion)))
+                if version == VERSION_5 =>
+            {
+                if !versions::unsupported_version(&node_id, std::time::Instant::now()) {
+                    return Err(LinkError::V5DowngradeRefused);
+                }
+                dial_once(&cfg, VERSION).await
+            }
+            other => other,
+        }
+    }
+
+    /// The handshake version the link completed: 4 or 5.
+    pub fn handshake_version(&self) -> i64 {
+        self.inner.version
     }
 
     /// The node_id of the station the link reached.
@@ -341,8 +377,40 @@ impl Link {
     }
 }
 
-async fn handshaken(cfg: Config) -> Result<Link, LinkError> {
-    let dialed = transport::dial_target(&cfg.target).await?;
+/// One QUIC connection and one handshake in `version`, within
+/// [`HANDSHAKE_TIMEOUT`]. A failed handshake closes its connection.
+async fn dial_once(cfg: &Config, version: i64) -> Result<Link, LinkError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let dialed = transport::dial_target(&cfg.target).await?;
+        let connection = dialed.connection.clone();
+        let linked = handshaken(cfg, dialed, version).await;
+        if let Err(e) = &linked {
+            versions::count_refusal(e);
+            connection.close(0u32.into(), b"handshake failed");
+        }
+        linked
+    })
+    .await
+    .map_err(|_| LinkError::HandshakeTimeout)
+    .and_then(|linked| linked)
+}
+
+/// Runs the client's side of the handshake, in `version`, on a new control
+/// stream of `dialed`.
+async fn handshaken(
+    cfg: &Config,
+    dialed: transport::Dialed,
+    version: i64,
+) -> Result<Link, LinkError> {
+    let exporter_connection = dialed.connection.clone();
+    let export = move |label: &str, context: &[u8], length: usize| {
+        let mut out = vec![0; length];
+        exporter_connection
+            .export_keying_material(&mut out, label.as_bytes(), context)
+            .ok()?;
+        Some(out)
+    };
+    let export: &Exporter = &export;
     let (send, mut recv) = dialed
         .connection
         .open_bi()
@@ -367,11 +435,13 @@ async fn handshaken(cfg: Config) -> Result<Link, LinkError> {
             capabilities: 0,
             now_ms: now_ms(),
             member_endorsement: cfg.member_endorsement.clone(),
+            version,
+            export: Some(export),
         },
     )?;
     control.write(&connect, HANDSHAKE_FRAME_BYTES).await?;
     let hello = read_frame(&mut recv, HANDSHAKE_FRAME_BYTES).await?;
-    let capabilities = handshake::read_hello(&hello)?;
+    let capabilities = handshake::read_hello(&hello, &station)?;
     let self_id = cfg
         .identity
         .node_id()
@@ -383,7 +453,9 @@ async fn handshaken(cfg: Config) -> Result<Link, LinkError> {
     let (done_tx, done_rx) = watch::channel(false);
     let share = cfg
         .share
+        .clone()
         .unwrap_or_else(|| format!("{}:{}", cfg.target.host, cfg.target.port));
+    let (pongs, pongs_rx) = tokio::sync::mpsc::channel(1);
     static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let inner = Arc::new(Inner {
         serial: SERIALS.fetch_add(1, Ordering::Relaxed),
@@ -391,18 +463,22 @@ async fn handshaken(cfg: Config) -> Result<Link, LinkError> {
         _endpoint: dialed.endpoint,
         control,
         profile: cfg.target.profile,
-        key: cfg.identity,
+        key: cfg.identity.clone(),
         self_id,
         status_deadline: AtomicI64::new(station.status_expires_at + STATUS_GRACE_MS),
         station_capabilities: capabilities,
         connection_hash: Sha384::digest(&challenge).into(),
+        version: station.version,
+        pongs,
+        pongs_rx: tokio::sync::Mutex::new(pongs_rx),
         station,
         send_seq: tokio::sync::Mutex::new(0),
-        publication_seq: cfg.publication_seq.unwrap_or_default(),
+        publication_seq: cfg.publication_seq.clone().unwrap_or_default(),
         admission: cfg
             .admission
+            .clone()
             .unwrap_or_else(|| Arc::new(Admission::new(AdmissionLimits::default()))),
-        dedup: cfg.dedup.unwrap_or_default(),
+        dedup: cfg.dedup.clone().unwrap_or_default(),
         share,
         state: Mutex::new(State {
             ended: None,
@@ -416,6 +492,8 @@ async fn handshaken(cfg: Config) -> Result<Link, LinkError> {
         done_tx,
         done_rx,
     });
+    let station_node_id = inner.station.node_id;
+    versions::completed(&station_node_id, &inner)?;
     tokio::spawn(send_statements(Arc::downgrade(&inner), statements));
     tokio::spawn(read_control(inner.clone(), recv));
     tokio::spawn(stream::accept_streams(Arc::downgrade(&inner)));
@@ -436,9 +514,12 @@ impl Inner {
         *self.lock().unrouted.entry(what.to_string()).or_default() += 1;
     }
 
-    /// A version-2 frame on the control stream, neighbour-signed with the
-    /// next seq when the profile signs its type.
+    /// A version-2 frame on the control stream: on v5 as it is, on v4
+    /// neighbour-signed with the next seq when the profile signs its type.
     async fn send_control(&self, v: &Value) -> Result<(), LinkError> {
+        if self.version == VERSION_5 {
+            return self.write_control(v).await;
+        }
         let mut seq = self.send_seq.lock().await;
         let signed = frame::sign_neighbour(
             v,
@@ -495,6 +576,9 @@ impl Inner {
             stream::StreamInner::end(&s, Some(err.clone()));
         }
         self.connection.close(0u32.into(), b"link ended");
+        if self.version == VERSION {
+            versions::v4_ended(&self.station.node_id, self.serial);
+        }
         let _ = self.done_tx.send_replace(true);
     }
 }
@@ -545,9 +629,10 @@ async fn read_control(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
     }
 }
 
-/// One frame from the station: a STATUS renews the station's statement,
-/// every other frame is opened from its neighbour signature at the next seq,
-/// and a GOODBYE ends the link.
+/// One frame from the station: a STATUS renews the station's statement, a
+/// liveness frame is answered or handed to the probe, every other frame is
+/// opened (on v4 from its neighbour signature at the next seq), and a GOODBYE
+/// ends the link.
 fn received(inner: &Arc<Inner>, payload: &[u8], recv_seq: &mut u64) -> Result<(), LinkError> {
     let v = cbor::decode(payload).map_err(|_| LinkError::Frame(FrameError::Malformed))?;
     let frame_type = frame_type_of(&v);
@@ -566,18 +651,10 @@ fn received(inner: &Arc<Inner>, payload: &[u8], recv_seq: &mut u64) -> Result<()
             .store(expires_at + STATUS_GRACE_MS, Ordering::SeqCst);
         return Ok(());
     }
-    let opened = frame::verify_neighbour(
-        &v,
-        &NeighbourPeer {
-            profile: inner.profile,
-            peer_key: inner.station.identity_key.clone(),
-            connection: inner.connection_hash,
-            seq: *recv_seq,
-        },
-    )?;
-    if frame::neighbour_signed(inner.profile, &frame_type) {
-        *recv_seq += 1;
+    if let Some((kind, nonce)) = frame::liveness_nonce(&v) {
+        return liveness(inner, kind, nonce);
     }
+    let opened = opened(inner, &v, &frame_type, recv_seq)?;
     match frame_type.as_str() {
         "event" => pubsub::evented(inner, &opened),
         "result" | "error" => call::replied(inner, &opened),
@@ -590,6 +667,62 @@ fn received(inner: &Arc<Inner>, payload: &[u8], recv_seq: &mut u64) -> Result<()
             return Err(LinkError::Goodbye(reason));
         }
         _ => inner.count(&frame_type),
+    }
+    Ok(())
+}
+
+/// A received frame as the link reads it: on v5 with no neighbour signature,
+/// on v4 opened from its neighbour signature at the next seq.
+fn opened(
+    inner: &Inner,
+    v: &Value,
+    frame_type: &str,
+    recv_seq: &mut u64,
+) -> Result<Value, LinkError> {
+    if inner.version == VERSION_5 {
+        return Ok(frame::verify_session_frame(v)?);
+    }
+    let opened = frame::verify_neighbour(
+        v,
+        &NeighbourPeer {
+            profile: inner.profile,
+            peer_key: inner.station.identity_key.clone(),
+            connection: inner.connection_hash,
+            seq: *recv_seq,
+        },
+    )?;
+    if frame::neighbour_signed(inner.profile, frame_type) {
+        *recv_seq += 1;
+    }
+    Ok(opened)
+}
+
+/// Answers the station's liveness_ping with a liveness_pong of the same
+/// nonce, and hands a liveness_pong to the probe. Neither goes further, and
+/// on a v4 link neither exists.
+fn liveness(
+    inner: &Arc<Inner>,
+    kind: Liveness,
+    nonce: [u8; frame::LIVENESS_NONCE_SIZE],
+) -> Result<(), LinkError> {
+    if inner.version != VERSION_5 {
+        return Err(LinkError::Frame(FrameError::Malformed));
+    }
+    match kind {
+        Liveness::Ping => {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                if let Err(e) = inner
+                    .send_control(&frame::liveness_pong_frame(&nonce))
+                    .await
+                {
+                    inner.end(e);
+                }
+            });
+        }
+        Liveness::Pong => {
+            let _ = inner.pongs.try_send(nonce);
+        }
     }
     Ok(())
 }

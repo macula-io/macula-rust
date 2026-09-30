@@ -16,7 +16,7 @@ use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::pool::{Call, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
 use macula_rust::record::RecordType;
-use macula_rust::station_link::Publication;
+use macula_rust::station_link::{handshake_counters, Publication};
 
 const VARIABLES: [&str; 4] = [
     "MACULA_RUST_LIVE_SEED",
@@ -83,6 +83,10 @@ async fn the_station_holds_verified_node_records() {
         .await
         .unwrap();
     assert!(!records.is_empty());
+    // The fleet's stations answer handshake v5, and nothing fell back.
+    let counters = handshake_counters();
+    assert!(counters["v5_connections"] >= 1, "{counters:?}");
+    assert_eq!(counters["v4_fallbacks"], 0, "{counters:?}");
     pool.close().await;
 }
 

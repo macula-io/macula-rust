@@ -15,6 +15,24 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Added
+
+- Handshake v5 (macula 13.2, DESIGN_NEIGHBOUR_CHANNEL_BINDING): every link
+  dials with v5, whose CONNECT proof (V2) and the station's session proof are
+  bound to the connection's TLS exporter (`EXPORTER-macula-session-v1`), so a
+  handshake cannot be relayed onto another connection. On a v5 link no frame
+  carries a neighbour signature, and the liveness probe is
+  `liveness_ping`/`liveness_pong`. A station never seen on v5 that refuses it
+  with `unsupported_version` is dialled once more with v4, and with v4 for 10
+  minutes. A station seen on v5 in this process that answers v4 is refused
+  (`LinkError::V5DowngradeRefused`) until `station_link::forget_v5_peer`, and
+  a v5 completion ends every open v4 link to the same node (macula#53).
+  `station_link::handshake_counters` counts links by version, fallbacks,
+  refused downgrades and HELLO refusals. `Link::handshake_version`.
+  `handshake::read_hello` takes the `Station` its CONNECT was answered from;
+  `ClientSession` takes `version` and `export`; `StationSession` takes `v5`.
+  Held to macula 8b8bb80a's own v5 frames. Port of macula-go v0.20.0.
+
 #### Fixed
 
 - A macula 13 advertisement that names its provider's KEM key is read, not
