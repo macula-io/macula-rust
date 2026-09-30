@@ -46,7 +46,7 @@ jobs:
       # Dry-run needs no registry auth -- it only verifies metadata,
       # compresses the package, and checks the result, never uploads.
       # This is also the step that proves macula-rust-ffi's `macula-rust
-      # = { path = "..", version = "0.5" }` dependency actually resolves
+      # = { path = "..", version = "0.6" }` dependency actually resolves
       # against the REAL published macula-rust on crates.io, not just the
       # local workspace path -- `cargo publish` downloads and rebuilds
       # against the registry version during verification, confirmed

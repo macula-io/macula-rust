@@ -13,7 +13,11 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [Unreleased]
+### [0.6.0] - 2026-09-30
+
+Handshake v5 and macula 13 compatibility: a link reaches a macula 13.2+
+station bound to its TLS session, and reads an advertisement that names its
+provider's KEM key.
 
 #### Added
 
@@ -423,7 +427,9 @@ same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
 
-### [Unreleased]
+### [ffi-0.6.0] - 2026-09-30
+
+On `macula-rust` 0.6: every link runs handshake v5.
 
 #### Added
 
