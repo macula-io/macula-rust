@@ -405,13 +405,17 @@ same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
 
-### [ffi-0.5.0] - Unreleased
+### [Unreleased]
 
 #### Added
 
 - `FfiError::Confidentiality { reason, advertised }`: a call or an open to
   providers that all name a KEM key this SDK cannot seal to yet, so nothing was
   sent.
+
+### [ffi-0.5.0] - 2026-09-26
+
+#### Added
 
 - `FfiPool::share_content`, `unshare_content` and `get_content`, with
   `FfiContentOptions` (zero for macula's defaults). New `FfiError`s:
