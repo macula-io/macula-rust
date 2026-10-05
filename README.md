@@ -29,9 +29,10 @@
 > handshake v5, bound to its TLS session, and falls back to v4 only for a
 > station never seen on v5. A call or stream to a provider whose
 > advertisement names a KEM key is sealed end to end to that key (macula 13's
-> seal scheme 1), held to macula's vectors and run live against a macula 13
-> provider that requires it (`scripts/interop/sealed.sh`); serving sealed
-> requests is next. Not here yet: UCAN-gated calls;
+> seal scheme 1), and a node with `kem_advertise` on names its key, opens
+> sealed requests and answers them sealed; both directions are held to
+> macula's vectors and run live against macula 13 with `confidential =>
+> required` (`scripts/interop/sealed.sh`). Not here yet: UCAN-gated calls;
 > see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
 > the retired 10.x wire and cannot reach the current fleet.
 
@@ -153,6 +154,7 @@ compatibility layer.
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
 | Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links |
+| End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required` |
 | Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |
 | DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | Records verified before they are handed on |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | `macula-rust-ffi`, below |
@@ -214,6 +216,10 @@ crate 1.89.
 
 - **UCAN-gated calls and serving.** macula 12 uses post-quantum UCANs; calls
   carry no token yet, and a gated procedure cannot be served.
+- **Resealing after a provider's key rotation.** A call or stream sealed to
+  a key the provider no longer holds fails closed with
+  `LinkError::SealedRefused`, naming the provider's new key; it is not sent
+  again sealed to that key.
 - **Station discovery beyond the seeds.** macula's discovery call is not
   served by the fleet today (macula-io/macula#31); give the pool its seeds.
 

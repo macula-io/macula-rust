@@ -38,9 +38,36 @@ usually touches both, but their version numbers don't move in lockstep.
   `KeyMismatch`, `ReplyNotOpened` and `NoSignedState`;
   `ConfidentialityError` gains `named`. The types moved to `station_link`
   and `pool` re-exports them.
+- Serving sealed requests, the provider's side (macula-go 3600218,
+  7f75e1d). `seal::Keyring`: a node's KEM keys in memory only, rotated every
+  24 hours, a replaced key kept 30 minutes. `station_link::Config` takes
+  `keyring` and `kem_advertise`; `pool::Opts` takes `kem_advertise` and
+  gives the node one keyring. `Offer` takes `confidential` and
+  `keyed_since_ms`: a keyed procedure's advertisement names the keyring's
+  current key; a sealed CALL or STREAM_OPEN is opened and every answer and
+  stream frame sealed (a provider's under random nonces, at most 2^32 per
+  stream, `LinkError::SealedFramesExhausted`); what does not open is
+  refused `sealed_refused` naming the key held now; a `Required` procedure,
+  or a `Preferred` one past its keyless window, refuses a clear request
+  `sealed_required`. `Request::sealed` and `Stream::sealed` say a request
+  came sealed; a sealed open's payload is its plaintext.
+  `LinkError::KemAdvertiseDisabled` for a required procedure without
+  `kem_advertise`.
 - `scripts/interop/sealed.sh` and `tests/interop_sealed.rs`: sealed calls and
-  streams from this SDK to an Erlang macula 13 provider with `confidential =>
-  required`, in both profiles.
+  streams both ways, this SDK to an Erlang macula 13 provider and an Erlang
+  macula 13 caller to this SDK, each with `confidential => required`, in
+  both profiles.
+
+#### Changed
+
+- **Breaking:** `Confidentiality` moved from `pool` to `station_link` (`pool`
+  re-exports it) and gained `Off`, which serves a procedure in the clear; a
+  pool call or open with `Off` is `PoolError::InvalidOpts` (macula-go
+  1aa3315), and `"off"` now parses. `pool::Offer` and `station_link::Offer`
+  gained fields.
+- A sealed stream spends its seq before it seals: a frame that then fails
+  to go out ends that side's sending, so nothing is sealed twice under one
+  seq.
 
 #### Fixed
 
@@ -52,9 +79,9 @@ usually touches both, but their version numbers don't move in lockstep.
 
 #### Not yet
 
-- Serving sealed requests (a KEM keyring, `kem_advertise`), and resealing a
-  call or stream to the key a `sealed_refused` names after a provider's key
-  rotation: today such a call fails closed with `SealedRefused`.
+- Resealing a call or stream to the key a `sealed_refused` names after a
+  provider's key rotation: today such a call fails closed with
+  `SealedRefused`.
 
 ### [0.6.0] - 2026-09-30
 
@@ -469,6 +496,20 @@ this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
 same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
+
+### [Unreleased]
+
+#### Added
+
+- `FfiConfidentiality` (`Preferred`, `Required`, `Off`), `FfiPoolOptions`
+  `kem_advertise`, `FfiRequest.sealed` and `FfiStream::sealed` (macula-go
+  7d7a90b, 1aa3315).
+
+#### Changed
+
+- **Breaking:** `FfiPool::call`, `open_stream`, `serve` and `serve_stream`
+  take a last `confidential` argument. A required procedure on a pool
+  without `kem_advertise`, or an `Off` call, is `InvalidArgument`.
 
 ### [ffi-0.6.0] - 2026-09-30
 
