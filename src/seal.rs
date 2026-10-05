@@ -24,6 +24,9 @@ use sha2::{Digest, Sha384};
 use crate::cbor::{self, Value};
 use crate::profile::Profile;
 
+mod keyring;
+pub use keyring::{Clock, Keyring, KEY_LIFETIME_MS, RETIRED_KEY_KEPT_MS};
+
 /// The sealed map's scheme number this module implements.
 pub const SCHEME: i64 = 1;
 
