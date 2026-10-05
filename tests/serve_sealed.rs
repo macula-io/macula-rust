@@ -3,7 +3,9 @@
 //! advertisement names the keyring's current key, a call sealed to it is
 //! opened and answered sealed, a call sealed to a key it does not hold is
 //! refused sealed_refused naming the key it holds, and a required procedure
-//! refuses every clear call sealed_required.
+//! refuses every clear call sealed_required. Streams likewise: a sealed open
+//! is opened, every frame after it sealed both ways, and a refusal after
+//! the open goes sealed.
 
 mod common;
 
@@ -11,13 +13,15 @@ use std::sync::Arc;
 
 use common::TestStations;
 use macula_rust::cbor::Value;
+use macula_rust::frame::{StreamEncoding, StreamMode, StreamRole};
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::profile::Profile;
 use macula_rust::record::{self, read_procedure_advertisement, RecordType};
 use macula_rust::seal::{self, Keyring};
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    handler, Call, Confidentiality, Config, Link, LinkError, Offer, Seal,
+    handler, stream_handler, Call, Confidentiality, Config, Link, LinkError, Offer, Seal, Stream,
+    StreamCall, StreamEvent,
 };
 
 /// A link as a new node, with `keyring` and kem_advertise on when given.
@@ -203,5 +207,183 @@ async fn a_required_procedure_needs_kem_advertise_and_kem_advertise_needs_a_keyr
     assert!(matches!(
         Link::dial(cfg).await,
         Err(LinkError::InvalidConfig(_))
+    ));
+}
+
+/// Every event a stream delivers until it ends, and how it ended.
+async fn drained(stream: &Stream) -> (Vec<StreamEvent>, LinkError) {
+    let mut events = Vec::new();
+    loop {
+        match stream.recv().await {
+            Ok(event) => events.push(event),
+            Err(e) => return (events, e),
+        }
+    }
+}
+
+fn raw(b: &[u8]) -> StreamEvent {
+    StreamEvent::Data {
+        encoding: StreamEncoding::Raw,
+        body: Value::Bytes(b.to_vec()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyed_provider_serves_sealed_streams_both_ways() {
+    let env = TestStations::start(Profile::PqHybrid);
+    let keyring = Arc::new(Keyring::system(env.profile).unwrap());
+    let provider = node(&env, Some(keyring.clone())).await.unwrap();
+    let caller = node(&env, None).await.unwrap();
+    let watch = record::own_procedure(&provider.node_id(), "watch");
+    let count = record::own_procedure(&provider.node_id(), "count");
+    let vault = record::own_procedure(&provider.node_id(), "vault");
+    let guarded = record::own_procedure(&provider.node_id(), "guarded");
+    let _watch = provider
+        .serve(Offer::stream(
+            env.realm_id,
+            &watch,
+            StreamMode::ServerStream,
+            stream_handler(|stream| async move {
+                // The handler reads the open's opened payload.
+                let Value::Bytes(asked) = stream.request().payload.clone() else {
+                    return Err("the open's payload did not open".into());
+                };
+                let sealed = [u8::from(stream.sealed())];
+                for chunk in [&asked[..], b"two", &sealed[..]] {
+                    stream.send(chunk).await.map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }),
+        ))
+        .await
+        .unwrap();
+    let _count = provider
+        .serve(Offer::stream(
+            env.realm_id,
+            &count,
+            StreamMode::ClientStream,
+            stream_handler(|stream| async move {
+                let mut total = 0i128;
+                while let Ok(event) = stream.recv().await {
+                    match event {
+                        StreamEvent::Data {
+                            body: Value::Bytes(b),
+                            ..
+                        } => total += b.len() as i128,
+                        StreamEvent::End { .. } => break,
+                        _ => {}
+                    }
+                }
+                stream
+                    .reply(Value::Int(total))
+                    .await
+                    .map_err(|e| e.to_string())
+            }),
+        ))
+        .await
+        .unwrap();
+    let _vault = provider
+        .serve(echo(env.realm_id, &vault, Confidentiality::Preferred))
+        .await
+        .unwrap();
+    let mut required = Offer::stream(
+        env.realm_id,
+        &guarded,
+        StreamMode::ServerStream,
+        stream_handler(|_| async move { Ok(()) }),
+    );
+    required.confidential = Confidentiality::Required;
+    let _guarded = provider.serve(required).await.unwrap();
+
+    let key = advertised_key(&caller, &watch).await.unwrap();
+    let open = |procedure: &str, mode, seal: Seal| StreamCall {
+        realm: env.realm_id,
+        procedure: procedure.to_string(),
+        target: provider.node_id(),
+        mode,
+        payload: Value::Bytes(b"one".to_vec()),
+        seal: Some(seal),
+        ..StreamCall::default()
+    };
+    let to = Seal::To(key.clone());
+
+    let stream = caller
+        .open_stream(open(&watch, StreamMode::ServerStream, to.clone()))
+        .await
+        .unwrap();
+    assert!(stream.sealed());
+    let (events, ended) = drained(&stream).await;
+    assert_eq!(
+        events,
+        vec![
+            raw(b"one"),
+            raw(b"two"),
+            raw(&[1]),
+            StreamEvent::End {
+                role: StreamRole::Both
+            }
+        ]
+    );
+    assert_eq!(ended, LinkError::EndOfStream);
+
+    let stream = caller
+        .open_stream(open(&count, StreamMode::ClientStream, to.clone()))
+        .await
+        .unwrap();
+    for chunk in [&b"abc"[..], b"de"] {
+        stream.send(chunk).await.unwrap();
+    }
+    stream.close_send().await.unwrap();
+    let (events, _) = drained(&stream).await;
+    assert_eq!(
+        events,
+        vec![StreamEvent::Reply {
+            payload: Value::Int(5)
+        }]
+    );
+
+    // A refusal after the open opened goes sealed, and opens to its code.
+    let stream = caller
+        .open_stream(open(&vault, StreamMode::ServerStream, to))
+        .await
+        .unwrap();
+    assert!(matches!(
+        drained(&stream).await.1,
+        LinkError::Stream { code, .. } if code == "not_found"
+    ));
+
+    // Sealed to a key the provider never held: refused in the clear, naming
+    // the key it holds now.
+    let stranger = seal::PrivateKey::generate(env.profile).unwrap();
+    let stream = caller
+        .open_stream(open(
+            &watch,
+            StreamMode::ServerStream,
+            Seal::To(stranger.public_key().carried().to_vec()),
+        ))
+        .await
+        .unwrap();
+    let current: String = keyring
+        .current_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        drained(&stream).await.1,
+        LinkError::Stream {
+            code: "sealed_refused".into(),
+            message: current,
+            relay: false
+        }
+    );
+
+    // A clear open of a required procedure is refused sealed_required.
+    let stream = caller
+        .open_stream(open(&guarded, StreamMode::ServerStream, Seal::Clear))
+        .await
+        .unwrap();
+    assert!(matches!(
+        drained(&stream).await.1,
+        LinkError::Stream { code, .. } if code == "sealed_required"
     ));
 }

@@ -458,14 +458,20 @@ impl CallSeal {
     }
 }
 
-/// One side's keys for a sealed stream: a caller's frames seal under k_c2p
-/// with their seq as the nonce; a provider's under k_p2c with a random nonce
-/// each, carried. A STREAM_END has nothing to seal. Showing it gives the key
-/// id, never a key.
+/// A provider seals at most this many frames under random nonces on one
+/// stream: GCM's bound, as macula's max_sealed_frames.
+const MAX_SEALED_PROVIDER_FRAMES: u64 = 1 << 32;
+
+/// One side's keys for a sealed stream (macula 13's E2E design §5.2): a
+/// caller's frames seal under k_c2p with their seq as the nonce; a
+/// provider's under k_p2c with a random nonce each, carried, since a
+/// provider restarted by a retried open numbers from 0 again. A STREAM_END
+/// has nothing to seal. Showing it gives the key id, never a key.
 #[derive(Clone)]
 pub(super) struct StreamSeal {
     key_id: [u8; KEY_ID_SIZE],
     request_id: [u8; 16],
+    caller: bool,
     send: [u8; 32],
     recv: [u8; 32],
 }
@@ -476,29 +482,49 @@ impl fmt::Debug for StreamSeal {
     }
 }
 
+/// What a sealable frame seals: its type's name and its plaintext.
+pub(super) struct StreamPlain {
+    frame_type: &'static str,
+    plain: Vec<u8>,
+}
+
 impl StreamSeal {
     /// The caller's side of the stream `s` opened.
     pub(super) fn caller(s: &CallSeal) -> StreamSeal {
         StreamSeal {
             key_id: s.key_id,
             request_id: s.request.request_id,
+            caller: true,
             send: s.k_c2p,
             recv: s.k_p2c,
         }
     }
 
-    /// `fields` with its body, payload, or code and message sealed. The
+    /// The provider's side of the stream `s` opened.
+    pub(super) fn provider(s: &CallSeal) -> StreamSeal {
+        StreamSeal {
+            key_id: s.key_id,
+            request_id: s.request.request_id,
+            caller: false,
+            send: s.k_p2c,
+            recv: s.k_c2p,
+        }
+    }
+
+    fn directions(&self) -> (Direction, Direction) {
+        match self.caller {
+            true => (Direction::CallerToProvider, Direction::ProviderToCaller),
+            false => (Direction::ProviderToCaller, Direction::CallerToProvider),
+        }
+    }
+
+    /// What `fields` seals, checked before any nonce is spent: the
     /// plaintext of a raw chunk is its bytes, of a structured chunk or a
     /// reply the value's CBOR, and of a STREAM_ERROR cbor([code, message]),
-    /// as macula_stream's plain_of/1 has them.
-    pub(super) fn sealed(&self, fields: StreamFields) -> Result<StreamFields, LinkError> {
-        let seq = match &fields {
-            StreamFields::Data { seq, .. }
-            | StreamFields::Error { seq, .. }
-            | StreamFields::Reply { seq, .. } => *seq,
-            _ => return Ok(fields),
-        };
-        let (frame_type, plain) = match &fields {
+    /// as macula_stream's plain_of/1 has them. `None` for a STREAM_END,
+    /// which goes as it is.
+    pub(super) fn plain_of(&self, fields: &StreamFields) -> Result<Option<StreamPlain>, LinkError> {
+        let (frame_type, plain) = match fields {
             StreamFields::Data {
                 encoding: StreamEncoding::Raw,
                 body: Value::Bytes(b),
@@ -523,19 +549,38 @@ impl StreamSeal {
             StreamFields::Error { code, message, .. } => {
                 ("stream_error", seal::error_plain(code, message))
             }
-            _ => unreachable!("only the three sealable frames reach here"),
+            _ => return Ok(None),
         };
-        let aad = seal::stream_aad(
-            frame_type,
-            &self.request_id,
-            seq,
-            Direction::CallerToProvider,
-        );
+        if !self.caller && fields.seq() >= MAX_SEALED_PROVIDER_FRAMES {
+            return Err(LinkError::SealedFramesExhausted);
+        }
+        Ok(Some(StreamPlain { frame_type, plain }))
+    }
+
+    /// `fields` with what [`Self::plain_of`] took from it sealed in place.
+    /// Each call spends a nonce: the caller's seq or a fresh random one, so
+    /// a sender takes the seq before it seals and never seals under it
+    /// again.
+    pub(super) fn sealed(
+        &self,
+        fields: StreamFields,
+        p: StreamPlain,
+    ) -> Result<StreamFields, LinkError> {
+        let seq = fields.seq();
+        let (nonce, carried) = match self.caller {
+            true => (seal::stream_nonce(seq), None),
+            false => {
+                let nonce =
+                    seal::random_nonce().map_err(|_| LinkError::Io("no randomness".into()))?;
+                (nonce, Some(nonce.to_vec()))
+            }
+        };
+        let aad = seal::stream_aad(p.frame_type, &self.request_id, seq, self.directions().0);
         let sealed = Sealed {
             key_id: self.key_id,
             kem_ct: None,
-            nonce: None,
-            ct: seal::seal(&self.send, &seal::stream_nonce(seq), &aad, &plain),
+            nonce: carried,
+            ct: seal::seal(&self.send, &nonce, &aad, &p.plain),
         };
         Ok(match fields {
             StreamFields::Data { encoding, .. } => StreamFields::SealedData {
@@ -548,7 +593,7 @@ impl StreamSeal {
         })
     }
 
-    /// A verified sealed frame from the provider with its body, payload, or
+    /// A verified sealed frame from the peer with its body, payload, or
     /// code and message opened; one that does not open, or opens to nothing
     /// its type holds, is reply_not_opened.
     pub(super) fn opened(&self, frame: VerifiedStreamFrame) -> Result<StreamFields, LinkError> {
@@ -564,17 +609,16 @@ impl StreamSeal {
         if sealed.key_id != self.key_id {
             return Err(not_opened());
         }
-        let nonce: [u8; NONCE_SIZE] = sealed
-            .nonce
-            .as_deref()
-            .and_then(|n| n.try_into().ok())
-            .ok_or_else(not_opened)?;
-        let aad = seal::stream_aad(
-            frame_type,
-            &self.request_id,
-            seq,
-            Direction::ProviderToCaller,
-        );
+        // A provider's frame carries its nonce; a caller's is its seq.
+        let nonce: [u8; NONCE_SIZE] = match self.caller {
+            true => sealed
+                .nonce
+                .as_deref()
+                .and_then(|n| n.try_into().ok())
+                .ok_or_else(not_opened)?,
+            false => seal::stream_nonce(seq),
+        };
+        let aad = seal::stream_aad(frame_type, &self.request_id, seq, self.directions().1);
         let plain = seal::open(&self.recv, &nonce, &aad, &sealed.ct).map_err(|_| not_opened())?;
         match frame.fields {
             StreamFields::SealedData {
@@ -610,13 +654,13 @@ fn encoded(v: &Value) -> Result<Vec<u8>, LinkError> {
     cbor::encode(v).map_err(|e| LinkError::Frame(frame::FrameError::Payload(e.to_string())))
 }
 
-/// A verified frame from the provider as a caller's stream takes it, as
-/// macula_stream's peer_event/2 does. A clear stream takes no sealed frame:
-/// that ends the session as sealed_refused, this node holding no key for it.
-/// A sealed stream opens each sealed frame before anything of it takes
-/// effect, and takes nothing clear but a STREAM_END and the provider's
-/// refusal of the open at seq 0: sealed_refused, or one from the closed set.
-/// Anything else clear is [`LinkError::ClearAnswerToSealed`].
+/// A verified frame from the peer as a stream takes it, as macula_stream's
+/// peer_event/2 does. A clear stream takes no sealed frame: that ends the
+/// session as sealed_refused, this node holding no key for it. A sealed
+/// stream opens each sealed frame before anything of it takes effect, and
+/// takes nothing clear but a STREAM_END and, on a caller's side, the
+/// provider's refusal of the open at seq 0: sealed_refused, or one from the
+/// closed set. Anything else clear is [`LinkError::ClearAnswerToSealed`].
 pub(super) fn unsealed(
     frame: VerifiedStreamFrame,
     sealing: Option<&StreamSeal>,
@@ -636,8 +680,8 @@ pub(super) fn unsealed(
         (None, false, _) => Ok(frame.fields),
         (Some(s), true, _) => s.opened(frame),
         (Some(_), false, StreamFields::End { .. }) => Ok(frame.fields),
-        (Some(_), false, StreamFields::Error { seq: 0, code, .. })
-            if code == CODE_SEALED_REFUSED || is_clear_refusal(code) =>
+        (Some(s), false, StreamFields::Error { seq: 0, code, .. })
+            if s.caller && (code == CODE_SEALED_REFUSED || is_clear_refusal(code)) =>
         {
             Ok(frame.fields)
         }
@@ -648,6 +692,232 @@ pub(super) fn unsealed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::{ReplyType, RequestType};
+
+    const CALLER: [u8; 32] = [1; 32];
+    const PROVIDER: [u8; 32] = [2; 32];
+
+    /// A request sealed by a caller to `keyring`'s current key, as the
+    /// provider verified it, and the caller's keys.
+    fn sealed_to(keyring: &Keyring, frame_type: RequestType) -> (VerifiedRequest, CallSeal) {
+        let name = match frame_type {
+            RequestType::Call => seal::FRAME_CALL,
+            RequestType::StreamOpen => seal::FRAME_STREAM_OPEN,
+        };
+        let to = keyring.current().public_key().carried().to_vec();
+        let (sealed, caller) = sealed_request(
+            keyring.profile(),
+            &to,
+            name,
+            [3; 32],
+            "~ring",
+            CALLER,
+            PROVIDER,
+            [4; 16],
+            1_790_000_000_000,
+            &Value::text("secret"),
+        )
+        .unwrap();
+        let request = VerifiedRequest {
+            frame_type,
+            key: Vec::new(),
+            request_hash: [5; 48],
+            caller: CALLER,
+            request_id: [4; 16],
+            realm: [3; 32],
+            procedure: "~ring".into(),
+            target: PROVIDER,
+            deadline: 1_790_000_000_000,
+            payload: Value::Null,
+            sealed: Some(sealed),
+            mode: None,
+            token: None,
+            proofs: None,
+        };
+        (request, caller)
+    }
+
+    fn clear_reply(frame_type: ReplyType, code: Option<&str>) -> VerifiedReply {
+        VerifiedReply {
+            frame_type,
+            responded_by: PROVIDER,
+            payload: code.is_none().then(|| Value::text("in the clear")),
+            code: code.map(str::to_string),
+            detail: None,
+            sealed: None,
+        }
+    }
+
+    #[test]
+    fn a_provider_opens_what_a_caller_sealed_and_its_answer_opens_to_the_caller() {
+        let keyring = Keyring::system(Profile::PqHybrid).unwrap();
+        let (request, caller) = sealed_to(&keyring, RequestType::Call);
+        let (payload, provider) = opened_request(Some(&keyring), &request).unwrap();
+        assert_eq!(payload, Value::text("secret"));
+
+        let plain = cbor::encode(&Value::text("answer")).unwrap();
+        let sealed = provider
+            .sealed_answer(seal::FRAME_RESULT, &plain, &request.request_hash, &PROVIDER)
+            .unwrap();
+        let reply = VerifiedReply {
+            frame_type: ReplyType::Result,
+            responded_by: PROVIDER,
+            payload: None,
+            code: None,
+            detail: None,
+            sealed: Some(sealed),
+        };
+        assert_eq!(
+            reply_outcome(reply, &request, Some(&caller)),
+            Ok(Value::text("answer"))
+        );
+    }
+
+    #[test]
+    fn a_sealed_request_this_node_cannot_open_is_refused_naming_its_key() {
+        let keyring = Keyring::system(Profile::PqPure).unwrap();
+        let other = Keyring::system(Profile::PqPure).unwrap();
+        let (request, _) = sealed_to(&other, RequestType::Call);
+        assert_eq!(
+            opened_request(Some(&keyring), &request).err(),
+            Some(hex(&keyring.current_id()))
+        );
+        assert_eq!(
+            opened_request(None, &request).err().as_deref(),
+            Some(NO_KEY_DETAIL)
+        );
+    }
+
+    /// Venus's review of package 1, observation 2: a forged clear answer to
+    /// a sealed call is never taken, unless it is sealed_refused or a
+    /// refusal from the closed set.
+    #[test]
+    fn a_forged_clear_answer_to_a_sealed_call_is_refused() {
+        let keyring = Keyring::system(Profile::PqPure).unwrap();
+        let (request, caller) = sealed_to(&keyring, RequestType::Call);
+        for forged in [
+            clear_reply(ReplyType::Result, None),
+            clear_reply(ReplyType::Error, Some("handler_error")),
+            clear_reply(ReplyType::Error, Some("sealed_required")),
+        ] {
+            assert_eq!(
+                reply_outcome(forged.clone(), &request, Some(&caller)),
+                Err(LinkError::ClearAnswerToSealed),
+                "{forged:?}"
+            );
+        }
+        assert!(matches!(
+            reply_outcome(
+                clear_reply(ReplyType::Error, Some("caller_quota")),
+                &request,
+                Some(&caller)
+            ),
+            Err(LinkError::Provider { code, .. }) if code == "caller_quota"
+        ));
+        assert_eq!(
+            reply_outcome(
+                clear_reply(ReplyType::Error, Some(CODE_SEALED_REFUSED)),
+                &request,
+                Some(&caller)
+            ),
+            Err(LinkError::SealedRefused { named: None })
+        );
+    }
+
+    fn data(seq: u64, body: &[u8]) -> StreamFields {
+        StreamFields::Data {
+            seq,
+            encoding: StreamEncoding::Raw,
+            body: Value::Bytes(body.to_vec()),
+        }
+    }
+
+    fn sealed(side: &StreamSeal, fields: StreamFields) -> StreamFields {
+        let plain = side.plain_of(&fields).unwrap().unwrap();
+        side.sealed(fields, plain).unwrap()
+    }
+
+    fn from(signer: [u8; 32], fields: StreamFields) -> VerifiedStreamFrame {
+        VerifiedStreamFrame { signer, fields }
+    }
+
+    #[test]
+    fn each_side_of_a_sealed_stream_opens_what_the_other_sealed() {
+        let keyring = Keyring::system(Profile::PqHybrid).unwrap();
+        let (open, caller_seal) = sealed_to(&keyring, RequestType::StreamOpen);
+        let (_, provider_seal) = opened_request(Some(&keyring), &open).unwrap();
+        let (caller, provider) = (
+            StreamSeal::caller(&caller_seal),
+            StreamSeal::provider(&provider_seal),
+        );
+
+        let up = sealed(&caller, data(0, b"up"));
+        assert_eq!(
+            unsealed(from(CALLER, up), Some(&provider)),
+            Ok(data(0, b"up"))
+        );
+        // A provider's frames carry a fresh random nonce each.
+        let (one, two) = (
+            sealed(&provider, data(0, b"down")),
+            sealed(&provider, data(0, b"down")),
+        );
+        let nonce = |f: &StreamFields| match f {
+            StreamFields::SealedData { sealed, .. } => sealed.nonce.clone().unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(nonce(&one), nonce(&two));
+        assert_eq!(
+            unsealed(from(PROVIDER, one), Some(&caller)),
+            Ok(data(0, b"down"))
+        );
+        // Sealed by the caller, a frame does not open as the provider's.
+        let up = sealed(&caller, data(1, b"up"));
+        assert!(matches!(
+            unsealed(from(CALLER, up), Some(&caller)),
+            Err(LinkError::Confidentiality(_))
+        ));
+    }
+
+    /// Venus's review of package 1, observation 2: a forged clear frame on
+    /// a sealed stream is refused on either side; only a caller takes the
+    /// provider's clear refusal of the open at seq 0.
+    #[test]
+    fn a_forged_clear_frame_on_a_sealed_stream_is_refused() {
+        let keyring = Keyring::system(Profile::PqPure).unwrap();
+        let (open, caller_seal) = sealed_to(&keyring, RequestType::StreamOpen);
+        let (_, provider_seal) = opened_request(Some(&keyring), &open).unwrap();
+        let (caller, provider) = (
+            StreamSeal::caller(&caller_seal),
+            StreamSeal::provider(&provider_seal),
+        );
+        let refusal = StreamFields::Error {
+            seq: 0,
+            code: CODE_SEALED_REFUSED.into(),
+            message: String::new(),
+        };
+        for side in [&caller, &provider] {
+            assert_eq!(
+                unsealed(from(PROVIDER, data(0, b"clear")), Some(side)),
+                Err(LinkError::ClearAnswerToSealed)
+            );
+            let reply = StreamFields::Reply {
+                seq: 1,
+                payload: Value::Null,
+            };
+            assert_eq!(
+                unsealed(from(PROVIDER, reply), Some(side)),
+                Err(LinkError::ClearAnswerToSealed)
+            );
+        }
+        assert_eq!(
+            unsealed(from(PROVIDER, refusal.clone()), Some(&caller)),
+            Ok(refusal.clone())
+        );
+        assert_eq!(
+            unsealed(from(CALLER, refusal), Some(&provider)),
+            Err(LinkError::ClearAnswerToSealed)
+        );
+    }
 
     #[test]
     fn a_keyed_procedure_takes_clear_calls_only_within_its_keyless_window() {

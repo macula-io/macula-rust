@@ -157,6 +157,9 @@ pub enum LinkError {
     /// relay error, not a refusal from the closed set, not sealed_refused.
     /// Refused, never taken as the answer.
     ClearAnswerToSealed,
+    /// A provider's sealed stream that has sealed all the frames GCM's
+    /// bound allows under random nonces: another would pass it.
+    SealedFramesExhausted,
 }
 
 impl fmt::Display for LinkError {

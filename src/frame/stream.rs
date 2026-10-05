@@ -121,7 +121,8 @@ pub enum StreamFields {
 }
 
 impl StreamFields {
-    fn seq(&self) -> u64 {
+    /// The frame's seq.
+    pub fn seq(&self) -> u64 {
         match self {
             StreamFields::Data { seq, .. }
             | StreamFields::End { seq, .. }

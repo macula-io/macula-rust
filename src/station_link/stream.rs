@@ -29,7 +29,8 @@ use crate::frame::{
 
 use super::admission::{Admission, SessionPlace, Verdict};
 use super::confidential::{
-    sealed_request, stated, unsealed, Seal, StreamSeal, CODE_SEALED_REFUSED, NO_KEY_DETAIL,
+    clear_allowed, opened_request, sealed_request, stated, unsealed, Seal, StreamSeal,
+    CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
 };
 use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
 use super::serve::{bounded_detail, BoxFuture, StreamOffer, CODE_REQUEST_COPY};
@@ -159,9 +160,16 @@ struct StreamSide {
 
 impl Stream {
     /// The stream's verified STREAM_OPEN: its caller, procedure, mode and
-    /// payload.
+    /// payload. On a provider's side of a sealed stream the payload is the
+    /// open's opened plaintext.
     pub fn request(&self) -> &VerifiedRequest {
         &self.inner.open
+    }
+
+    /// Whether the stream is sealed end to end: every chunk, reply and
+    /// error after the open travels sealed.
+    pub fn sealed(&self) -> bool {
+        self.inner.sealing.is_some()
     }
 
     /// Sends a raw chunk.
@@ -305,7 +313,10 @@ impl StreamInner {
 
     /// Signs the fields `at(seq)` builds at this side's next seq and writes
     /// them; `last` marks this side's last frame, after which its QUIC
-    /// direction is finished.
+    /// direction is finished. On a sealed stream the seq is spent before
+    /// anything is sealed under it: a frame that then fails to go out ends
+    /// this side's sending, so nothing is ever sealed twice under one
+    /// (key, seq).
     async fn send(
         self: &Arc<Self>,
         at: impl FnOnce(u64) -> StreamFields,
@@ -315,22 +326,36 @@ impl StreamInner {
         if self.side().sent_end {
             return Err(LinkError::StreamClosed);
         }
-        let fields = match &self.sealing {
-            Some(sealing) => sealing.sealed(at(*seq))?,
-            None => at(*seq),
+        let fields = at(*seq);
+        let plain = match &self.sealing {
+            Some(sealing) => sealing.plain_of(&fields)?,
+            None => None,
         };
-        let signed = if self.caller {
-            frame::sign_caller_stream(&fields, &self.open, &self.link.key)?
-        } else {
-            frame::sign_provider_stream(&fields, &self.open, &self.link.key)?
+        let spent = plain.is_some();
+        let fields = match (&self.sealing, plain) {
+            (Some(sealing), Some(plain)) => {
+                *seq += 1;
+                let sealed = sealing.sealed(fields, plain);
+                sealed.inspect_err(|_| self.side().sent_end = true)?
+            }
+            _ => fields,
         };
-        let encoded = cbor::encode(&signed)
-            .map_err(|e| LinkError::Frame(frame::FrameError::Payload(e.to_string())))?;
+        let encoded = match self.signed(&fields) {
+            Ok(encoded) => encoded,
+            Err(e) => {
+                if spent {
+                    self.side().sent_end = true;
+                }
+                return Err(e);
+            }
+        };
         if let Err(e) = self.writer.write(&encoded, MAX_FRAME_BYTES).await {
             self.side().sent_end = true;
             return Err(e);
         }
-        *seq += 1;
+        if !spent {
+            *seq += 1;
+        }
         if last {
             let peer_ended = {
                 let mut side = self.side();
@@ -343,6 +368,17 @@ impl StreamInner {
             }
         }
         Ok(())
+    }
+
+    /// `fields` signed by this side's key and encoded.
+    fn signed(&self, fields: &StreamFields) -> Result<Vec<u8>, LinkError> {
+        let signed = if self.caller {
+            frame::sign_caller_stream(fields, &self.open, &self.link.key)?
+        } else {
+            frame::sign_provider_stream(fields, &self.open, &self.link.key)?
+        };
+        cbor::encode(&signed)
+            .map_err(|e| LinkError::Frame(frame::FrameError::Payload(e.to_string())))
     }
 
     async fn abort(self: &Arc<Self>, code: &str, message: &str) -> Result<(), LinkError> {
@@ -599,19 +635,50 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
         abandon(send, recv);
         return;
     };
-    let s = StreamInner::new(inner.clone(), send, open.clone(), false, None);
-    let offer = match admit_stream(&inner, &open) {
-        Ok(offer) => offer,
-        Err(code) => return refuse(&s, code, "", recv).await,
+    let offer = inner
+        .lock()
+        .served
+        .get(&(open.realm, open.procedure.clone()))
+        .map(|s| s.offer.clone());
+    let refuse_clear = |code: &str, message: &str, send: quinn::SendStream, recv| {
+        let s = StreamInner::new(inner.clone(), send, open.clone(), false, None);
+        let (code, message) = (code.to_string(), message.to_string());
+        async move { refuse(&s, &code, &message, recv).await }
     };
-    // This node opens no sealed payload: a sealed open is refused, never
-    // served on a payload it cannot read.
-    if open.sealed.is_some() {
-        return refuse(&s, CODE_SEALED_REFUSED, NO_KEY_DETAIL, recv).await;
+    // Before the open is opened, so a caller over its admission or at its
+    // session cap costs no decapsulation: in the clear, from the closed set.
+    let place = match admit_stream(&inner, &open) {
+        Ok(place) => place,
+        Err(code) => return refuse_clear(code, "", send, recv).await,
+    };
+    let (session_open, sealing) = match &open.sealed {
+        Some(_) => match opened_request(inner.keyring.as_deref(), &open) {
+            Ok((payload, sealed)) => (
+                VerifiedRequest {
+                    payload,
+                    ..open.clone()
+                },
+                Some(StreamSeal::provider(&sealed)),
+            ),
+            Err(detail) => return refuse_clear(CODE_SEALED_REFUSED, &detail, send, recv).await,
+        },
+        None if offer
+            .as_ref()
+            .is_some_and(|o| !clear_allowed(o.confidential, inner.keyed_since(o), now_ms())) =>
+        {
+            let message = "this procedure takes sealed opens only";
+            return refuse_clear(CODE_SEALED_REQUIRED, message, send, recv).await;
+        }
+        None => (open.clone(), None),
+    };
+    // From here a refusal of a sealed open goes sealed.
+    let s = StreamInner::new(inner.clone(), send, session_open, false, sealing);
+    let Some(offer) = offer.and_then(|o| o.stream) else {
+        return refuse(&s, CODE_STREAM_NOT_FOUND, "", recv).await;
+    };
+    if Some(offer.mode) != open.mode {
+        return refuse(&s, CODE_MODE_MISMATCH, "", recv).await;
     }
-    let Some(place) = inner.admission.open_session(open.caller) else {
-        return refuse(&s, CODE_TOO_MANY_SESSIONS, "", recv).await;
-    };
     *s.budget() = Some(Budget {
         admission: inner.admission.clone(),
         caller: open.caller,
@@ -626,25 +693,19 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     tokio::spawn(serve(s, offer));
 }
 
-/// Judges an open as macula's link does, in its order: the admission (one
-/// run per request, the deadline window, its bounds), the procedure served
-/// here as a stream, and its mode. The offer, or the code to refuse with.
-fn admit_stream(inner: &Inner, open: &VerifiedRequest) -> Result<StreamOffer, &'static str> {
+/// Admits an open as macula's link does, before anything of it is opened:
+/// one run per request, the deadline window and its bounds, then a place
+/// among the caller's sessions. The place, or the code to refuse with.
+fn admit_stream(inner: &Inner, open: &VerifiedRequest) -> Result<SessionPlace, &'static str> {
     match inner.admission.admit(open, &inner.share, now_ms()) {
         Verdict::Refused(code) => return Err(code),
         Verdict::Copy(_) => return Err(CODE_REQUEST_COPY),
         Verdict::New => {}
     }
-    let state = inner.lock();
-    let offer = state
-        .served
-        .get(&(open.realm, open.procedure.clone()))
-        .and_then(|s| s.offer.stream.clone())
-        .ok_or(CODE_STREAM_NOT_FOUND)?;
-    if Some(offer.mode) != open.mode {
-        return Err(CODE_MODE_MISMATCH);
-    }
-    Ok(offer)
+    inner
+        .admission
+        .open_session(open.caller)
+        .ok_or(CODE_TOO_MANY_SESSIONS)
 }
 
 /// Answers an open with a STREAM_ERROR of `code` and `message` at seq 0 and
