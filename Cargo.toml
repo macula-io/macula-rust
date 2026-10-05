@@ -3,7 +3,7 @@ members = ["macula-rust-ffi"]
 
 [package]
 name = "macula-rust"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Macula <raf.lefever@erlef.org>"]

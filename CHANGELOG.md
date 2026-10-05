@@ -13,7 +13,9 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [Unreleased]
+### [0.7.0] - 2026-10-06
+
+macula 13's end-to-end sealing on both sides, and the caller's seal report.
 
 #### Added
 
@@ -510,7 +512,9 @@ same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
 
-### [Unreleased]
+### [ffi-0.7.0] - 2026-10-06
+
+On `macula-rust` 0.7: sealing and the seal report through the bindings.
 
 #### Added
 

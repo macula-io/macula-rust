@@ -31,9 +31,9 @@
 > advertisement names a KEM key is sealed end to end to that key (macula 13's
 > seal scheme 1), and a node with `kem_advertise` on names its key, opens
 > sealed requests and answers them sealed, and a caller's seal report says
-> whether the exchange behind a result was sealed and to which key; both directions are held to
-> macula's vectors and run live against macula 13 with `confidential =>
-> required` (`scripts/interop/sealed.sh`). Not here yet: UCAN-gated calls;
+> whether the exchange behind a result was sealed and to which key; both
+> directions are held to macula's vectors and run live against macula 13
+> with `confidential => required` (`scripts/interop/sealed.sh`). Not here yet: UCAN-gated calls;
 > see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
 > the retired 10.x wire and cannot reach the current fleet.
 
@@ -56,7 +56,7 @@ Swift. The core crate has no FFI dependency and no FFI-shaped types.
 
 ```toml
 [dependencies]
-macula-rust = "0.6"
+macula-rust = "0.7"
 tokio = { version = "1", features = ["full"] }
 ```
 
