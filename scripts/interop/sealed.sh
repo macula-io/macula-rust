@@ -10,7 +10,7 @@
 #
 # erlang_sealed.escript is macula-go's (scripts/interop at 0cb83e8), unchanged.
 # Needs target/teststation (scripts/build-teststation.sh). CGROUP_PARENT puts
-# the containers in a slice (msi00: ci-runners.slice).
+# the containers in a CI host's cgroup slice.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 image="${MACULA_CI_IMAGE:-ghcr.io/macula-io/macula-ci-otp:20260923-1347@sha256:b2260d084a3d3c5e0b74932c4ee052a0cadfddddb6587d5d2214873e6bb06330}"
