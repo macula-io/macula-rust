@@ -14,7 +14,6 @@
 //! answered is remembered until its advertisement expires.
 
 use std::collections::HashSet;
-use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,7 +25,10 @@ use crate::cbor::Value;
 use crate::frame::StreamMode;
 use crate::record::{self, RecordType, Trust, Verified};
 use crate::seal::KEY_ID_SIZE;
-use crate::station_link::{self, Link, LinkError, Stream, DEFAULT_CALL_TIMEOUT};
+use crate::station_link::{
+    self, ConfidentialityError, ConfidentialityReason, Link, LinkError, Seal, Stream,
+    DEFAULT_CALL_TIMEOUT,
+};
 use crate::transport::Target;
 
 use super::{Pool, PoolError, PoolInner};
@@ -37,16 +39,16 @@ const MIN_CANDIDATE_SHARE: Duration = Duration::from_secs(1);
 /// How a call or an open must be kept, as macula-go's options name it
 /// (macula 13, E2E design §8): `Preferred`, the default, or `Required`.
 /// There is no `off`: only an advertisement naming no key is called in the
-/// clear. This SDK seals nothing yet, so a provider whose advertisement names
-/// a KEM key is never called, and `Required` calls no provider: a lookup can
-/// deny a call, never downgrade it.
+/// clear. A provider whose advertisement names a KEM key is always called
+/// sealed to that key; a lookup can deny a call, never downgrade it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Confidentiality {
-    /// A provider whose advertisement names no KEM key is called in the
-    /// clear.
+    /// Sealed to a provider whose advertisement names a KEM key, and in the
+    /// clear to one whose advertisements name none.
     #[default]
     Preferred,
-    /// Only a sealed call, which this SDK does not make yet.
+    /// Sealed only: a provider whose advertisement names no key is not
+    /// called.
     Required,
 }
 
@@ -67,46 +69,6 @@ impl FromStr for Confidentiality {
                 "confidential is preferred or required, not {other:?}"
             ))),
         }
-    }
-}
-
-/// Why a call could not be kept confidential, as macula's
-/// {error, {confidentiality, Reason}} names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfidentialityReason {
-    /// Every trusted provider names a KEM key this node cannot seal to, or
-    /// the call requires a seal and none can be made.
-    NoKemKey,
-}
-
-impl ConfidentialityReason {
-    /// The reason as macula names it.
-    pub fn name(self) -> &'static str {
-        match self {
-            ConfidentialityReason::NoKemKey => "no_kem_key",
-        }
-    }
-}
-
-/// A call or an open that could not be kept confidential, and so was not
-/// made: nothing was sent. `advertised` holds the key ids the trusted
-/// providers' advertisements named.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfidentialityError {
-    pub reason: ConfidentialityReason,
-    pub advertised: Vec<[u8; KEY_ID_SIZE]>,
-}
-
-impl fmt::Display for ConfidentialityError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "confidentiality: {}", self.reason.name())?;
-        for id in &self.advertised {
-            f.write_str(" ")?;
-            for b in id {
-                write!(f, "{b:02x}")?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -182,13 +144,28 @@ pub struct Provider {
 }
 
 /// A trusted advertisement: its provider, serving station, times, and the
-/// id of the KEM key it names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// KEM key it names, as carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Candidate {
     provider: Provider,
     expires_at: u64,
     created_at: u64,
-    kem_key_id: Option<[u8; KEY_ID_SIZE]>,
+    kem_key: Option<Vec<u8>>,
+}
+
+impl Candidate {
+    /// How a call to this candidate is kept: sealed to the key its
+    /// advertisement names, or clear when it names none.
+    fn seal(&self) -> Seal {
+        match &self.kem_key {
+            Some(key) => Seal::To(key.clone()),
+            None => Seal::Clear,
+        }
+    }
+
+    fn kem_key_id(&self) -> Option<[u8; KEY_ID_SIZE]> {
+        self.kem_key.as_deref().map(crate::seal::key_id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -367,7 +344,7 @@ impl PoolInner {
         key: &ResolvedKey,
         realm_key: Option<Vec<u8>>,
     ) -> Result<Vec<Candidate>, PoolError> {
-        let remembered = self.lock().remember.get(key).copied();
+        let remembered = self.lock().remember.get(key).cloned();
         if let Some(cand) = remembered {
             if cand.expires_at as i64 > now_ms() && self.linked_to(&cand.provider.station).is_some()
             {
@@ -411,7 +388,7 @@ impl PoolInner {
                     },
                     expires_at: v.record().expires_at,
                     created_at: v.record().created_at,
-                    kem_key_id: ad.kem_key.map(|(_, id)| id),
+                    kem_key: ad.kem_key.map(|(key, _)| key),
                 })
             })
             .collect();
@@ -463,6 +440,7 @@ impl PoolInner {
                 timeout: left.max(Duration::from_millis(1)),
                 token: c.token.clone(),
                 proofs: c.proofs.clone(),
+                seal: Some(cand.seal()),
             })
             .await?)
     }
@@ -484,6 +462,7 @@ impl PoolInner {
                 deadline: c.deadline,
                 token: c.token.clone(),
                 proofs: c.proofs.clone(),
+                seal: Some(cand.seal()),
             })
             .await?)
     }
@@ -627,44 +606,49 @@ fn now_ms() -> i64 {
 }
 
 /// The candidates a call or an open under `confidential` may reach, in their
-/// order, before anything is sent: under `Preferred` the providers none of
-/// whose advertisements names a KEM key, under `Required` none, since this
-/// SDK seals nothing yet. A provider that names a key is never called in the
-/// clear, not even through an older keyless advertisement the DHT still
-/// serves while it rotates. None left is a [`ConfidentialityError`] naming
-/// the advertised key ids.
+/// order, before anything is sent. A candidate whose advertisement names a
+/// KEM key is called sealed to it. Under `Preferred` a keyless one is called
+/// in the clear, unless its provider names a key in another advertisement
+/// the DHT still serves (it rotated onto `kem_advertise`): a provider that
+/// names a key is never called in the clear. Under `Required` only keyed
+/// candidates are called. None left is a [`ConfidentialityError`] naming the
+/// advertised key ids.
 fn callable(
     candidates: Vec<Candidate>,
     confidential: Confidentiality,
 ) -> Result<Vec<Candidate>, PoolError> {
-    let advertised: Vec<[u8; KEY_ID_SIZE]> =
-        candidates.iter().filter_map(|c| c.kem_key_id).collect();
+    let advertised: Vec<[u8; KEY_ID_SIZE]> = candidates
+        .iter()
+        .filter_map(Candidate::kem_key_id)
+        .collect();
     let keyed: HashSet<[u8; 32]> = candidates
         .iter()
-        .filter(|c| c.kem_key_id.is_some())
+        .filter(|c| c.kem_key.is_some())
         .map(|c| c.provider.node)
         .collect();
-    let clear: Vec<Candidate> = match confidential {
-        Confidentiality::Preferred => candidates
-            .into_iter()
-            .filter(|c| !keyed.contains(&c.provider.node))
-            .collect(),
-        Confidentiality::Required => Vec::new(),
-    };
-    if clear.is_empty() {
+    let kept: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| match (confidential, &c.kem_key) {
+            (_, Some(_)) => true,
+            (Confidentiality::Preferred, None) => !keyed.contains(&c.provider.node),
+            (Confidentiality::Required, None) => false,
+        })
+        .collect();
+    if kept.is_empty() {
         return Err(PoolError::Confidentiality(ConfidentialityError {
             reason: ConfidentialityReason::NoKemKey,
             advertised,
+            named: None,
         }));
     }
-    Ok(clear)
+    Ok(kept)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cand(node: u8, kem_key_id: Option<[u8; KEY_ID_SIZE]>) -> Candidate {
+    fn cand(node: u8, kem_key: Option<u8>) -> Candidate {
         Candidate {
             provider: Provider {
                 node: [node; 32],
@@ -672,7 +656,7 @@ mod tests {
             },
             expires_at: 0,
             created_at: 0,
-            kem_key_id,
+            kem_key: kem_key.map(|k| vec![k; 1568]),
         }
     }
 
@@ -684,54 +668,39 @@ mod tests {
     }
 
     #[test]
-    fn preferred_calls_only_the_providers_that_name_no_key() {
+    fn preferred_seals_to_a_keyed_provider_and_calls_a_keyless_one_in_the_clear() {
         let kept = callable(
-            vec![cand(1, Some([7; 8])), cand(2, None), cand(3, None)],
+            vec![cand(1, Some(7)), cand(2, None), cand(3, None)],
             Confidentiality::Preferred,
         )
         .unwrap();
-        assert_eq!(kept, vec![cand(2, None), cand(3, None)]);
-    }
-
-    #[test]
-    fn a_provider_that_names_a_key_is_never_called_in_the_clear() {
-        let e = refused(callable(
-            vec![cand(1, Some([7; 8])), cand(2, Some([8; 8]))],
-            Confidentiality::Preferred,
-        ));
-        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
-        assert_eq!(e.advertised, vec![[7; 8], [8; 8]]);
-        assert_eq!(
-            e.to_string(),
-            "confidentiality: no_kem_key 0707070707070707 0808080808080808"
-        );
+        assert_eq!(kept, vec![cand(1, Some(7)), cand(2, None), cand(3, None)]);
+        assert_eq!(kept[0].seal(), Seal::To(vec![7; 1568]));
+        assert_eq!(kept[1].seal(), Seal::Clear);
     }
 
     #[test]
     fn a_provider_that_names_a_key_is_not_called_through_its_older_keyless_ad() {
-        let e = refused(callable(
-            vec![cand(1, Some([7; 8])), cand(1, None)],
-            Confidentiality::Preferred,
-        ));
-        assert_eq!(e.advertised, vec![[7; 8]]);
         let kept = callable(
-            vec![cand(1, Some([7; 8])), cand(1, None), cand(2, None)],
+            vec![cand(1, Some(7)), cand(1, None), cand(2, None)],
             Confidentiality::Preferred,
         )
         .unwrap();
-        assert_eq!(kept, vec![cand(2, None)]);
+        assert_eq!(kept, vec![cand(1, Some(7)), cand(2, None)]);
     }
 
     #[test]
-    fn required_calls_no_provider_until_this_sdk_seals() {
-        let e = refused(callable(
-            vec![cand(1, None), cand(2, Some([7; 8]))],
+    fn required_calls_only_keyed_providers_and_refuses_when_there_are_none() {
+        let kept = callable(
+            vec![cand(1, None), cand(2, Some(7))],
             Confidentiality::Required,
-        ));
-        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
-        assert_eq!(e.advertised, vec![[7; 8]]);
+        )
+        .unwrap();
+        assert_eq!(kept, vec![cand(2, Some(7))]);
         let e = refused(callable(vec![cand(1, None)], Confidentiality::Required));
+        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
         assert!(e.advertised.is_empty());
+        assert_eq!(e.to_string(), "confidentiality: no_kem_key");
     }
 
     #[test]

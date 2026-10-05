@@ -17,6 +17,7 @@
 
 mod admission;
 mod call;
+mod confidential;
 mod dht;
 mod framing;
 mod pubsub;
@@ -26,6 +27,7 @@ mod versions;
 
 pub use admission::{Admission, AdmissionLimits};
 pub use call::{Call, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
+pub use confidential::{is_clear_refusal, ConfidentialityError, ConfidentialityReason, Seal};
 pub use pubsub::{Event, EventDedup, Publication, PublicationSeq, SignedPublication, Subscription};
 pub use serve::{handler, BoxFuture, Handler, Offer, Request, Served, StreamOffer};
 pub use stream::{
@@ -35,7 +37,7 @@ pub use versions::{forget_v5_peer, handshake_counters};
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -139,6 +141,16 @@ pub enum LinkError {
     StreamClosed,
     /// A STREAM_OPEN over the 1 MiB a peer reads of one.
     StreamOpenTooLarge(usize),
+    /// A call or an open that could not be kept confidential, so it was not
+    /// made, or failed rather than be taken in the clear.
+    Confidentiality(ConfidentialityError),
+    /// The provider's sealed_refused: it could not open the request. `named`
+    /// is the key it holds now, `None` when it holds none.
+    SealedRefused { named: Option<[u8; 8]> },
+    /// A clear answer to a sealed request that nothing clear may give: not a
+    /// relay error, not a refusal from the closed set, not sealed_refused.
+    /// Refused, never taken as the answer.
+    ClearAnswerToSealed,
 }
 
 impl fmt::Display for LinkError {
@@ -162,6 +174,16 @@ impl fmt::Display for LinkError {
             LinkError::Record(e) => write!(f, "record: {e}"),
             LinkError::Issuer(e) => write!(f, "{e}"),
             LinkError::Goodbye(reason) => write!(f, "the station said goodbye: {reason}"),
+            LinkError::Confidentiality(e) => write!(f, "{e}"),
+            LinkError::SealedRefused { named: Some(id) } => write!(
+                f,
+                "the provider could not open the request; it holds key {}",
+                id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+            LinkError::SealedRefused { named: None } => {
+                f.write_str("the provider opens no sealed payload")
+            }
+            LinkError::ClearAnswerToSealed => f.write_str("a clear answer to a sealed request"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -249,6 +271,9 @@ struct Inner {
     version: i64,
     /// v5 liveness answers, for the probe.
     pongs: tokio::sync::mpsc::Sender<[u8; frame::LIVENESS_NONCE_SIZE]>,
+    /// A liveness_pong is being written (macula-rust#9): at most one is in
+    /// flight, so a station's pings cannot pile up tasks on this link.
+    pong_in_flight: AtomicBool,
     pongs_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<[u8; frame::LIVENESS_NONCE_SIZE]>>,
     /// Orders a neighbour signature's seq with its write.
     send_seq: tokio::sync::Mutex<u64>,
@@ -470,6 +495,7 @@ async fn handshaken(
         connection_hash: Sha384::digest(&challenge).into(),
         version: station.version,
         pongs,
+        pong_in_flight: AtomicBool::new(false),
         pongs_rx: tokio::sync::Mutex::new(pongs_rx),
         station,
         send_seq: tokio::sync::Mutex::new(0),
@@ -723,13 +749,18 @@ fn liveness(
     nonce: [u8; frame::LIVENESS_NONCE_SIZE],
 ) -> Result<(), LinkError> {
     match kind {
+        // A ping while a pong is still being written is not answered again:
+        // the station's probe needs one answer per interval, not one per
+        // ping, and a burst of pings starts one task, not one each.
+        Liveness::Ping if !pong_slot(&inner.pong_in_flight) => {}
         Liveness::Ping => {
             let inner = inner.clone();
             tokio::spawn(async move {
-                if let Err(e) = inner
+                let sent = inner
                     .send_control(&frame::liveness_pong_frame(&nonce))
-                    .await
-                {
+                    .await;
+                inner.pong_in_flight.store(false, Ordering::Release);
+                if let Err(e) = sent {
                     inner.end(e);
                 }
             });
@@ -739,6 +770,11 @@ fn liveness(
         }
     }
     Ok(())
+}
+
+/// Takes the one pong slot: true when no pong was in flight, and it is now.
+fn pong_slot(in_flight: &AtomicBool) -> bool {
+    !in_flight.swap(true, Ordering::AcqRel)
 }
 
 /// Ends the link when the station's statement lapses past the grace, or its
@@ -798,6 +834,17 @@ mod tests {
         };
         pairs.push((Value::text("neighbour"), Value::Map(Vec::new())));
         Value::Map(pairs)
+    }
+
+    /// macula-rust#9: a burst of pings takes one pong slot until its pong is
+    /// written.
+    #[test]
+    fn a_burst_of_pings_starts_one_pong_at_a_time() {
+        let in_flight = AtomicBool::new(false);
+        let taken = (0..1000).filter(|_| pong_slot(&in_flight)).count();
+        assert_eq!(taken, 1);
+        in_flight.store(false, Ordering::Release);
+        assert!(pong_slot(&in_flight), "free again once the pong is written");
     }
 
     /// macula-go 2294f25: liveness frames are read after the session-mode

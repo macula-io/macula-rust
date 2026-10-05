@@ -12,6 +12,7 @@ use crate::signed_object::{
     sign_held_object, sign_object, verify_held_object, verify_object, VerifiedObject,
 };
 
+use super::sealed::{read_sealed, Sealed, SealedContext};
 use super::{
     bounded_text, check_payload, entry, fixed, has_fields, identity_signer, names_request,
     object_refusal, protocol_uint, read_fields, received_frame, text_of, uint, FrameError,
@@ -104,6 +105,19 @@ pub enum StreamFields {
     },
     /// A provider's terminal value for a client_stream or bidi stream.
     Reply { seq: u64, payload: Value },
+    /// A STREAM_DATA whose body is sealed end to end, sent in place of the
+    /// body; its encoding still travels.
+    SealedData {
+        seq: u64,
+        encoding: StreamEncoding,
+        sealed: Sealed,
+    },
+    /// A STREAM_ERROR whose code and message are sealed end to end, sent in
+    /// place of both.
+    SealedError { seq: u64, sealed: Sealed },
+    /// A STREAM_REPLY whose payload is sealed end to end, sent in place of
+    /// the payload.
+    SealedReply { seq: u64, sealed: Sealed },
 }
 
 impl StreamFields {
@@ -112,17 +126,40 @@ impl StreamFields {
             StreamFields::Data { seq, .. }
             | StreamFields::End { seq, .. }
             | StreamFields::Error { seq, .. }
-            | StreamFields::Reply { seq, .. } => *seq,
+            | StreamFields::Reply { seq, .. }
+            | StreamFields::SealedData { seq, .. }
+            | StreamFields::SealedError { seq, .. }
+            | StreamFields::SealedReply { seq, .. } => *seq,
         }
     }
 
     fn frame_type(&self) -> &'static str {
         match self {
-            StreamFields::Data { .. } => STREAM_DATA,
+            StreamFields::Data { .. } | StreamFields::SealedData { .. } => STREAM_DATA,
             StreamFields::End { .. } => STREAM_END,
-            StreamFields::Error { .. } => STREAM_ERROR,
-            StreamFields::Reply { .. } => STREAM_REPLY,
+            StreamFields::Error { .. } | StreamFields::SealedError { .. } => STREAM_ERROR,
+            StreamFields::Reply { .. } | StreamFields::SealedReply { .. } => STREAM_REPLY,
         }
+    }
+
+    /// The sealed map a sealed frame carries.
+    fn sealed(&self) -> Option<&Sealed> {
+        match self {
+            StreamFields::SealedData { sealed, .. }
+            | StreamFields::SealedError { sealed, .. }
+            | StreamFields::SealedReply { sealed, .. } => Some(sealed),
+            _ => None,
+        }
+    }
+}
+
+/// The sealed shape a side's frames carry: a provider's its random nonce, a
+/// caller's none (its nonce is its seq).
+fn side_context(caller: bool) -> SealedContext {
+    if caller {
+        SealedContext::CallerStream
+    } else {
+        SealedContext::ProviderStream
     }
 }
 
@@ -224,16 +261,24 @@ fn stream_build(
     }
     if caller {
         match fields {
-            StreamFields::Reply { .. } => {
+            StreamFields::Reply { .. } | StreamFields::SealedReply { .. } => {
                 return Err(FrameError::NotAllowed("a caller's STREAM_REPLY".into()))
             }
-            StreamFields::Data { .. } if open.mode == Some(StreamMode::ServerStream) => {
+            StreamFields::Data { .. } | StreamFields::SealedData { .. }
+                if open.mode == Some(StreamMode::ServerStream) =>
+            {
                 return Err(FrameError::NotAllowed(
                     "a caller's STREAM_DATA in a server_stream".into(),
                 ))
             }
             _ => {}
         }
+    }
+    if fields
+        .sealed()
+        .is_some_and(|s| !s.shaped(side_context(caller)))
+    {
+        return Err(FrameError::SealedShape);
     }
     if let StreamFields::Error { code, message, .. } = fields {
         bounded_text("code", code.as_bytes(), MAX_ERROR_CODE_BYTES)?;
@@ -268,6 +313,15 @@ fn stream_build(
             ]
         }
         StreamFields::Reply { payload, .. } => vec![entry("payload", payload.clone())],
+        StreamFields::SealedData {
+            encoding, sealed, ..
+        } => vec![
+            entry("encoding", Value::text(encoding.name())),
+            entry("sealed", sealed.value()),
+        ],
+        StreamFields::SealedError { sealed, .. } | StreamFields::SealedReply { sealed, .. } => {
+            vec![entry("sealed", sealed.value())]
+        }
     };
     if fields.seq() >= MAX_PROTOCOL_INT {
         return Err(FrameError::OutOfRange("a seq of 2^53 or more".into()));
@@ -323,7 +377,8 @@ pub fn verify_provider_stream(
     if &verified.key != held_key {
         return Err(FrameError::KeyIdMismatch);
     }
-    let (signer, fields, read) = stream_read(&frame_type, &verified)?;
+    let (signer, fields, read) =
+        stream_read(&frame_type, &verified, SealedContext::ProviderStream)?;
     if signer != state.provider.signer {
         return Err(FrameError::KeyIdMismatch);
     }
@@ -353,7 +408,7 @@ fn provider_first(
         return Err(FrameError::SeqMismatch);
     }
     let verified = verify_object(STREAM_LABEL, object, profile).map_err(object_refusal)?;
-    let (signer, fields, read) = stream_read(frame_type, &verified)?;
+    let (signer, fields, read) = stream_read(frame_type, &verified, SealedContext::ProviderStream)?;
     if signer != node_id_of(&verified.key, profile) {
         return Err(FrameError::KeyIdMismatch);
     }
@@ -392,7 +447,7 @@ pub fn verify_caller_stream(
     }
     let verified = verify_held_object(CALLER_STREAM_LABEL, &object, &state.open.key, profile)
         .map_err(object_refusal)?;
-    let (signer, fields, read) = stream_read(&frame_type, &verified)?;
+    let (signer, fields, read) = stream_read(&frame_type, &verified, SealedContext::CallerStream)?;
     if frame_type == STREAM_DATA && state.mode == StreamMode::ServerStream {
         return Err(FrameError::Malformed);
     }
@@ -413,10 +468,13 @@ pub fn verify_caller_stream(
 
 /// A stream frame's signed fields read through its type's table: frame_type,
 /// request_id, request_hash, signer and seq, and exactly the fields of its
-/// type, a raw body a byte string.
+/// type, a raw body a byte string; or, sealed in `context`'s shape, `sealed`
+/// in place of the body (the encoding stays), the code and message, or the
+/// payload.
 fn stream_read(
     frame_type: &str,
     verified: &VerifiedObject,
+    context: SealedContext,
 ) -> Result<([u8; 32], StreamFields, super::Fields), FrameError> {
     let types: &'static [&'static str] = match frame_type {
         STREAM_DATA => &[STREAM_DATA],
@@ -437,6 +495,7 @@ fn stream_read(
         ("code", Rule::TextWithin(MAX_ERROR_CODE_BYTES)),
         ("message", Rule::TextWithin(MAX_ERROR_TEXT_BYTES)),
         ("payload", Rule::Any),
+        ("sealed", Rule::Sealed(context)),
     ];
     let fields = read_fields(&verified.fields, &table).ok_or(FrameError::Malformed)?;
     if !has_fields(
@@ -445,24 +504,39 @@ fn stream_read(
     ) {
         return Err(FrameError::Malformed);
     }
-    let own: &[&str] = match frame_type {
-        STREAM_DATA => &["encoding", "body"],
-        STREAM_END => &["role"],
-        STREAM_ERROR => &["code", "message"],
-        _ => &["payload"],
+    let sealed = fields.get("sealed").and_then(|v| read_sealed(v, context));
+    let own: &[&str] = match (frame_type, sealed.is_some()) {
+        (STREAM_DATA, false) => &["encoding", "body"],
+        (STREAM_DATA, true) => &["encoding", "sealed"],
+        (STREAM_END, _) => &["role"],
+        (STREAM_ERROR, false) => &["code", "message"],
+        (_, false) => &["payload"],
+        (_, true) => &["sealed"],
     };
     let carried = 5 + own.len() + usize::from(fields.contains_key("alg"));
     if !has_fields(&fields, own) || fields.len() != carried {
         return Err(FrameError::Malformed);
     }
     let seq = protocol_uint(&fields["seq"]).unwrap_or(0);
-    let parsed = match frame_type {
-        STREAM_DATA => {
-            let encoding = if text_of(&fields["encoding"]) == "raw" {
-                StreamEncoding::Raw
+    let parsed = match (frame_type, sealed) {
+        (STREAM_DATA, Some(sealed)) => StreamFields::SealedData {
+            seq,
+            encoding: stream_encoding(&fields),
+            sealed,
+        },
+        (STREAM_ERROR, Some(sealed)) => StreamFields::SealedError { seq, sealed },
+        (STREAM_REPLY, Some(sealed)) => StreamFields::SealedReply { seq, sealed },
+        (STREAM_END, _) => StreamFields::End {
+            seq,
+            role: if text_of(&fields["role"]) == "send" {
+                StreamRole::Send
             } else {
-                StreamEncoding::Msgpack
-            };
+                StreamRole::Both
+            },
+        },
+        (_, Some(_)) => return Err(FrameError::Malformed),
+        (STREAM_DATA, None) => {
+            let encoding = stream_encoding(&fields);
             if encoding == StreamEncoding::Raw && !matches!(fields["body"], Value::Bytes(_)) {
                 return Err(FrameError::Malformed);
             }
@@ -472,23 +546,23 @@ fn stream_read(
                 body: fields["body"].clone(),
             }
         }
-        STREAM_END => StreamFields::End {
-            seq,
-            role: if text_of(&fields["role"]) == "send" {
-                StreamRole::Send
-            } else {
-                StreamRole::Both
-            },
-        },
-        STREAM_ERROR => StreamFields::Error {
+        (STREAM_ERROR, None) => StreamFields::Error {
             seq,
             code: text_of(&fields["code"]),
             message: text_of(&fields["message"]),
         },
-        _ => StreamFields::Reply {
+        (_, None) => StreamFields::Reply {
             seq,
             payload: fields["payload"].clone(),
         },
     };
     Ok((fixed(&fields["signer"]), parsed, fields))
+}
+
+fn stream_encoding(fields: &super::Fields) -> StreamEncoding {
+    if text_of(&fields["encoding"]) == "raw" {
+        StreamEncoding::Raw
+    } else {
+        StreamEncoding::Msgpack
+    }
 }

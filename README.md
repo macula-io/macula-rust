@@ -27,7 +27,11 @@
 > against in-process macula 12 stations on every `cargo test`, and calls,
 > pubsub and the DHT live against the fleet. Every link runs macula 13.2's
 > handshake v5, bound to its TLS session, and falls back to v4 only for a
-> station never seen on v5. Not here yet: UCAN-gated calls;
+> station never seen on v5. A call or stream to a provider whose
+> advertisement names a KEM key is sealed end to end to that key (macula 13's
+> seal scheme 1), held to macula's vectors and run live against a macula 13
+> provider that requires it (`scripts/interop/sealed.sh`); serving sealed
+> requests is next. Not here yet: UCAN-gated calls;
 > see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
 > the retired 10.x wire and cannot reach the current fleet.
 

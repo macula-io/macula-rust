@@ -34,6 +34,7 @@ fn call_spec(keys: &Keys) -> RequestSpec {
         target: keys.provider.key_id(),
         deadline: 1_789_000_005_000,
         payload: Value::text("hello"),
+        sealed: None,
         mode: None,
         token: None,
         proofs: Vec::new(),

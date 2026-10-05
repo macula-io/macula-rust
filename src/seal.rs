@@ -300,9 +300,7 @@ impl PrivateKey {
 /// A fresh shared secret to `recipient`, and the kem_ct that carries it:
 /// ML-KEM-1024's ciphertext, followed by the ephemeral P-384 point in
 /// pq_hybrid.
-pub fn sender_secret(
-    recipient: &PublicKey,
-) -> Result<([u8; KEY_HASH_SIZE], Vec<u8>), SealError> {
+pub fn sender_secret(recipient: &PublicKey) -> Result<([u8; KEY_HASH_SIZE], Vec<u8>), SealError> {
     let ek = EncapsulationKey::new(&ML_KEM_1024, recipient.mlkem())
         .map_err(|_| SealError::Unavailable)?;
     let (mlkem_ct, ss_mlkem) = ek.encapsulate().map_err(|_| SealError::Unavailable)?;
@@ -422,7 +420,11 @@ pub struct Parties {
 
 /// The request and reply keys of one CALL or STREAM_OPEN. `frame_type` is
 /// [`FRAME_CALL`] or [`FRAME_STREAM_OPEN`].
-pub fn call_keys(secret: &[u8; KEY_HASH_SIZE], frame_type: &str, p: &Parties) -> ([u8; 32], [u8; 32]) {
+pub fn call_keys(
+    secret: &[u8; KEY_HASH_SIZE],
+    frame_type: &str,
+    p: &Parties,
+) -> ([u8; 32], [u8; 32]) {
     halves(expand(
         secret,
         &encode(vec![
@@ -566,7 +568,11 @@ pub fn open(
     let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("a 32-byte AES-256 key"));
     let mut buf = sealed.to_vec();
     let plain = key
-        .open_in_place(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf)
+        .open_in_place(
+            Nonce::assume_unique_for_key(*nonce),
+            Aad::from(aad),
+            &mut buf,
+        )
         .map_err(|_| SealError::Refused)?;
     Ok(plain.to_vec())
 }

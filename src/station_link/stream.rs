@@ -28,6 +28,9 @@ use crate::frame::{
 };
 
 use super::admission::{Admission, SessionPlace, Verdict};
+use super::confidential::{
+    sealed_request, stated, unsealed, Seal, StreamSeal, CODE_SEALED_REFUSED, NO_KEY_DETAIL,
+};
 use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
 use super::serve::{bounded_detail, BoxFuture, StreamOffer, CODE_REQUEST_COPY};
 use super::{frame_type_of, now_ms, Inner, Link, LinkError};
@@ -64,8 +67,9 @@ where
 
 /// A streaming session to open: the realm and procedure, the provider it
 /// targets, the mode, the open's payload, how far ahead its deadline lies
-/// ([`DEFAULT_STREAM_DEADLINE`] when zero), and a UCAN and its proofs for a
-/// gated procedure. Its default mode is server_stream.
+/// ([`DEFAULT_STREAM_DEADLINE`] when zero), a UCAN and its proofs for a gated
+/// procedure, and how it is kept, which an open must state as a call does
+/// (see [`super::Call`]). Its default mode is server_stream.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamCall {
     pub realm: [u8; 32],
@@ -76,6 +80,7 @@ pub struct StreamCall {
     pub deadline: Duration,
     pub token: Option<Vec<u8>>,
     pub proofs: Vec<Vec<u8>>,
+    pub seal: Option<Seal>,
 }
 
 impl Default for StreamCall {
@@ -89,6 +94,7 @@ impl Default for StreamCall {
             deadline: Duration::ZERO,
             token: None,
             proofs: Vec::new(),
+            seal: None,
         }
     }
 }
@@ -129,6 +135,8 @@ pub(super) struct StreamInner {
     writer: FrameWriter,
     open: VerifiedRequest,
     caller: bool,
+    /// This side's keys when the stream is sealed.
+    sealing: Option<StreamSeal>,
     /// Orders a frame's seq with its write.
     send_seq: tokio::sync::Mutex<u64>,
     state: Mutex<StreamSide>,
@@ -271,12 +279,14 @@ impl StreamInner {
         send: quinn::SendStream,
         open: VerifiedRequest,
         caller: bool,
+        sealing: Option<StreamSeal>,
     ) -> Arc<StreamInner> {
         Arc::new(StreamInner {
             link,
             writer: FrameWriter::new(send),
             open,
             caller,
+            sealing,
             send_seq: tokio::sync::Mutex::new(0),
             state: Mutex::new(StreamSide::default()),
             budget: Mutex::new(None),
@@ -305,7 +315,10 @@ impl StreamInner {
         if self.side().sent_end {
             return Err(LinkError::StreamClosed);
         }
-        let fields = at(*seq);
+        let fields = match &self.sealing {
+            Some(sealing) => sealing.sealed(at(*seq))?,
+            None => at(*seq),
+        };
         let signed = if self.caller {
             frame::sign_caller_stream(&fields, &self.open, &self.link.key)?
         } else {
@@ -460,6 +473,7 @@ impl Link {
     /// open on is released before the error returns.
     pub async fn open_stream(&self, c: StreamCall) -> Result<Stream, LinkError> {
         let inner = &self.inner;
+        stated(&c.target, &inner.station.node_id, &c.seal)?;
         let deadline = if c.deadline.is_zero() {
             DEFAULT_STREAM_DEADLINE
         } else {
@@ -468,14 +482,34 @@ impl Link {
         let mut request_id = [0u8; 16];
         aws_lc_rs::rand::fill(&mut request_id)
             .map_err(|_| LinkError::Io("no randomness".into()))?;
+        let deadline = (now_ms() + deadline.as_millis() as i64) as u64;
+        let (sealed, sealing) = match &c.seal {
+            Some(Seal::To(key)) => {
+                let (sealed, s) = sealed_request(
+                    inner.profile,
+                    key,
+                    crate::seal::FRAME_STREAM_OPEN,
+                    c.realm,
+                    &c.procedure,
+                    inner.self_id,
+                    c.target,
+                    request_id,
+                    deadline,
+                    &c.payload,
+                )?;
+                (Some(sealed), Some(StreamSeal::caller(&s)))
+            }
+            _ => (None, None),
+        };
         let signed = frame::sign_stream_open(
             &RequestSpec {
                 request_id,
                 realm: c.realm,
                 procedure: c.procedure,
                 target: c.target,
-                deadline: (now_ms() + deadline.as_millis() as i64) as u64,
+                deadline,
                 payload: c.payload,
+                sealed,
                 mode: Some(c.mode),
                 token: c.token,
                 proofs: c.proofs,
@@ -496,7 +530,7 @@ impl Link {
             .open_bi()
             .await
             .map_err(|e| LinkError::Io(format!("open a stream: {e}")))?;
-        let s = StreamInner::new(inner.clone(), send, open, true);
+        let s = StreamInner::new(inner.clone(), send, open, true, sealing);
         let held = hold_stream(inner, &s);
         let written = match held {
             true => s.writer.write(&encoded, STREAM_OPEN_BYTES).await,
@@ -565,13 +599,18 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
         abandon(send, recv);
         return;
     };
-    let s = StreamInner::new(inner.clone(), send, open.clone(), false);
+    let s = StreamInner::new(inner.clone(), send, open.clone(), false, None);
     let offer = match admit_stream(&inner, &open) {
         Ok(offer) => offer,
-        Err(code) => return refuse(&s, code, recv).await,
+        Err(code) => return refuse(&s, code, "", recv).await,
     };
+    // This node opens no sealed payload: a sealed open is refused, never
+    // served on a payload it cannot read.
+    if open.sealed.is_some() {
+        return refuse(&s, CODE_SEALED_REFUSED, NO_KEY_DETAIL, recv).await;
+    }
     let Some(place) = inner.admission.open_session(open.caller) else {
-        return refuse(&s, CODE_TOO_MANY_SESSIONS, recv).await;
+        return refuse(&s, CODE_TOO_MANY_SESSIONS, "", recv).await;
     };
     *s.budget() = Some(Budget {
         admission: inner.admission.clone(),
@@ -608,11 +647,11 @@ fn admit_stream(inner: &Inner, open: &VerifiedRequest) -> Result<StreamOffer, &'
     Ok(offer)
 }
 
-/// Answers an open with a STREAM_ERROR of `code` at seq 0 and releases the
-/// stream.
-async fn refuse(s: &Arc<StreamInner>, code: &str, mut recv: quinn::RecvStream) {
+/// Answers an open with a STREAM_ERROR of `code` and `message` at seq 0 and
+/// releases the stream.
+async fn refuse(s: &Arc<StreamInner>, code: &str, message: &str, mut recv: quinn::RecvStream) {
     s.link.count(&format!("stream_refused_{code}"));
-    let _ = s.abort(code, "").await;
+    let _ = s.abort(code, message).await;
     let _ = recv.stop(0u32.into());
 }
 
@@ -719,7 +758,14 @@ async fn received(
         }
     };
     let size = payload.len();
-    match verified.fields {
+    let fields = match unsealed(verified, s.sealing.as_ref()) {
+        Ok(fields) => fields,
+        Err(e) => {
+            StreamInner::end(s, Some(e));
+            return None;
+        }
+    };
+    match fields {
         StreamFields::Error { code, message, .. } => {
             s.peer_finished(Some(LinkError::Stream {
                 code,
@@ -755,6 +801,13 @@ async fn received(
                 return None;
             }
             Some(next)
+        }
+        // unsealed opens every sealed frame or refuses it.
+        StreamFields::SealedData { .. }
+        | StreamFields::SealedError { .. }
+        | StreamFields::SealedReply { .. } => {
+            StreamInner::end(s, Some(LinkError::ClearAnswerToSealed));
+            None
         }
     }
 }

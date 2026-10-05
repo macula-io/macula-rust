@@ -13,6 +13,7 @@ mod neighbour;
 mod publication;
 mod reply;
 mod request;
+mod sealed;
 mod session;
 mod stream;
 
@@ -25,13 +26,15 @@ pub use neighbour::{
 };
 pub use publication::{sign_publish, verify_publication, PublicationSpec, VerifiedPublication};
 pub use reply::{
-    claimed_reply_ids, sign_provider_error, sign_relay_error, sign_result, verify_relay_error,
-    verify_reply, RelayErrorSpec, RelayErrorType, ReplyType, VerifiedRelayError, VerifiedReply,
+    claimed_reply_ids, sign_provider_error, sign_relay_error, sign_result,
+    sign_sealed_provider_error, sign_sealed_result, verify_relay_error, verify_reply,
+    RelayErrorSpec, RelayErrorType, ReplyType, VerifiedRelayError, VerifiedReply,
 };
 pub use request::{
     request_fields_accepted, sign_call, sign_stream_open, verify_request, RequestSpec, RequestType,
     VerifiedRequest, MAX_PROOFS, MAX_PROOFS_BYTES,
 };
+pub use sealed::{Sealed, SEALED_SCHEME};
 pub use session::{
     liveness_nonce, liveness_ping_frame, liveness_pong_frame, verify_session_frame, Liveness,
     LIVENESS_NONCE_SIZE,
@@ -103,6 +106,11 @@ pub enum FrameError {
     RelayCodeOutsideItsSet,
     /// A field outside its range, and which.
     OutOfRange(String),
+    /// A sealed payload built with another shape than its frame's: a
+    /// request's without a kem_ct of a profile's size or with a nonce, a
+    /// reply's or a provider stream frame's without a 12-byte nonce or with a
+    /// kem_ct, or a caller stream frame's with either.
+    SealedShape,
     /// A stream frame its side does not send, and which.
     NotAllowed(String),
     /// A stream frame out of its side's order.
@@ -148,6 +156,9 @@ impl fmt::Display for FrameError {
                 f.write_str("a relay error code outside its closed set")
             }
             FrameError::OutOfRange(what) => write!(f, "a field outside its range: {what}"),
+            FrameError::SealedShape => {
+                f.write_str("a sealed payload of another shape than its frame's")
+            }
             FrameError::NotAllowed(what) => {
                 write!(f, "a stream frame its side does not send: {what}")
             }
@@ -234,6 +245,7 @@ enum Rule {
     HeldObject,
     StreamObject,
     Proofs,
+    Sealed(sealed::SealedContext),
 }
 
 impl Rule {
@@ -252,6 +264,7 @@ impl Rule {
             Rule::HeldObject => crate::signed_object::HeldObject::from_value(v).is_ok(),
             Rule::StreamObject => Rule::CarriedObject.accepts(v) || Rule::HeldObject.accepts(v),
             Rule::Proofs => request::proofs_within_bound(v),
+            Rule::Sealed(context) => sealed::read_sealed(v, context).is_some(),
         }
     }
 }

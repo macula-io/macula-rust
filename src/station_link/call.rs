@@ -10,10 +10,12 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use crate::cbor::Value;
-use crate::frame::{self, ReplyType, RequestSpec, VerifiedRequest};
+use crate::frame::{self, RequestSpec, VerifiedRequest};
 use crate::handshake::VERSION_5;
 
+use super::confidential::{reply_outcome, sealed_request, stated, CallSeal, Seal};
 use super::{now_ms, Inner, Link, LinkError};
+use crate::seal;
 
 /// macula's default timeout for a call.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,8 +28,12 @@ const LIVENESS_PROCEDURE: &str = "_macula.ping";
 
 /// One request: the realm and procedure, the node it targets (the station
 /// itself when zero, as for `_dht.*`; the provider's node_id otherwise), its
-/// payload, how long to wait (the default when zero), and a UCAN token and
-/// its delegation chain's proofs for a gated procedure.
+/// payload, how long to wait (the default when zero), a UCAN token and its
+/// delegation chain's proofs for a gated procedure, and how it is kept. A
+/// call to a provider must state `seal`: sealed to the key its verified
+/// advertisement names, or clear by the application's decision; one that
+/// states neither is refused no_signed_state before anything is sent. A call
+/// to the station is always clear.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     pub realm: [u8; 32],
@@ -37,6 +43,7 @@ pub struct Call {
     pub timeout: Duration,
     pub token: Option<Vec<u8>>,
     pub proofs: Vec<Vec<u8>>,
+    pub seal: Option<Seal>,
 }
 
 impl Default for Call {
@@ -49,13 +56,15 @@ impl Default for Call {
             timeout: Duration::ZERO,
             token: None,
             proofs: Vec::new(),
+            seal: None,
         }
     }
 }
 
-/// A call waiting for its reply.
+/// A call waiting for its reply, with what its sealed request agreed.
 pub(super) struct Pending {
     pub(super) request: VerifiedRequest,
+    pub(super) seal: Option<CallSeal>,
     pub(super) outcome: oneshot::Sender<Result<Value, LinkError>>,
 }
 
@@ -73,6 +82,7 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     } else {
         c.timeout.min(MAX_CALL_TIMEOUT)
     };
+    stated(&c.target, &inner.station.node_id, &c.seal)?;
     let target = if c.target == [0; 32] {
         inner.station.node_id
     } else {
@@ -80,14 +90,34 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     };
     let mut request_id = [0u8; 16];
     aws_lc_rs::rand::fill(&mut request_id).map_err(|_| LinkError::Io("no randomness".into()))?;
+    let deadline = (now_ms() + timeout.as_millis() as i64) as u64;
+    let (sealed, call_seal) = match &c.seal {
+        Some(Seal::To(key)) => {
+            let (sealed, s) = sealed_request(
+                inner.profile,
+                key,
+                seal::FRAME_CALL,
+                c.realm,
+                &c.procedure,
+                inner.self_id,
+                target,
+                request_id,
+                deadline,
+                &c.payload,
+            )?;
+            (Some(sealed), Some(s))
+        }
+        _ => (None, None),
+    };
     let signed = frame::sign_call(
         &RequestSpec {
             request_id,
             realm: c.realm,
             procedure: c.procedure,
             target,
-            deadline: (now_ms() + timeout.as_millis() as i64) as u64,
+            deadline,
             payload: c.payload,
+            sealed,
             mode: None,
             token: c.token,
             proofs: c.proofs,
@@ -107,6 +137,7 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
             request_id,
             Pending {
                 request,
+                seal: call_seal,
                 outcome: outcome_tx,
             },
         );
@@ -134,14 +165,14 @@ pub(super) fn replied(inner: &Arc<Inner>, v: &Value) {
         inner.count("malformed_reply");
         return;
     };
-    let request = match inner.lock().pending.get(&request_id) {
-        Some(p) => p.request.clone(),
+    let (request, seal) = match inner.lock().pending.get(&request_id) {
+        Some(p) => (p.request.clone(), p.seal.clone()),
         None => {
             inner.count("unmatched_reply");
             return;
         }
     };
-    let Some(outcome) = verified_outcome(inner, v, &request) else {
+    let Some(outcome) = verified_outcome(inner, v, &request, seal.as_ref()) else {
         inner.count("unverified_reply");
         return;
     };
@@ -154,17 +185,11 @@ fn verified_outcome(
     inner: &Inner,
     v: &Value,
     request: &VerifiedRequest,
+    seal: Option<&CallSeal>,
 ) -> Option<Result<Value, LinkError>> {
     if v.get("reply").is_some() {
         let reply = frame::verify_reply(v, request, inner.profile).ok()?;
-        return Some(match reply.frame_type {
-            ReplyType::Result => Ok(reply.payload.unwrap_or(Value::Null)),
-            ReplyType::Error => Err(LinkError::Provider {
-                responded_by: reply.responded_by,
-                code: reply.code.unwrap_or_default(),
-                detail: reply.detail,
-            }),
-        });
+        return Some(reply_outcome(reply, request, seal));
     }
     let relayed =
         frame::verify_relay_error(v, request, inner.profile, &inner.station.node_id).ok()?;

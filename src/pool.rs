@@ -22,9 +22,8 @@ mod member;
 mod pubsub;
 mod serve;
 
-pub use call::{
-    Call, Confidentiality, ConfidentialityError, ConfidentialityReason, Provider, StreamCall,
-};
+pub use crate::station_link::{ConfidentialityError, ConfidentialityReason};
+pub use call::{Call, Confidentiality, Provider, StreamCall};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};

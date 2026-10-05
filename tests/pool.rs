@@ -703,6 +703,7 @@ async fn a_required_call_reaches_no_provider_that_names_no_kem_key() {
             Err(PoolError::Confidentiality(ConfidentialityError {
                 reason: ConfidentialityReason::NoKemKey,
                 advertised,
+                named: None,
             })) if advertised.is_empty()
         ),
         "{required:?}"

@@ -28,6 +28,7 @@ use crate::record::{
 };
 
 use super::admission::Verdict;
+use super::confidential::{CODE_SEALED_REFUSED, NO_KEY_DETAIL};
 use super::framing::MAX_FRAME_BYTES;
 use super::stream::StreamHandler;
 use super::{now_ms, Inner, Link, LinkError};
@@ -444,6 +445,12 @@ pub(super) fn called(inner: &Arc<Inner>, v: &Value) {
             tokio::spawn(async move {
                 let _ = inner.control.write(&stored, MAX_FRAME_BYTES).await;
             });
+        }
+        // This node opens no sealed payload: a sealed request is refused,
+        // never handed to a handler on a payload it cannot read.
+        Verdict::New if request.sealed.is_some() => {
+            let reply = provider_error(&inner, &request, CODE_SEALED_REFUSED, Some(NO_KEY_DETAIL));
+            tokio::spawn(async move { send_reply(&inner, reply).await });
         }
         Verdict::New => {
             tokio::spawn(answer(inner, request));

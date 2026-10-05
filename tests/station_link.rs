@@ -15,10 +15,11 @@ use macula_rust::handshake::HandshakeError;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::profile::Profile;
 use macula_rust::record::{self, new_node_record, NodeRecordOptions, RecordType};
+use macula_rust::seal;
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    handler, handshake_counters, stream_handler, Call, Config, Link, LinkError, Offer, Publication,
-    StreamCall, StreamEvent,
+    handler, handshake_counters, stream_handler, Call, ConfidentialityError, ConfidentialityReason,
+    Config, Link, LinkError, Offer, Publication, Seal, StreamCall, StreamEvent,
 };
 
 /// A link as a new node: its own identity key and issuer.
@@ -121,6 +122,7 @@ async fn a_call_nobody_serves_is_answered_with_the_station_s_relay_error() {
             procedure: format!("{}/nothing", env.org),
             target: [9; 32],
             payload: Value::Null,
+            seal: Some(Seal::Clear),
             ..Call::default()
         })
         .await;
@@ -190,6 +192,7 @@ async fn a_procedure_in_a_node_s_own_namespace_is_served_and_called() {
         procedure: ring.clone(),
         target: provider.node_id(),
         payload,
+        seal: Some(Seal::Clear),
         ..Call::default()
     };
     let answered = caller.call(call(Value::Null)).await.unwrap();
@@ -204,6 +207,34 @@ async fn a_procedure_in_a_node_s_own_namespace_is_served_and_called() {
         }
         other => panic!("{other:?}"),
     }
+    // A call to a provider states how it is kept, or nothing is sent.
+    let unstated = caller
+        .call(Call {
+            seal: None,
+            ..call(Value::Null)
+        })
+        .await;
+    assert!(
+        matches!(
+            &unstated,
+            Err(LinkError::Confidentiality(ConfidentialityError {
+                reason: ConfidentialityReason::NoSignedState,
+                ..
+            }))
+        ),
+        "{unstated:?}"
+    );
+    // This provider opens no sealed payload: a call sealed to some key is
+    // refused sealed_refused, naming no key, and its handler never runs on a
+    // payload it cannot read.
+    let key = seal::PrivateKey::generate(env.profile).unwrap();
+    let sealed = caller
+        .call(Call {
+            seal: Some(Seal::To(key.public_key().carried().to_vec())),
+            ..call(Value::text("fail"))
+        })
+        .await;
+    assert_eq!(sealed, Err(LinkError::SealedRefused { named: None }));
     // Withdrawn, the procedure is no longer routed to the provider.
     served.stop().await.unwrap();
     assert!(matches!(
@@ -233,6 +264,7 @@ async fn an_org_procedure_is_served_once_the_org_delegates_to_the_node() {
             procedure,
             target: provider.node_id(),
             payload: Value::text("hello"),
+            seal: Some(Seal::Clear),
             ..Call::default()
         })
         .await
@@ -308,6 +340,7 @@ async fn streams_deliver_their_frames_and_are_released() {
         target: provider.node_id(),
         mode,
         payload: Value::Null,
+        seal: Some(Seal::Clear),
         ..StreamCall::default()
     };
     let stream = caller

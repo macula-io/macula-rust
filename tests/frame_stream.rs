@@ -30,6 +30,7 @@ fn stream(mode: StreamMode) -> Stream {
         target: provider.key_id(),
         deadline: 1_789_000_005_000,
         payload: Value::Null,
+        sealed: None,
         mode: Some(mode),
         token: None,
         proofs: Vec::new(),

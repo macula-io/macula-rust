@@ -9,6 +9,7 @@ use crate::node_key::{node_id_of, NodeKey};
 use crate::profile::Profile;
 use crate::signed_object::{sign_object, verify_object};
 
+use super::sealed::{clear_or_sealed, sealed_field, Sealed, SealedContext};
 use super::{
     bounded_text, check_payload, entry, fixed, has_fields, identity_signer, object_refusal,
     protocol_uint, read_fields, received_frame, text_of, uint, FrameError, Rule, StreamMode,
@@ -39,8 +40,9 @@ impl RequestType {
     }
 }
 
-/// A request as its caller gives it: `mode` is a STREAM_OPEN's and `None` for
-/// a CALL; `token` is `None` when the request carries none; `proofs` are the
+/// A request as its caller gives it: `sealed` is the payload sealed end to
+/// end, carried in place of `payload`, which is then not sent, and `None` for
+/// a clear request; `mode` is a STREAM_OPEN's and `None` for a CALL; `token` is `None` when the request carries none; `proofs` are the
 /// tokens of the delegation chain the token rests on, empty for none;
 /// `source_route` and `retry_budget` are routing fields outside the
 /// signature.
@@ -52,6 +54,7 @@ pub struct RequestSpec {
     pub target: [u8; 32],
     pub deadline: u64,
     pub payload: Value,
+    pub sealed: Option<Sealed>,
     pub mode: Option<StreamMode>,
     pub token: Option<Vec<u8>>,
     pub proofs: Vec<Vec<u8>>,
@@ -61,7 +64,8 @@ pub struct RequestSpec {
 
 /// A CALL or STREAM_OPEN whose request verified: its fields, the caller's key
 /// as carried, and `request_hash`, the SHA-384 of its tbs, which replies and
-/// stream frames name.
+/// stream frames name. A sealed request's payload is in `sealed`, and its
+/// `payload` is null.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedRequest {
     pub frame_type: RequestType,
@@ -74,6 +78,7 @@ pub struct VerifiedRequest {
     pub target: [u8; 32],
     pub deadline: u64,
     pub payload: Value,
+    pub sealed: Option<Sealed>,
     pub mode: Option<StreamMode>,
     pub token: Option<Vec<u8>>,
     pub proofs: Option<Vec<Vec<u8>>>,
@@ -81,7 +86,8 @@ pub struct VerifiedRequest {
 
 /// Signs a CALL with the caller's identity key: caller is the key's key id.
 /// Refused, in this order: a key that is not an identity key, a procedure over
-/// 512 bytes, a payload the wire cannot carry, a deadline or retry budget of
+/// 512 bytes, a sealed payload of another shape than a request's or a clear
+/// payload the wire cannot carry, a deadline or retry budget of
 /// 2^53 or more, or a stream mode, which a CALL does not carry; then proofs
 /// outside their bound.
 pub fn sign_call(spec: &RequestSpec, key: &NodeKey) -> Result<Value, FrameError> {
@@ -101,7 +107,13 @@ fn sign_request(
 ) -> Result<Value, FrameError> {
     identity_signer(key)?;
     bounded_text("procedure", spec.procedure.as_bytes(), MAX_PROCEDURE_BYTES)?;
-    check_payload(&spec.payload)?;
+    match &spec.sealed {
+        Some(sealed) if !sealed.shaped(SealedContext::Request) => {
+            return Err(FrameError::SealedShape)
+        }
+        Some(_) => {}
+        None => check_payload(&spec.payload)?,
+    }
     if spec.deadline >= MAX_PROTOCOL_INT || spec.retry_budget.is_some_and(|b| b >= MAX_PROTOCOL_INT)
     {
         return Err(FrameError::OutOfRange(
@@ -133,7 +145,10 @@ fn sign_request(
         entry("procedure", Value::text(spec.procedure.clone())),
         entry("target", Value::Bytes(spec.target.to_vec())),
         entry("deadline", uint(spec.deadline)),
-        entry("payload", spec.payload.clone()),
+        match &spec.sealed {
+            Some(sealed) => entry("sealed", sealed.value()),
+            None => entry("payload", spec.payload.clone()),
+        },
     ];
     if let Some(mode) = spec.mode {
         fields.push(entry("mode", Value::text(mode.name())));
@@ -197,9 +212,9 @@ pub fn verify_request(frame: &Value, profile: Profile) -> Result<VerifiedRequest
             "procedure",
             "target",
             "deadline",
-            "payload",
         ],
-    ) || has_mode != (frame_type == RequestType::StreamOpen)
+    ) || !clear_or_sealed(&fields, "payload")
+        || has_mode != (frame_type == RequestType::StreamOpen)
     {
         return Err(FrameError::Malformed);
     }
@@ -212,7 +227,8 @@ pub fn verify_request(frame: &Value, profile: Profile) -> Result<VerifiedRequest
         procedure: text_of(&fields["procedure"]),
         target: fixed(&fields["target"]),
         deadline: protocol_uint(&fields["deadline"]).unwrap_or(0),
-        payload: fields["payload"].clone(),
+        payload: fields.get("payload").cloned().unwrap_or(Value::Null),
+        sealed: sealed_field(&fields, SealedContext::Request),
         mode: fields
             .get("mode")
             .and_then(|m| StreamMode::parse(&text_of(m))),
@@ -246,6 +262,7 @@ fn request_table(frame_type: RequestType) -> Vec<(&'static str, Rule)> {
         ("target", Rule::BytesOf(32)),
         ("deadline", Rule::ProtocolUint),
         ("payload", Rule::Any),
+        ("sealed", Rule::Sealed(SealedContext::Request)),
         (
             "mode",
             Rule::TextIn(&["server_stream", "client_stream", "bidi"]),

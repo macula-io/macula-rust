@@ -597,6 +597,10 @@ async fn fetch_one(
                     (Value::text("want"), Value::text(want)),
                 ]),
                 deadline: timeout,
+                // A content fetch is clear, as macula opens it confidential
+                // => off: a content announcement names no key, and the
+                // content is checked against its id.
+                seal: Some(station_link::Seal::Clear),
                 ..station_link::StreamCall::default()
             })
             .await?;

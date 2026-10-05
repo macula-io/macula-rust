@@ -8,6 +8,7 @@ use crate::node_key::{node_id_of, NodeKey};
 use crate::profile::Profile;
 use crate::signed_object::{sign_object, verify_object, Object};
 
+use super::sealed::{clear_or_sealed, sealed_field, Sealed, SealedContext};
 use super::{
     bounded_text, check_payload, entry, fixed, has_fields, identity_signer, names_request,
     object_refusal, read_fields, received_frame, text_of, FrameError, Rule, VerifiedRequest,
@@ -45,7 +46,8 @@ impl RelayErrorType {
 }
 
 /// A provider's RESULT or ERROR that verified for its request: the node that
-/// responded, a RESULT's payload, and an ERROR's code and detail.
+/// responded, a RESULT's payload, and an ERROR's code and detail; or, sealed
+/// end to end, `sealed` in their place.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedReply {
     pub frame_type: ReplyType,
@@ -53,6 +55,7 @@ pub struct VerifiedReply {
     pub payload: Option<Value>,
     pub code: Option<String>,
     pub detail: Option<String>,
+    pub sealed: Option<Sealed>,
 }
 
 /// A station's relay error as it gives it: for a pending verified request, a
@@ -116,6 +119,54 @@ pub fn sign_provider_error(
     sign_reply(ReplyType::Error, request, fields, source_route_reverse, key)
 }
 
+/// Signs a provider's RESULT whose payload is sealed end to end, carried in
+/// place of the payload, with [`sign_result`]'s key check.
+pub fn sign_sealed_result(
+    request: &VerifiedRequest,
+    sealed: &Sealed,
+    source_route_reverse: Option<Vec<u8>>,
+    key: &NodeKey,
+) -> Result<Value, FrameError> {
+    sign_sealed_reply(
+        ReplyType::Result,
+        request,
+        sealed,
+        source_route_reverse,
+        key,
+    )
+}
+
+/// Signs a provider's ERROR whose code and detail are sealed end to end, as
+/// cbor([code, detail]), carried in their place.
+pub fn sign_sealed_provider_error(
+    request: &VerifiedRequest,
+    sealed: &Sealed,
+    source_route_reverse: Option<Vec<u8>>,
+    key: &NodeKey,
+) -> Result<Value, FrameError> {
+    sign_sealed_reply(ReplyType::Error, request, sealed, source_route_reverse, key)
+}
+
+fn sign_sealed_reply(
+    frame_type: ReplyType,
+    request: &VerifiedRequest,
+    sealed: &Sealed,
+    source_route_reverse: Option<Vec<u8>>,
+    key: &NodeKey,
+) -> Result<Value, FrameError> {
+    reply_signer(request, key)?;
+    if !sealed.shaped(SealedContext::Reply) {
+        return Err(FrameError::SealedShape);
+    }
+    sign_reply(
+        frame_type,
+        request,
+        vec![entry("sealed", sealed.value())],
+        source_route_reverse,
+        key,
+    )
+}
+
 fn reply_signer(request: &VerifiedRequest, key: &NodeKey) -> Result<(), FrameError> {
     identity_signer(key)?;
     if key.key_id() != request.target {
@@ -174,15 +225,16 @@ pub fn verify_reply(
     let verified = verify_object(REPLY_LABEL, &object, profile).map_err(object_refusal)?;
     let fields =
         read_fields(&verified.fields, &reply_table(&frame_type)).ok_or(FrameError::Malformed)?;
-    let (has_payload, has_code, has_detail) = (
+    let (has_payload, has_code, has_detail, has_sealed) = (
         fields.contains_key("payload"),
         fields.contains_key("code"),
         fields.contains_key("detail"),
+        fields.contains_key("sealed"),
     );
-    let shaped = if frame_type == RESULT {
-        has_payload && !has_code && !has_detail
-    } else {
-        has_code && !has_payload
+    let shaped = match (frame_type == RESULT, has_sealed) {
+        (true, _) => clear_or_sealed(&fields, "payload") && !has_code && !has_detail,
+        (false, true) => !has_code && !has_detail && !has_payload,
+        (false, false) => has_code && !has_payload,
     };
     if !has_fields(
         &fields,
@@ -201,6 +253,7 @@ pub fn verify_reply(
         payload: fields.get("payload").cloned(),
         code: fields.get("code").map(text_of),
         detail: fields.get("detail").map(text_of),
+        sealed: sealed_field(&fields, SealedContext::Reply),
     };
     if reply.responded_by != node_id_of(&verified.key, profile) {
         return Err(FrameError::KeyIdMismatch);
@@ -231,6 +284,7 @@ fn reply_table(frame_type: &str) -> Vec<(&'static str, Rule)> {
         ("payload", Rule::Any),
         ("code", Rule::TextWithin(MAX_ERROR_CODE_BYTES)),
         ("detail", Rule::TextWithin(MAX_ERROR_TEXT_BYTES)),
+        ("sealed", Rule::Sealed(SealedContext::Reply)),
     ]
 }
 

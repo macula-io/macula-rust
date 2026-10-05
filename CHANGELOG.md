@@ -13,6 +13,49 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [Unreleased]
+
+#### Added
+
+- End-to-end payload sealing, scheme 1 (macula 13, E2E design), the
+  caller's side. `seal`: ML-KEM-1024 (+ ephemeral P-384 ECDH in pq_hybrid),
+  HKDF-SHA-384 and AES-256-GCM on aws-lc-rs, held to macula v13.3.0's
+  `e2e_seal_v1.json` (the recipient side byte for byte, the sender side by
+  round trip, a zero ECDH output refused). `frame`: a payload sealed end to
+  end rides in `sealed` in place of its clear field on a CALL, STREAM_OPEN,
+  RESULT, ERROR and STREAM_DATA / STREAM_REPLY / STREAM_ERROR, held to
+  macula_frame's shape for each (`FrameError::SealedShape`).
+- A pool call or stream to a provider whose advertisement names a KEM key is
+  sealed to that key, and its answers opened (`Preferred` and `Required`
+  both). `Required` calls only keyed providers. A provider that names a key
+  is still never called in the clear.
+- `station_link::Call` / `StreamCall` take `seal`: `Seal::To(key)` or
+  `Seal::Clear`. A call or an open to a provider that states neither is
+  refused `no_signed_state` before anything is sent; one to the station is
+  always clear. `LinkError::Confidentiality`, `SealedRefused { named }` and
+  `ClearAnswerToSealed`: a sealed request is never taken in the clear except
+  from the closed set of refusals. `ConfidentialityReason` gains
+  `KeyMismatch`, `ReplyNotOpened` and `NoSignedState`;
+  `ConfidentialityError` gains `named`. The types moved to `station_link`
+  and `pool` re-exports them.
+- `scripts/interop/sealed.sh` and `tests/interop_sealed.rs`: sealed calls and
+  streams from this SDK to an Erlang macula 13 provider with `confidential =>
+  required`, in both profiles.
+
+#### Fixed
+
+- A sealed CALL or STREAM_OPEN reaching a node this SDK serves from is refused
+  `sealed_refused` ("this node opens no sealed payload"); before, the handler
+  ran on a null payload.
+- A link answers at most one station liveness_ping at a time (#9): a burst
+  of pings starts one pong task, not one each.
+
+#### Not yet
+
+- Serving sealed requests (a KEM keyring, `kem_advertise`), and resealing a
+  call or stream to the key a `sealed_refused` names after a provider's key
+  rotation: today such a call fails closed with `SealedRefused`.
+
 ### [0.6.0] - 2026-09-30
 
 Handshake v5 and macula 13 compatibility: a link reaches a macula 13.2+

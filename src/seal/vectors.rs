@@ -89,7 +89,11 @@ fn every_call_and_stream_vector_reaches_macula_s_bytes() {
         let frame_type = c["frame_type"].as_str().unwrap();
         let what = format!("{} {frame_type}", profile.name());
         let key = recipient(&v["recipients"][profile.name()], profile);
-        assert_eq!(key.public_key().key_id().to_vec(), b(&c["key_id"]), "{what}");
+        assert_eq!(
+            key.public_key().key_id().to_vec(),
+            b(&c["key_id"]),
+            "{what}"
+        );
 
         // The combiner's input, from the vector's own parts.
         let key_hash = key_hash(key.public_key().carried());
@@ -134,7 +138,11 @@ fn every_call_and_stream_vector_reaches_macula_s_bytes() {
             request_id: parties.request_id,
             deadline: c["deadline"].as_u64().unwrap(),
         };
-        assert_eq!(request_aad(&request), b(&c["request"]["aad"]), "{what}: request AAD");
+        assert_eq!(
+            request_aad(&request),
+            b(&c["request"]["aad"]),
+            "{what}: request AAD"
+        );
         assert_eq!(b(&c["request"]["nonce"]), vec![0; NONCE_SIZE]);
         sealed_and_opened(&k_req, &c["request"], &format!("{what} request"));
 
@@ -150,10 +158,17 @@ fn every_call_and_stream_vector_reaches_macula_s_bytes() {
             sealed_and_opened(&k_rep, r, &format!("{what} {reply}"));
             if reply == "error_reply" {
                 let (code, detail) = (r["code"].as_str().unwrap(), r["detail"].as_str().unwrap());
-                assert_eq!(error_plain(code, detail), b(&r["plain"]), "{what}: ERROR plain");
+                assert_eq!(
+                    error_plain(code, detail),
+                    b(&r["plain"]),
+                    "{what}: ERROR plain"
+                );
                 assert_eq!(
                     open_error_plain(&b(&r["plain"])),
-                    Ok((code.to_string(), (!detail.is_empty()).then(|| detail.to_string())))
+                    Ok((
+                        code.to_string(),
+                        (!detail.is_empty()).then(|| detail.to_string())
+                    ))
                 );
             }
         }
@@ -180,7 +195,11 @@ fn every_call_and_stream_vector_reaches_macula_s_bytes() {
             );
             assert_eq!(aad, b(&f["aad"]), "{what}: stream frame {seq} AAD");
             if direction == Direction::CallerToProvider {
-                assert_eq!(stream_nonce(seq).to_vec(), b(&f["nonce"]), "{what}: seq nonce");
+                assert_eq!(
+                    stream_nonce(seq).to_vec(),
+                    b(&f["nonce"]),
+                    "{what}: seq nonce"
+                );
             }
             sealed_and_opened(key, f, &format!("{what} stream frame {seq}"));
         }
@@ -201,7 +220,12 @@ fn a_sender_s_secret_is_the_one_its_recipient_recovers() {
                 Profile::PqHybrid => MLKEM_CIPHERTEXT_SIZE + P384_POINT_BYTES,
             }
         );
-        assert_eq!(recipient_secret(&key, &kem_ct), Ok(ss), "{}", profile.name());
+        assert_eq!(
+            recipient_secret(&key, &kem_ct),
+            Ok(ss),
+            "{}",
+            profile.name()
+        );
         let other = PrivateKey::generate(profile).unwrap();
         assert_ne!(recipient_secret(&other, &kem_ct), Ok(ss), "another key");
         let mut short = kem_ct.clone();
@@ -235,15 +259,27 @@ fn a_key_that_is_not_one_is_refused() {
     let v = vectors();
     let pure = b(&v["recipients"]["pq_pure"]["key_as_carried"]);
     let hybrid = b(&v["recipients"]["pq_hybrid"]["key_as_carried"]);
-    assert!(parse_public_key(Profile::PqHybrid, &pure).is_err(), "pure as hybrid");
-    assert!(parse_public_key(Profile::PqPure, &hybrid).is_err(), "hybrid as pure");
+    assert!(
+        parse_public_key(Profile::PqHybrid, &pure).is_err(),
+        "pure as hybrid"
+    );
+    assert!(
+        parse_public_key(Profile::PqPure, &hybrid).is_err(),
+        "hybrid as pure"
+    );
     let mut compressed = hybrid.clone();
     compressed[MLKEM_EK_BYTES] = 0x02;
-    assert!(parse_public_key(Profile::PqHybrid, &compressed).is_err(), "not uncompressed");
+    assert!(
+        parse_public_key(Profile::PqHybrid, &compressed).is_err(),
+        "not uncompressed"
+    );
     let mut off_curve = hybrid.clone();
     let last = off_curve.len() - 1;
     off_curve[last] ^= 1;
-    assert!(parse_public_key(Profile::PqHybrid, &off_curve).is_err(), "off the curve");
+    assert!(
+        parse_public_key(Profile::PqHybrid, &off_curve).is_err(),
+        "off the curve"
+    );
     assert!(
         open_error_plain(&error_plain(&"c".repeat(MAX_ERROR_CODE_BYTES + 1), "")).is_err(),
         "an ERROR code past its bound"
