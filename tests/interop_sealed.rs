@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 use macula_rust::cbor::Value;
 use macula_rust::frame::StreamMode;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Call, Confidentiality, Offer, Opts, Pool, PoolError, Seed, StreamCall};
+use macula_rust::pool::{
+    Call, Confidentiality, Offer, Opts, Pool, PoolError, Report, Seed, StreamCall,
+};
 use macula_rust::profile::Profile;
 use macula_rust::record;
 use macula_rust::station_link::{handler, stream_handler, StreamEvent};
@@ -63,10 +65,10 @@ async fn pool(kem_advertise: bool) -> (Pool, [u8; 32]) {
 }
 
 /// The provider's advertisement reaches the DHT in its own time.
-async fn until_served(pool: &Pool, c: Call) -> Result<Value, PoolError> {
+async fn until_served(pool: &Pool, c: Call) -> Result<(Value, Report), PoolError> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        match pool.call(c.clone()).await {
+        match pool.call_report(c.clone()).await {
             Err(PoolError::NoProvider(tried)) if tried.is_empty() && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await
             }
@@ -82,6 +84,7 @@ async fn a_sealed_call_and_stream_reach_a_required_macula_provider() {
     let provider = hex32("MACULA_RUST_SEALED_PROVIDER");
     let vault = record::own_procedure(&provider, "vault");
     let watch = record::own_procedure(&provider, "watch");
+    let mut call_key = None;
     for confidential in [Confidentiality::Preferred, Confidentiality::Required] {
         let answered = until_served(
             &pool,
@@ -96,7 +99,12 @@ async fn a_sealed_call_and_stream_reach_a_required_macula_provider() {
         )
         .await;
         println!("sealed call ({confidential:?}): {answered:?}");
-        assert_eq!(answered.unwrap(), Value::text("kept by erlang"));
+        let (result, report) = answered.unwrap();
+        assert_eq!(result, Value::text("kept by erlang"));
+        println!("call report: {report:?}");
+        assert_eq!((report.sealed, report.provider), (1, provider));
+        assert!(report.seal_key_id.is_some());
+        call_key = report.seal_key_id;
     }
 
     let stream = pool
@@ -114,6 +122,16 @@ async fn a_sealed_call_and_stream_reach_a_required_macula_provider() {
     assert!(
         matches!(&chunk, Ok(StreamEvent::Data { body: Value::Bytes(b), .. }) if b == b"chunk from erlang"),
         "{chunk:?}"
+    );
+    let report = stream.report();
+    println!("stream report: {report:?}");
+    assert_eq!(
+        report,
+        Ok(Report {
+            sealed: 1,
+            provider,
+            seal_key_id: call_key,
+        })
     );
     let reply = stream.recv().await;
     println!("sealed stream reply: {reply:?}");

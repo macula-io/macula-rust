@@ -25,8 +25,8 @@ use crate::frame::StreamMode;
 use crate::record::{self, RecordType, Trust, Verified};
 use crate::seal::KEY_ID_SIZE;
 use crate::station_link::{
-    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Link, LinkError, Seal,
-    Stream, DEFAULT_CALL_TIMEOUT,
+    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Link, LinkError, Report,
+    Seal, Stream, DEFAULT_CALL_TIMEOUT,
 };
 use crate::transport::Target;
 
@@ -144,6 +144,16 @@ impl Pool {
     /// `PoolError::Link(LinkError::Provider { .. })`; when no candidate
     /// answers, [`PoolError::NoProvider`] names each one tried.
     pub async fn call(&self, c: Call) -> Result<Value, PoolError> {
+        self.call_report(c).await.map(|(result, _)| result)
+    }
+
+    /// [`Pool::call`], returning with its result the call's seal report
+    /// (macula's DESIGN_E2E_SEAL_REPORT): `sealed` 1 with the id of the key
+    /// the request was sealed to, which is the key its answer opened under,
+    /// or 0 and no key for a clear call; `provider` is the node the call was
+    /// addressed to. An error comes with no report. It states that sealing
+    /// ran on this exchange, nothing more.
+    pub async fn call_report(&self, c: Call) -> Result<(Value, Report), PoolError> {
         let inner = &self.inner;
         let realm_key = inner.realm_key_for(&c.realm, &c.procedure)?;
         let timeout = if c.timeout.is_zero() {
@@ -385,16 +395,18 @@ impl PoolInner {
     }
 
     /// Calls the candidate's provider on `link`, under what is left before
-    /// `deadline`.
+    /// `deadline`, and reports the call: a sealed call's result is only ever
+    /// one its answer opened under the key it was sealed to (the link
+    /// refuses any other), so `sealed` 1 names that key.
     async fn call_at(
         &self,
         link: &Link,
         cand: &Candidate,
         c: &Call,
         deadline: Instant,
-    ) -> Result<Value, PoolError> {
+    ) -> Result<(Value, Report), PoolError> {
         let left = deadline.saturating_duration_since(Instant::now());
-        Ok(link
+        let result = link
             .call(station_link::Call {
                 realm: c.realm,
                 procedure: c.procedure.clone(),
@@ -405,7 +417,8 @@ impl PoolInner {
                 proofs: c.proofs.clone(),
                 seal: Some(cand.seal()),
             })
-            .await?)
+            .await?;
+        Ok((result, Report::of(cand.provider.node, cand.kem_key_id())))
     }
 
     /// Opens the stream at the candidate's provider on `link`.

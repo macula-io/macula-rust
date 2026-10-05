@@ -500,6 +500,11 @@ impl StreamSeal {
         }
     }
 
+    /// The id of the KEM key the stream is sealed to.
+    pub(super) fn key_id(&self) -> [u8; KEY_ID_SIZE] {
+        self.key_id
+    }
+
     /// The provider's side of the stream `s` opened.
     pub(super) fn provider(s: &CallSeal) -> StreamSeal {
         StreamSeal {

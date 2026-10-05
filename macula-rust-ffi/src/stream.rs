@@ -9,7 +9,7 @@ use macula_rust::frame::{StreamEncoding, StreamMode, StreamRole};
 use macula_rust::pool::StreamCall;
 use macula_rust::station_link::{Stream, StreamEvent};
 
-use crate::pool::{FfiConfidentiality, FfiPool};
+use crate::pool::{FfiConfidentiality, FfiPool, FfiSealReport};
 use crate::{millis, to_32, FfiError, FfiValue};
 
 /// Who pushes data on a stream: the provider, the caller, or both.
@@ -139,6 +139,15 @@ impl FfiStream {
     /// Whether the session is sealed end to end.
     pub fn sealed(&self) -> bool {
         self.0.sealed()
+    }
+
+    /// The caller's seal report on this session, once the provider's first
+    /// data or reply opened under the session's key (on a clear session, its
+    /// first data, reply or end); [`FfiError::NotSettled`] before that and
+    /// on a session that ended first, [`FfiError::NotACaller`] on a served
+    /// one.
+    pub fn report(&self) -> Result<FfiSealReport, FfiError> {
+        Ok(self.0.report()?.into())
     }
 
     /// The payload the session was opened with.

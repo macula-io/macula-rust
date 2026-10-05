@@ -53,6 +53,19 @@ usually touches both, but their version numbers don't move in lockstep.
   came sealed; a sealed open's payload is its plaintext.
   `LinkError::KemAdvertiseDisabled` for a required procedure without
   `kem_advertise`.
+- The caller's seal report (macula's DESIGN_E2E_SEAL_REPORT, as macula
+  13.1.0 and macula-go 0.19.0 have it). `Pool::call_report` returns with a
+  result a `Report { sealed, provider, seal_key_id }`: `sealed` 1 and the id
+  of the key the request was sealed to, which its answer opened under, or 0
+  and no key for a clear call; `provider` is the node the call was addressed
+  to. An error carries no report, and `Pool::call` is unchanged.
+  `Stream::report` answers the same for a caller's stream once it settles: on
+  the provider's first STREAM_DATA or STREAM_REPLY opened under the stream's
+  key, or on a clear stream its first STREAM_DATA, STREAM_REPLY or
+  STREAM_END. Before that, and on a stream that ended first, an error
+  included, it is `ReportError::NotSettled`; a served stream is
+  `ReportError::NotACaller`. The report states that sealing ran on the
+  exchange, nothing more. `tests/seal_report.rs`.
 - `scripts/interop/sealed.sh` and `tests/interop_sealed.rs`: sealed calls and
   streams both ways, this SDK to an Erlang macula 13 provider and an Erlang
   macula 13 caller to this SDK, each with `confidential => required`, in
@@ -504,6 +517,10 @@ did, but the two have moved at different paces ever since).
 - `FfiConfidentiality` (`Preferred`, `Required`, `Off`), `FfiPoolOptions`
   `kem_advertise`, `FfiRequest.sealed` and `FfiStream::sealed` (macula-go
   7d7a90b, 1aa3315).
+- The caller's seal report: `FfiPool::call_report` returns an
+  `FfiCallReport { result, report }`, and `FfiStream::report` an
+  `FfiSealReport { sealed, provider, seal_key_id }`, or
+  `FfiError::NotSettled` / `FfiError::NotACaller`.
 
 #### Changed
 

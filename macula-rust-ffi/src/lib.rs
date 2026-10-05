@@ -46,7 +46,7 @@ pub use serve::{FfiCallHandler, FfiRequest, FfiServed};
 pub use stream::{FfiStream, FfiStreamEncoding, FfiStreamEvent, FfiStreamHandler, FfiStreamMode};
 
 use macula_rust::pool::PoolError;
-use macula_rust::station_link::LinkError;
+use macula_rust::station_link::{LinkError, ReportError};
 
 uniffi::setup_scaffolding!();
 
@@ -110,6 +110,13 @@ pub enum FfiError {
     /// A stream that ended normally.
     #[error("end of stream")]
     EndOfStream,
+    /// A stream's seal report asked for before it settled, or of a stream
+    /// that ended first.
+    #[error("not_settled")]
+    NotSettled,
+    /// A seal report asked of a served stream.
+    #[error("not_a_caller")]
+    NotACaller,
     /// A handler the foreign side implements refused, or failed.
     #[error("handler: {message}")]
     Handler { message: String },
@@ -160,6 +167,15 @@ impl From<LinkError> for FfiError {
             other => FfiError::Other {
                 message: other.to_string(),
             },
+        }
+    }
+}
+
+impl From<ReportError> for FfiError {
+    fn from(e: ReportError) -> Self {
+        match e {
+            ReportError::NotSettled => FfiError::NotSettled,
+            ReportError::NotACaller => FfiError::NotACaller,
         }
     }
 }

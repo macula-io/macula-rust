@@ -120,7 +120,7 @@ pub enum StreamEvent {
 /// One streaming session, on either side. Cloning it shares the session.
 #[derive(Clone)]
 pub struct Stream {
-    inner: Arc<StreamInner>,
+    pub(super) inner: Arc<StreamInner>,
 }
 
 /// What a served stream's inbox holds is charged to its caller's budget in
@@ -134,10 +134,10 @@ struct Budget {
 pub(super) struct StreamInner {
     link: Arc<Inner>,
     writer: FrameWriter,
-    open: VerifiedRequest,
-    caller: bool,
+    pub(super) open: VerifiedRequest,
+    pub(super) caller: bool,
     /// This side's keys when the stream is sealed.
-    sealing: Option<StreamSeal>,
+    pub(super) sealing: Option<StreamSeal>,
     /// Orders a frame's seq with its write.
     send_seq: tokio::sync::Mutex<u64>,
     state: Mutex<StreamSide>,
@@ -147,7 +147,7 @@ pub(super) struct StreamInner {
 }
 
 #[derive(Default)]
-struct StreamSide {
+pub(super) struct StreamSide {
     /// This side sent its last frame, or will send no more.
     sent_end: bool,
     /// The peer sent its last frame.
@@ -156,6 +156,8 @@ struct StreamSide {
     held: usize,
     ended: bool,
     err: Option<LinkError>,
+    /// A caller's seal report has settled (see [`Stream::report`]).
+    pub(super) settled: bool,
 }
 
 impl Stream {
@@ -303,7 +305,7 @@ impl StreamInner {
         })
     }
 
-    fn side(&self) -> MutexGuard<'_, StreamSide> {
+    pub(super) fn side(&self) -> MutexGuard<'_, StreamSide> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -826,6 +828,11 @@ async fn received(
             return None;
         }
     };
+    // Before the frame is delivered, so a recv that returns it sees the
+    // report settled.
+    if s.caller && settles(&fields, s.sealing.is_some()) {
+        s.side().settled = true;
+    }
     match fields {
         StreamFields::Error { code, message, .. } => {
             s.peer_finished(Some(LinkError::Stream {
@@ -870,5 +877,18 @@ async fn received(
             StreamInner::end(s, Some(LinkError::ClearAnswerToSealed));
             None
         }
+    }
+}
+
+/// Whether a provider's frame settles its caller's seal report: on a sealed
+/// stream a data or reply frame, which [`unsealed`] returns only once it
+/// opened under the stream's key; on a clear stream a data, reply or end
+/// frame. A sealed stream's end travels clear and settles nothing, and no
+/// error settles a stream.
+fn settles(fields: &StreamFields, sealed: bool) -> bool {
+    match fields {
+        StreamFields::Data { .. } | StreamFields::Reply { .. } => true,
+        StreamFields::End { .. } => !sealed,
+        _ => false,
     }
 }

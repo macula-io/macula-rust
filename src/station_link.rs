@@ -21,6 +21,7 @@ mod confidential;
 mod dht;
 mod framing;
 mod pubsub;
+mod report;
 mod serve;
 mod stream;
 mod versions;
@@ -31,6 +32,7 @@ pub use confidential::{
     is_clear_refusal, Confidentiality, ConfidentialityError, ConfidentialityReason, Seal,
 };
 pub use pubsub::{Event, EventDedup, Publication, PublicationSeq, SignedPublication, Subscription};
+pub use report::{Report, ReportError};
 pub use serve::{handler, BoxFuture, Handler, Offer, Request, Served, StreamOffer};
 pub use stream::{
     stream_handler, Stream, StreamCall, StreamEvent, StreamHandler, DEFAULT_STREAM_DEADLINE,

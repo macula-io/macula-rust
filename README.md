@@ -30,7 +30,8 @@
 > station never seen on v5. A call or stream to a provider whose
 > advertisement names a KEM key is sealed end to end to that key (macula 13's
 > seal scheme 1), and a node with `kem_advertise` on names its key, opens
-> sealed requests and answers them sealed; both directions are held to
+> sealed requests and answers them sealed, and a caller's seal report says
+> whether the exchange behind a result was sealed and to which key; both directions are held to
 > macula's vectors and run live against macula 13 with `confidential =>
 > required` (`scripts/interop/sealed.sh`). Not here yet: UCAN-gated calls;
 > see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
@@ -154,7 +155,7 @@ compatibility layer.
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
 | Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links |
-| End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required` |
+| End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; `call_report` and `Stream::report` give the caller's seal report |
 | Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |
 | DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | Records verified before they are handed on |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | `macula-rust-ffi`, below |

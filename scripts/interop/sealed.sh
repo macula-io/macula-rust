@@ -11,8 +11,13 @@
 #
 #   MACULA_BUILD=<a compiled macula 13.x checkout> scripts/interop/sealed.sh [pq_hybrid|pq_pure]
 #
-# erlang_sealed.escript is macula-go's (scripts/interop at 0cb83e8), unchanged;
+# erlang_sealed.escript is macula-go's (scripts/interop at 303dc6f), unchanged;
 # MACULA_SEALED_PEER=rust names the texts it expects from a Rust provider.
+# The Rust caller always checks its seal reports (DESIGN_E2E_SEAL_REPORT): the
+# call's and the stream's, sealed 1, addressed to the Erlang provider, naming
+# one key. MACULA_SEAL_REPORT=1 (macula 13.1.0 on) has the Erlang caller check
+# its own reports of the Rust provider the same way, and MACULA_OFF_REFUSED=1
+# (13.0.1 on) has it require a direct dial with confidential => off refused.
 # Needs target/teststation (scripts/build-teststation.sh). CGROUP_PARENT puts
 # the containers in a CI host's cgroup slice.
 set -euo pipefail
@@ -80,6 +85,7 @@ podman run --rm --init --name "$rust_name" --network host $slice \
 first_line "$work/rust.out" '^serving' > /dev/null
 provider="$(first_line "$work/rust.out" '^node ' | awk '{print $2}')"
 podman run --rm --network host $slice -e MACULA_SEALED_PEER=rust \
+  -e MACULA_SEAL_REPORT="${MACULA_SEAL_REPORT:-}" -e MACULA_OFF_REFUSED="${MACULA_OFF_REFUSED:-}" \
   -v "$MACULA_BUILD:/macula:ro" -v "$root/scripts/interop:/interop:ro" \
   "$image" escript /interop/erlang_sealed.escript /macula/_build/default/lib/macula \
   "$host" "$port" "$station" "$realm" "$profile" call "$provider"

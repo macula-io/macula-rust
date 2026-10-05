@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use macula_rust::pool::{Call, Confidentiality, Opts, Pool, Seed};
+use macula_rust::pool::{Call, Confidentiality, Opts, Pool, Report, Seed};
 use macula_rust::record::{self, RecordType, Verified};
 
 use crate::node_key::FfiNodeKey;
@@ -85,6 +85,36 @@ pub struct FfiLinkStatus {
     pub port: u16,
     pub direct: bool,
     pub up: bool,
+}
+
+/// A caller's seal report on one exchange (macula's DESIGN_E2E_SEAL_REPORT):
+/// `sealed` 1 when the request that produced the result was sealed and its
+/// answer opened under the same key, whose 8-byte id `seal_key_id` names; 0,
+/// with no key id, for a clear exchange. `provider` is the node the request
+/// was addressed to. It states that sealing ran on this exchange, nothing
+/// more.
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct FfiSealReport {
+    pub sealed: u8,
+    pub provider: Vec<u8>,
+    pub seal_key_id: Option<Vec<u8>>,
+}
+
+impl From<Report> for FfiSealReport {
+    fn from(r: Report) -> Self {
+        FfiSealReport {
+            sealed: r.sealed,
+            provider: r.provider.to_vec(),
+            seal_key_id: r.seal_key_id.map(|id| id.to_vec()),
+        }
+    }
+}
+
+/// A call's result and its seal report.
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct FfiCallReport {
+    pub result: FfiValue,
+    pub report: FfiSealReport,
 }
 
 /// A node serving a procedure, and the station it serves from.
@@ -227,6 +257,35 @@ impl FfiPool {
             })
             .await?;
         answered.try_into()
+    }
+
+    /// [`FfiPool::call`], returning with its result the call's seal report.
+    /// An error comes with no report.
+    pub async fn call_report(
+        &self,
+        realm: Vec<u8>,
+        procedure: String,
+        payload: FfiValue,
+        provider: Option<Vec<u8>>,
+        timeout_ms: u64,
+        confidential: FfiConfidentiality,
+    ) -> Result<FfiCallReport, FfiError> {
+        let (result, report) = self
+            .0
+            .call_report(Call {
+                realm: to_32(realm)?,
+                procedure,
+                provider: provider.map(to_32).transpose()?.unwrap_or([0; 32]),
+                payload: payload.into(),
+                timeout: millis(timeout_ms),
+                confidential: confidential.into(),
+                ..Call::default()
+            })
+            .await?;
+        Ok(FfiCallReport {
+            result: result.try_into()?,
+            report: report.into(),
+        })
     }
 
     /// Every provider of `procedure` in `realm` the pinned realm key

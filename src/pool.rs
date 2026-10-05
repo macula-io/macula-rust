@@ -22,7 +22,7 @@ mod pubsub;
 mod serve;
 
 pub use crate::station_link::Confidentiality;
-pub use crate::station_link::{ConfidentialityError, ConfidentialityReason};
+pub use crate::station_link::{ConfidentialityError, ConfidentialityReason, Report, ReportError};
 pub use call::{Call, Provider, StreamCall};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;

@@ -504,6 +504,21 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
         .await
         .unwrap();
     assert_eq!(answered, FfiValue::Int(1));
+    let reported = caller
+        .call_report(
+            realm.clone(),
+            vault.clone(),
+            FfiValue::Text("secret".into()),
+            None,
+            5_000,
+            FfiConfidentiality::Required,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reported.result, FfiValue::Int(1));
+    assert_eq!(reported.report.sealed, 1);
+    assert_eq!(reported.report.provider, provider.node_id());
+    assert_eq!(reported.report.seal_key_id.map(|id| id.len()), Some(8));
     let off = caller
         .call(
             realm.clone(),
