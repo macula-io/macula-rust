@@ -10,6 +10,10 @@
 //! request_id) and answered with a RESULT or ERROR signed by this node.
 //! UNADVERTISE carries a tombstone of the advertisement.
 //!
+//! With `kem_advertise` on, a confidential procedure's advertisement names
+//! this node's KEM key, and a request sealed to it is opened and answered
+//! sealed (confidential.rs).
+//!
 //! Only open procedures are served: a gated one needs a post-quantum UCAN
 //! verifier, which this crate does not have.
 
@@ -26,9 +30,13 @@ use crate::record::{
     self, Authorization, ProcedureAdvertisementOptions, Reason, Record, RecordError,
     TombstoneOptions, Trust,
 };
+use crate::seal;
 
 use super::admission::Verdict;
-use super::confidential::{CODE_SEALED_REFUSED, NO_KEY_DETAIL};
+use super::confidential::{
+    clear_allowed, opened_request, CallSeal, Confidentiality, CODE_SEALED_REFUSED,
+    CODE_SEALED_REQUIRED,
+};
 use super::framing::MAX_FRAME_BYTES;
 use super::stream::StreamHandler;
 use super::{now_ms, Inner, Link, LinkError};
@@ -42,12 +50,16 @@ const CODE_UNKNOWN_PROCEDURE: &str = "unknown_next_peer";
 pub(super) const CODE_REQUEST_COPY: &str = "request_copy";
 const CODE_PAYLOAD_TOO_LARGE: &str = "payload_too_large";
 const CODE_UNSENDABLE: &str = "unknown_error";
+/// A sealed answer this node could not seal: a refusal from the closed set,
+/// which carries no application data.
+const CODE_UNAVAILABLE: &str = "unavailable";
 
 /// An ERROR's detail is at most 256 bytes, cut on a character boundary.
 const MAX_DETAIL_BYTES: usize = 256;
 
 /// macula's default and longest advertisement lifetime.
-const MAX_ADVERTISEMENT_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_ADVERTISEMENT_TTL: Duration =
+    Duration::from_millis(super::confidential::MAX_ADVERTISEMENT_TTL_MS as u64);
 /// How soon a failed renewal is tried again, while the advertisement it
 /// replaces still lives.
 const REFRESH_RETRY: Duration = Duration::from_secs(10);
@@ -81,6 +93,9 @@ pub struct Request {
     pub token: Option<Vec<u8>>,
     pub proofs: Option<Vec<Vec<u8>>>,
     pub deadline_ms: u64,
+    /// Whether the request came sealed end to end: `payload` is its opened
+    /// plaintext, and the answer goes back sealed.
+    pub sealed: bool,
 }
 
 /// A procedure to serve: its realm and name, exactly one of a unary handler
@@ -94,6 +109,15 @@ pub struct Offer {
     pub handler: Option<Handler>,
     pub stream: Option<StreamOffer>,
     pub realm_key: Option<Vec<u8>>,
+    /// How the procedure takes its requests: whether its advertisement names
+    /// this node's KEM key, with `kem_advertise` on, and whether it takes
+    /// clear ones.
+    pub confidential: Confidentiality,
+    /// When the procedure was first advertised naming the key (unix ms),
+    /// from which its keyless window runs; serving sets it to now when
+    /// `None`. A pool keeps it across the links it serves on, so no link
+    /// reopens the window.
+    pub keyed_since_ms: Option<i64>,
 }
 
 impl Offer {
@@ -105,6 +129,8 @@ impl Offer {
             handler: Some(handler),
             stream: None,
             realm_key: None,
+            confidential: Confidentiality::Preferred,
+            keyed_since_ms: None,
         }
     }
 
@@ -121,6 +147,8 @@ impl Offer {
             handler: None,
             stream: Some(StreamOffer { mode, handler }),
             realm_key: None,
+            confidential: Confidentiality::Preferred,
+            keyed_since_ms: None,
         }
     }
 }
@@ -165,13 +193,20 @@ impl Link {
     /// (against the realm key for an org procedure) before sending it in an
     /// ADVERTISE and putting it in the DHT. The advertisement is renewed at
     /// half its lifetime.
-    pub async fn serve(&self, o: Offer) -> Result<Served, LinkError> {
+    pub async fn serve(&self, mut o: Offer) -> Result<Served, LinkError> {
         let own = record::in_own_namespace(&o.procedure);
         if o.handler.is_some() == o.stream.is_some() || (!own && o.realm_key.is_none()) {
             return Err(LinkError::InvalidOffer);
         }
         if !matches!(record::procedure_org(&o.procedure), Ok(Some(_))) {
             return Err(LinkError::NoOrg);
+        }
+        let can_name_key = self.inner.kem_advertise && self.inner.keyring.is_some();
+        if o.confidential == Confidentiality::Required && !can_name_key {
+            return Err(LinkError::KemAdvertiseDisabled);
+        }
+        if self.inner.keyed(&o) && o.keyed_since_ms.is_none() {
+            o.keyed_since_ms = Some(now_ms());
         }
         let (advertisement, wire) = self.advertisement(&o, MAX_ADVERTISEMENT_TTL).await?;
         let key = (o.realm, o.procedure.clone());
@@ -212,12 +247,12 @@ impl Link {
     ) -> Result<(Record, Vec<u8>), LinkError> {
         let inner = &self.inner;
         let max_ttl_ms = max_ttl.as_millis() as u64;
-        // This node opens no sealed request, so its advertisement names no
-        // KEM key: callers reach it in the clear.
+        // Each signing reads the keyring, so a renewal names a rotated key.
+        let kem_key = inner.kem_key(o);
         let opts = if record::in_own_namespace(&o.procedure) {
             ProcedureAdvertisementOptions {
                 authorization: Authorization::None,
-                kem_key: None,
+                kem_key,
                 ttl_ms: max_ttl_ms,
             }
         } else {
@@ -244,7 +279,7 @@ impl Link {
                     org_directory: record::encode(directory.record())?,
                     procedure_delegation: record::encode(delegation.record())?,
                 },
-                kem_key: None,
+                kem_key,
                 ttl_ms: ttl as u64,
             }
         };
@@ -446,30 +481,21 @@ pub(super) fn called(inner: &Arc<Inner>, v: &Value) {
                 let _ = inner.control.write(&stored, MAX_FRAME_BYTES).await;
             });
         }
-        // This node opens no sealed payload: a sealed request is refused,
-        // never handed to a handler on a payload it cannot read.
-        Verdict::New if request.sealed.is_some() => {
-            let reply = provider_error(&inner, &request, CODE_SEALED_REFUSED, Some(NO_KEY_DETAIL));
-            tokio::spawn(async move { send_reply(&inner, reply).await });
-        }
         Verdict::New => {
             tokio::spawn(answer(inner, request));
         }
     }
 }
 
-/// Runs the request's handler and sends its signed reply, storing it for the
+/// Serves a request and sends its signed reply, storing it for the
 /// request's copies.
 async fn answer(inner: Arc<Inner>, request: VerifiedRequest) {
-    let handler = inner
+    let offer = inner
         .lock()
         .served
         .get(&(request.realm, request.procedure.clone()))
-        .and_then(|s| s.offer.handler.clone());
-    let reply = match handler {
-        None => provider_error(&inner, &request, CODE_UNKNOWN_PROCEDURE, None),
-        Some(handler) => handled(&inner, handler, &request).await,
-    };
+        .map(|s| s.offer.clone());
+    let reply = reply(&inner, &request, offer).await;
     let Ok(encoded) = cbor::encode(&reply) else {
         inner.count("unencodable_reply");
         return;
@@ -478,46 +504,181 @@ async fn answer(inner: Arc<Inner>, request: VerifiedRequest) {
     let _ = inner.control.write(&encoded, MAX_FRAME_BYTES).await;
 }
 
-/// The handler's answer to `request` as a signed reply: its result, its
-/// refusal as handler_error, a panic as temporary_relay_failure, or a result
-/// the wire cannot carry as payload_too_large or unknown_error.
-async fn handled(inner: &Inner, handler: Handler, request: &VerifiedRequest) -> Value {
+/// The signed reply to `request`, served by `offer` (`None` when this link
+/// serves no such procedure), in macula 13's order: a sealed request opened
+/// first, or refused sealed_refused in the clear when it does not open; a
+/// clear one to a procedure past its keyless window refused sealed_required;
+/// then the procedure and its handler, answered sealed when the request was.
+async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -> Value {
+    let (payload, sealing) = match &request.sealed {
+        Some(_) => match opened_request(inner.keyring.as_deref(), request) {
+            Ok((payload, sealing)) => (payload, Some(sealing)),
+            Err(detail) => {
+                return provider_error(inner, request, CODE_SEALED_REFUSED, Some(&detail))
+            }
+        },
+        None => {
+            let refused = offer
+                .as_ref()
+                .is_some_and(|o| !clear_allowed(o.confidential, inner.keyed_since(o), now_ms()));
+            if refused {
+                return provider_error(inner, request, CODE_SEALED_REQUIRED, None);
+            }
+            (request.payload.clone(), None)
+        }
+    };
+    let outcome = match offer.and_then(|o| o.handler) {
+        None => Outcome::Refused(CODE_UNKNOWN_PROCEDURE, None),
+        Some(handler) => handled(handler, request, payload, sealing.is_some()).await,
+    };
+    answered(inner, request, sealing.as_ref(), outcome)
+}
+
+/// What answers a request: a RESULT's payload, or an ERROR's code and
+/// detail.
+enum Outcome {
+    Result(Value),
+    Refused(&'static str, Option<String>),
+}
+
+/// The handler's answer to `request`, on `payload`: its result, its refusal
+/// as handler_error, a panic as temporary_relay_failure, or handler_error
+/// when it is still running at the deadline.
+async fn handled(
+    handler: Handler,
+    request: &VerifiedRequest,
+    payload: Value,
+    sealed: bool,
+) -> Outcome {
     let running = tokio::spawn(handler(Request {
         caller: request.caller,
         realm: request.realm,
         procedure: request.procedure.clone(),
-        payload: request.payload.clone(),
+        payload,
         token: request.token.clone(),
         proofs: request.proofs.clone(),
         deadline_ms: request.deadline,
+        sealed,
     }));
     let abort = running.abort_handle();
     let left = (request.deadline as i64 - now_ms()).max(0) as u64;
-    let outcome = tokio::time::timeout(Duration::from_millis(left), running).await;
-    match outcome {
+    match tokio::time::timeout(Duration::from_millis(left), running).await {
         Err(_) => {
             abort.abort();
-            provider_error(
-                inner,
-                request,
+            Outcome::Refused(
                 CODE_HANDLER_ERROR,
-                Some("the request's deadline passed"),
+                Some("the request's deadline passed".into()),
             )
         }
-        Ok(Err(_panicked)) => provider_error(inner, request, CODE_HANDLER_CRASHED, None),
-        Ok(Ok(Err(refusal))) => provider_error(
-            inner,
-            request,
+        Ok(Err(_panicked)) => Outcome::Refused(CODE_HANDLER_CRASHED, None),
+        Ok(Ok(Err(refusal))) => Outcome::Refused(
             CODE_HANDLER_ERROR,
-            Some(bounded_detail(&refusal)),
+            Some(bounded_detail(&refusal).to_string()),
         ),
-        Ok(Ok(Ok(payload))) => match frame::sign_result(request, &payload, None, &inner.key) {
-            Ok(signed) => signed,
-            Err(_) if cbor::encode(&payload).is_ok_and(|e| e.len() > frame::MAX_FRAME_BYTES) => {
-                provider_error(inner, request, CODE_PAYLOAD_TOO_LARGE, None)
+        Ok(Ok(Ok(payload))) => Outcome::Result(payload),
+    }
+}
+
+/// An outcome as the signed reply to `request`: clear to a clear request,
+/// sealed to a sealed one. A result the wire cannot carry is answered
+/// payload_too_large or unknown_error, as macula answers it.
+fn answered(
+    inner: &Inner,
+    request: &VerifiedRequest,
+    sealing: Option<&CallSeal>,
+    outcome: Outcome,
+) -> Value {
+    let Some(sealing) = sealing else {
+        return match outcome {
+            Outcome::Refused(code, detail) => {
+                provider_error(inner, request, code, detail.as_deref())
             }
-            Err(_) => provider_error(inner, request, CODE_UNSENDABLE, None),
-        },
+            Outcome::Result(payload) => {
+                match frame::sign_result(request, &payload, None, &inner.key) {
+                    Ok(signed) => signed,
+                    Err(_)
+                        if cbor::encode(&payload)
+                            .is_ok_and(|e| e.len() > frame::MAX_FRAME_BYTES) =>
+                    {
+                        provider_error(inner, request, CODE_PAYLOAD_TOO_LARGE, None)
+                    }
+                    Err(_) => provider_error(inner, request, CODE_UNSENDABLE, None),
+                }
+            }
+        };
+    };
+    let payload = match outcome {
+        Outcome::Refused(code, detail) => {
+            return sealed_error(inner, request, sealing, code, detail.as_deref())
+        }
+        Outcome::Result(payload) => payload,
+    };
+    let plain = frame::check_payload(&payload)
+        .ok()
+        .and_then(|_| cbor::encode(&payload).ok());
+    let Some(plain) = plain else {
+        return sealed_error(inner, request, sealing, CODE_UNSENDABLE, None);
+    };
+    let signed = sealing
+        .sealed_answer(
+            seal::FRAME_RESULT,
+            &plain,
+            &request.request_hash,
+            &inner.self_id,
+        )
+        .and_then(|sealed| {
+            frame::sign_sealed_result(request, &sealed, None, &inner.key).map_err(LinkError::from)
+        });
+    match signed {
+        Ok(reply) if cbor::encode(&reply).is_ok_and(|e| e.len() <= frame::MAX_FRAME_BYTES) => reply,
+        Ok(_) => sealed_error(inner, request, sealing, CODE_PAYLOAD_TOO_LARGE, None),
+        Err(LinkError::Io(_)) => provider_error(inner, request, CODE_UNAVAILABLE, None),
+        Err(_) => sealed_error(inner, request, sealing, CODE_PAYLOAD_TOO_LARGE, None),
+    }
+}
+
+/// This node's ERROR for a sealed request, its code and detail sealed as
+/// cbor([code, detail]). One that cannot be sealed (no randomness) is
+/// answered unavailable in the clear, from the closed set: never the code
+/// or detail in the clear.
+fn sealed_error(
+    inner: &Inner,
+    request: &VerifiedRequest,
+    sealing: &CallSeal,
+    code: &str,
+    detail: Option<&str>,
+) -> Value {
+    let plain = seal::error_plain(code, detail.unwrap_or(""));
+    match sealing.sealed_answer(
+        seal::FRAME_ERROR,
+        &plain,
+        &request.request_hash,
+        &inner.self_id,
+    ) {
+        Ok(sealed) => frame::sign_sealed_provider_error(request, &sealed, None, &inner.key)
+            .unwrap_or_else(|e| {
+                panic!("station_link: a sealed provider error that does not sign: {e}")
+            }),
+        Err(_) => provider_error(inner, request, CODE_UNAVAILABLE, None),
+    }
+}
+
+impl Inner {
+    /// Whether `o`'s advertisements name this node's KEM key.
+    pub(super) fn keyed(&self, o: &Offer) -> bool {
+        self.kem_advertise && self.keyring.is_some() && o.confidential != Confidentiality::Off
+    }
+
+    /// When `o` was first keyed, `None` while its advertisements name no
+    /// key.
+    pub(super) fn keyed_since(&self, o: &Offer) -> Option<i64> {
+        o.keyed_since_ms.filter(|_| self.keyed(o))
+    }
+
+    /// The key `o`'s advertisement names now, as carried, `None` for none.
+    fn kem_key(&self, o: &Offer) -> Option<Vec<u8>> {
+        let keyring = self.keyring.as_ref().filter(|_| self.keyed(o))?;
+        Some(keyring.current().public_key().carried().to_vec())
     }
 }
 

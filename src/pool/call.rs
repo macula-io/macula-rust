@@ -15,7 +15,6 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +25,8 @@ use crate::frame::StreamMode;
 use crate::record::{self, RecordType, Trust, Verified};
 use crate::seal::KEY_ID_SIZE;
 use crate::station_link::{
-    self, ConfidentialityError, ConfidentialityReason, Link, LinkError, Seal, Stream,
-    DEFAULT_CALL_TIMEOUT,
+    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Link, LinkError, Seal,
+    Stream, DEFAULT_CALL_TIMEOUT,
 };
 use crate::transport::Target;
 
@@ -35,42 +34,6 @@ use super::{Pool, PoolError, PoolInner};
 
 /// No candidate gets less than a second of a call's time.
 const MIN_CANDIDATE_SHARE: Duration = Duration::from_secs(1);
-
-/// How a call or an open must be kept, as macula-go's options name it
-/// (macula 13, E2E design §8): `Preferred`, the default, or `Required`.
-/// There is no `off`: only an advertisement naming no key is called in the
-/// clear. A provider whose advertisement names a KEM key is always called
-/// sealed to that key; a lookup can deny a call, never downgrade it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Confidentiality {
-    /// Sealed to a provider whose advertisement names a KEM key, and in the
-    /// clear to one whose advertisements name none.
-    #[default]
-    Preferred,
-    /// Sealed only: a provider whose advertisement names no key is not
-    /// called.
-    Required,
-}
-
-impl FromStr for Confidentiality {
-    type Err = PoolError;
-
-    /// "preferred" (or "", the default) or "required"; "off" and anything
-    /// else are refused, as macula-go's call options refuse them.
-    fn from_str(s: &str) -> Result<Self, PoolError> {
-        match s {
-            "" | "preferred" => Ok(Confidentiality::Preferred),
-            "required" => Ok(Confidentiality::Required),
-            "off" => Err(PoolError::InvalidOpts(
-                "confidential off is refused for a call or an open: it is preferred or required"
-                    .into(),
-            )),
-            other => Err(PoolError::InvalidOpts(format!(
-                "confidential is preferred or required, not {other:?}"
-            ))),
-        }
-    }
-}
 
 /// A call to a procedure: its realm and name, the provider to call (any
 /// trusted one when zero), the payload, how long to wait
@@ -612,11 +575,18 @@ fn now_ms() -> i64 {
 /// the DHT still serves (it rotated onto `kem_advertise`): a provider that
 /// names a key is never called in the clear. Under `Required` only keyed
 /// candidates are called. None left is a [`ConfidentialityError`] naming the
-/// advertised key ids.
+/// advertised key ids. `Off` is refused: a clear call is an explicit
+/// target's, made on a link with [`Seal::Clear`].
 fn callable(
     candidates: Vec<Candidate>,
     confidential: Confidentiality,
 ) -> Result<Vec<Candidate>, PoolError> {
+    if confidential == Confidentiality::Off {
+        return Err(PoolError::InvalidOpts(
+            "confidential off is refused for a pool call or open: it is preferred or required"
+                .into(),
+        ));
+    }
     let advertised: Vec<[u8; KEY_ID_SIZE]> = candidates
         .iter()
         .filter_map(Candidate::kem_key_id)
@@ -631,7 +601,7 @@ fn callable(
         .filter(|c| match (confidential, &c.kem_key) {
             (_, Some(_)) => true,
             (Confidentiality::Preferred, None) => !keyed.contains(&c.provider.node),
-            (Confidentiality::Required, None) => false,
+            (_, None) => false,
         })
         .collect();
     if kept.is_empty() {
@@ -704,28 +674,22 @@ mod tests {
     }
 
     #[test]
-    fn confidential_is_preferred_or_required_and_off_is_refused() {
+    fn confidential_parses_and_off_is_refused_for_a_pool_call() {
         assert_eq!(Confidentiality::default(), Confidentiality::Preferred);
-        assert_eq!(
-            "".parse::<Confidentiality>().unwrap(),
-            Confidentiality::Preferred
-        );
-        assert_eq!(
-            "preferred".parse::<Confidentiality>().unwrap(),
-            Confidentiality::Preferred
-        );
-        assert_eq!(
-            "required".parse::<Confidentiality>().unwrap(),
-            Confidentiality::Required
-        );
-        for refused in ["off", "Required", "none", "optional"] {
-            assert!(
-                matches!(
-                    refused.parse::<Confidentiality>(),
-                    Err(PoolError::InvalidOpts(_))
-                ),
-                "{refused}"
-            );
+        for (text, parsed) in [
+            ("", Confidentiality::Preferred),
+            ("preferred", Confidentiality::Preferred),
+            ("required", Confidentiality::Required),
+            ("off", Confidentiality::Off),
+        ] {
+            assert_eq!(text.parse::<Confidentiality>(), Ok(parsed), "{text}");
         }
+        for refused in ["Required", "none", "optional"] {
+            assert!(refused.parse::<Confidentiality>().is_err(), "{refused}");
+        }
+        assert!(matches!(
+            callable(vec![cand(1, Some(7))], Confidentiality::Off),
+            Err(PoolError::InvalidOpts(_))
+        ));
     }
 }

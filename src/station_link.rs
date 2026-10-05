@@ -27,7 +27,9 @@ mod versions;
 
 pub use admission::{Admission, AdmissionLimits};
 pub use call::{Call, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
-pub use confidential::{is_clear_refusal, ConfidentialityError, ConfidentialityReason, Seal};
+pub use confidential::{
+    is_clear_refusal, Confidentiality, ConfidentialityError, ConfidentialityReason, Seal,
+};
 pub use pubsub::{Event, EventDedup, Publication, PublicationSeq, SignedPublication, Subscription};
 pub use serve::{handler, BoxFuture, Handler, Offer, Request, Served, StreamOffer};
 pub use stream::{
@@ -52,6 +54,7 @@ use crate::handshake::{
 use crate::node_key::NodeKey;
 use crate::profile::Profile;
 use crate::record::RecordError;
+use crate::seal::Keyring;
 use crate::statement_issuer::{IssuerError, StatementIssuer, StatementSubscription};
 use crate::transport::{self, DialError, Target};
 
@@ -126,6 +129,9 @@ pub enum LinkError {
     NoOrg,
     /// A procedure already served on this link.
     AlreadyServed,
+    /// A required-confidential procedure on a link whose `kem_advertise` is
+    /// off: it would name no key and refuse every clear call.
+    KemAdvertiseDisabled,
     /// A served procedure withdrawn by its owner.
     Stopped,
     /// A stream ended by a STREAM_ERROR: the peer's, the station's relay
@@ -231,6 +237,16 @@ pub struct Config {
     /// This link's place in the admission: the station it dialed, host:port,
     /// when `None`.
     pub share: Option<String>,
+    /// This identity's KEM keys (macula 13, E2E design amendment A1): with
+    /// them the link opens sealed requests; without them it refuses them,
+    /// holding no key. Links of one identity share one.
+    pub keyring: Option<Arc<Keyring>>,
+    /// Names the keyring's current key in the advertisements of procedures
+    /// served confidentially ([`Confidentiality::Preferred`] or
+    /// [`Confidentiality::Required`]). Off by default: switch it on only once
+    /// every station runs macula 12.11 or later, which stores and routes a
+    /// keyed advertisement, and every caller runs 13. It needs a keyring.
+    pub kem_advertise: bool,
 }
 
 impl Config {
@@ -245,6 +261,8 @@ impl Config {
             admission: None,
             dedup: None,
             share: None,
+            keyring: None,
+            kem_advertise: false,
         }
     }
 }
@@ -282,6 +300,8 @@ struct Inner {
     admission: Arc<Admission>,
     dedup: Arc<EventDedup>,
     share: String,
+    keyring: Option<Arc<Keyring>>,
+    kem_advertise: bool,
     state: Mutex<State>,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
@@ -315,6 +335,20 @@ impl Link {
         }
         if let Some(admission) = &cfg.admission {
             admission.limits().validate()?;
+        }
+        if cfg
+            .keyring
+            .as_ref()
+            .is_some_and(|k| k.profile() != cfg.target.profile)
+        {
+            return Err(LinkError::InvalidConfig(
+                "the keyring is of another profile than the target's".into(),
+            ));
+        }
+        if cfg.kem_advertise && cfg.keyring.is_none() {
+            return Err(LinkError::InvalidConfig(
+                "kem_advertise names a key: it needs a keyring".into(),
+            ));
         }
         let node_id = cfg.target.expected_node_id;
         let version = versions::dial_version(&node_id, std::time::Instant::now());
@@ -506,6 +540,8 @@ async fn handshaken(
             .unwrap_or_else(|| Arc::new(Admission::new(AdmissionLimits::default()))),
         dedup: cfg.dedup.clone().unwrap_or_default(),
         share,
+        keyring: cfg.keyring.clone(),
+        kem_advertise: cfg.kem_advertise,
         state: Mutex::new(State {
             ended: None,
             closing: false,

@@ -1,35 +1,86 @@
 //! End-to-end payload confidentiality on a link, as macula 13 has it (E2E
-//! design §5, §8, amendment A1; seal scheme 1), the caller's side. A call or a
-//! stream to a provider states how it is kept: sealed to the key the
-//! provider's verified advertisement names, or in the clear by the
-//! application's own decision. A sealed request is never answered in the
-//! clear except from a closed set of refusals that carry no application data,
-//! and never falls back to the clear.
+//! design §5, §8, amendment A1; seal scheme 1). A provider that names its KEM
+//! key in its advertisement opens the requests sealed to it and seals every
+//! answer to them; what it cannot open it refuses in the clear, from a
+//! closed set that carries no application data. A call or a stream to a
+//! provider states how it is kept: sealed to the key the provider's verified
+//! advertisement names, or in the clear by the application's own decision.
+//! A sealed request is never answered in the clear except from that closed
+//! set, and never falls back to the clear.
 
 use std::fmt;
+use std::str::FromStr;
 
 use crate::cbor::{self, Value};
 use crate::frame::{
     self, Sealed, StreamEncoding, StreamFields, VerifiedReply, VerifiedRequest, VerifiedStreamFrame,
 };
 use crate::profile::Profile;
-use crate::seal::{self, Direction, Parties, KEY_ID_SIZE, NONCE_SIZE};
+use crate::record::CLOCK_TOLERANCE_MS;
+use crate::seal::{self, Direction, Keyring, Parties, KEY_ID_SIZE, NONCE_SIZE};
 
 use super::LinkError;
+
+/// How a procedure takes its requests, and how a pool's call or open must
+/// be kept, as macula-go's stationlink.Confidentiality.
+///
+/// Serving: `Preferred`, the default, names this node's KEM key in the
+/// advertisement when the link's `kem_advertise` is on, and still takes a
+/// clear request while the procedure's last keyless advertisement could be
+/// served, then refuses it sealed_required. `Required` names the key and
+/// refuses every clear request; it needs `kem_advertise` on. `Off` names no
+/// key: the procedure is served in the clear.
+///
+/// Calling through a pool: `Preferred` seals to a provider that names a key
+/// and calls one that names none in the clear; `Required` never calls one
+/// that names none. `Off` is refused: a clear call is an explicit target's
+/// (a [`Seal::Clear`] on a link).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Confidentiality {
+    #[default]
+    Preferred,
+    Required,
+    Off,
+}
+
+impl FromStr for Confidentiality {
+    type Err = String;
+
+    /// "preferred" (or "", the default), "required" or "off", as macula-go's
+    /// options name them.
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "" | "preferred" => Ok(Confidentiality::Preferred),
+            "required" => Ok(Confidentiality::Required),
+            "off" => Ok(Confidentiality::Off),
+            other => Err(format!(
+                "confidential is preferred, required or off, not {other:?}"
+            )),
+        }
+    }
+}
 
 /// How a call or an open to a provider is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Seal {
     /// In the clear, by the application's own decision: only for a provider
-    /// whose advertisement names no key.
+    /// whose advertisement names no key. On a link nothing checks that: a
+    /// pool refuses a clear call to a provider that names a key, but a
+    /// direct [`super::Link`] caller must read the advertisement itself.
     Clear,
     /// Sealed to this KEM key as carried, the one the provider's verified
     /// advertisement names.
     To(Vec<u8>),
 }
 
-/// The refusal codes of a sealed request.
+/// The refusal codes of a sealed request, and of a clear one to a procedure
+/// past its keyless window.
 pub(super) const CODE_SEALED_REFUSED: &str = "sealed_refused";
+pub(super) const CODE_SEALED_REQUIRED: &str = "sealed_required";
+
+/// macula's default and longest advertisement lifetime, which bounds the
+/// keyless window.
+pub(super) const MAX_ADVERTISEMENT_TTL_MS: i64 = 5 * 60 * 1000;
 
 /// A sealed_refused's detail from a node that holds no KEM key.
 pub(super) const NO_KEY_DETAIL: &str = "this node opens no sealed payload";
@@ -308,6 +359,105 @@ pub(super) fn reply_outcome(
     }
 }
 
+/// Whether a procedure under `confidential` takes a clear request at
+/// `now_ms`, as macula's clear_allowed/2 decides it: never when required,
+/// always when its advertisement names no key (`keyed_since` is `None`),
+/// and once keyed only while its last keyless advertisement could still be
+/// served, the longest advertisement lifetime and the clock tolerance from
+/// the moment it was first keyed.
+pub(super) fn clear_allowed(
+    confidential: Confidentiality,
+    keyed_since: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    match (confidential, keyed_since) {
+        (Confidentiality::Required, _) => false,
+        (_, None) => true,
+        (_, Some(since)) => now_ms <= since + MAX_ADVERTISEMENT_TTL_MS + CLOCK_TOLERANCE_MS as i64,
+    }
+}
+
+/// A sealed request opened with this node's keyring: its plaintext payload
+/// and the keys it agreed, or the detail of the sealed_refused it is
+/// answered with, naming the key this node holds now, or that it holds none.
+pub(super) fn opened_request(
+    keyring: Option<&Keyring>,
+    request: &VerifiedRequest,
+) -> Result<(Value, CallSeal), String> {
+    let Some(keyring) = keyring else {
+        return Err(NO_KEY_DETAIL.into());
+    };
+    let refused = hex(&keyring.current_id());
+    let Some(sealed) = &request.sealed else {
+        return Err(refused);
+    };
+    let key = keyring
+        .find(&sealed.key_id)
+        .ok_or_else(|| refused.clone())?;
+    let kem_ct = sealed.kem_ct.as_deref().ok_or_else(|| refused.clone())?;
+    let secret = seal::recipient_secret(&key, kem_ct).map_err(|_| refused.clone())?;
+    let frame_type = match request.frame_type {
+        frame::RequestType::Call => seal::FRAME_CALL,
+        frame::RequestType::StreamOpen => seal::FRAME_STREAM_OPEN,
+    };
+    let parties = Parties {
+        request_id: request.request_id,
+        caller: request.caller,
+        target: request.target,
+    };
+    let (k_req, k_rep) = seal::call_keys(&secret, frame_type, &parties);
+    let (k_c2p, k_p2c) = seal::stream_keys(&secret, &parties);
+    let bound = seal::Request {
+        frame_type: frame_type.to_string(),
+        realm: request.realm,
+        procedure: request.procedure.clone(),
+        caller: request.caller,
+        target: request.target,
+        request_id: request.request_id,
+        deadline: request.deadline,
+    };
+    let plain = seal::open(
+        &k_req,
+        &[0; NONCE_SIZE],
+        &seal::request_aad(&bound),
+        &sealed.ct,
+    )
+    .map_err(|_| refused.clone())?;
+    let payload = cbor::decode(&plain).map_err(|_| refused)?;
+    Ok((
+        payload,
+        CallSeal {
+            key_id: sealed.key_id,
+            k_rep,
+            k_c2p,
+            k_p2c,
+            request: bound,
+        },
+    ))
+}
+
+impl CallSeal {
+    /// A RESULT's payload, or an ERROR's cbor([code, detail]), sealed under
+    /// the request's reply key with a fresh nonce, carried, bound to the
+    /// request and to `responded_by` as the node that answered.
+    pub(super) fn sealed_answer(
+        &self,
+        frame_type: &str,
+        plain: &[u8],
+        request_hash: &[u8; 48],
+        responded_by: &[u8; 32],
+    ) -> Result<Sealed, LinkError> {
+        let nonce = seal::random_nonce().map_err(|_| LinkError::Io("no randomness".into()))?;
+        let aad = seal::reply_aad(&self.request, frame_type, request_hash, responded_by);
+        Ok(Sealed {
+            key_id: self.key_id,
+            kem_ct: None,
+            nonce: Some(nonce.to_vec()),
+            ct: seal::seal(&self.k_rep, &nonce, &aad, plain),
+        })
+    }
+}
+
 /// One side's keys for a sealed stream: a caller's frames seal under k_c2p
 /// with their seq as the nonce; a provider's under k_p2c with a random nonce
 /// each, carried. A STREAM_END has nothing to seal. Showing it gives the key
@@ -498,6 +648,32 @@ pub(super) fn unsealed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keyed_procedure_takes_clear_calls_only_within_its_keyless_window() {
+        let since = 1_790_000_000_000;
+        let window = MAX_ADVERTISEMENT_TTL_MS + CLOCK_TOLERANCE_MS as i64;
+        for c in [Confidentiality::Preferred, Confidentiality::Off] {
+            assert!(clear_allowed(c, None, since + 10 * window), "{c:?} keyless");
+        }
+        assert!(clear_allowed(
+            Confidentiality::Preferred,
+            Some(since),
+            since + window
+        ));
+        assert!(!clear_allowed(
+            Confidentiality::Preferred,
+            Some(since),
+            since + window + 1
+        ));
+        for keyed_since in [None, Some(since)] {
+            assert!(!clear_allowed(
+                Confidentiality::Required,
+                keyed_since,
+                since
+            ));
+        }
+    }
 
     #[test]
     fn a_refusal_names_a_key_only_as_sixteen_lowercase_hex_digits() {

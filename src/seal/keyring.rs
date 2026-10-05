@@ -182,12 +182,18 @@ mod tests {
         let second = ring.current().public_key().key_id();
         assert_ne!(second, first, "a key outlived its lifetime");
         assert_eq!(ring.current_id(), second);
-        assert!(ring.find(&first).is_some(), "a replaced key stopped at once");
+        assert!(
+            ring.find(&first).is_some(),
+            "a replaced key stopped at once"
+        );
 
         at.fetch_add(RETIRED_KEY_KEPT_MS - 1000, Ordering::SeqCst);
         assert!(ring.find(&first).is_some(), "a replaced key went early");
         at.fetch_add(1000, Ordering::SeqCst);
-        assert!(ring.find(&first).is_none(), "a replaced key outlived 30 minutes");
+        assert!(
+            ring.find(&first).is_none(),
+            "a replaced key outlived 30 minutes"
+        );
         assert_eq!(
             ring.find(&second).map(|k| k.public_key().key_id()),
             Some(second)

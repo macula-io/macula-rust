@@ -113,6 +113,8 @@ async fn supervise(pool: Weak<PoolInner>, m: Arc<Member>) {
         cfg.publication_seq = Some(inner.publication_seq.clone());
         cfg.admission = Some(inner.admission.clone());
         cfg.dedup = Some(inner.dedup.clone());
+        cfg.keyring = inner.keyring.clone();
+        cfg.kem_advertise = inner.opts.kem_advertise;
         drop(inner);
         let dialed = tokio::select! {
             dialed = Link::dial(cfg) => dialed,

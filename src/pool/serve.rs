@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use crate::frame::StreamMode;
 use crate::station_link::{
-    self, Handler, Link, LinkError, StreamHandler, StreamOffer, DEFAULT_CALL_TIMEOUT,
+    self, Confidentiality, Handler, Link, LinkError, StreamHandler, StreamOffer,
+    DEFAULT_CALL_TIMEOUT,
 };
 
 use super::{Pool, PoolError, PoolInner};
@@ -19,13 +20,17 @@ static NEXT_SERVED: AtomicU64 = AtomicU64::new(1);
 
 /// A procedure the node serves: its realm, which the pool must pin a key for
 /// unless the procedure is in the node's own namespace, its name, and
-/// exactly one of a unary handler and a stream offer.
+/// exactly one of a unary handler and a stream offer, and how it takes its
+/// requests: with [`super::Opts::kem_advertise`] its advertisement names the
+/// node's KEM key unless `confidential` is off, and sealed requests are
+/// answered sealed.
 #[derive(Clone)]
 pub struct Offer {
     pub realm: [u8; 32],
     pub procedure: String,
     pub handler: Option<Handler>,
     pub stream: Option<StreamOffer>,
+    pub confidential: Confidentiality,
 }
 
 impl Offer {
@@ -36,6 +41,7 @@ impl Offer {
             procedure: procedure.to_string(),
             handler: Some(handler),
             stream: None,
+            confidential: Confidentiality::Preferred,
         }
     }
 
@@ -51,6 +57,7 @@ impl Offer {
             procedure: procedure.to_string(),
             handler: None,
             stream: Some(StreamOffer { mode, handler }),
+            confidential: Confidentiality::Preferred,
         }
     }
 }
@@ -80,6 +87,14 @@ impl Pool {
     /// [`Link::serve`] does.
     pub async fn serve(&self, o: Offer) -> Result<Served, PoolError> {
         let realm_key = self.inner.realm_key_for(&o.realm, &o.procedure)?;
+        let kem_advertise = self.inner.opts.kem_advertise;
+        if o.confidential == Confidentiality::Required && !kem_advertise {
+            return Err(PoolError::Link(LinkError::KemAdvertiseDisabled));
+        }
+        // Kept across every link it is served on, so no link reopens the
+        // keyless window.
+        let keyed_since_ms = (kem_advertise && o.confidential != Confidentiality::Off)
+            .then(|| crate::uuid_v7::now_ms() as i64);
         let served = Arc::new(ServedInner {
             id: NEXT_SERVED.fetch_add(1, Ordering::Relaxed),
             pool: Arc::downgrade(&self.inner),
@@ -89,6 +104,8 @@ impl Pool {
                 handler: o.handler,
                 stream: o.stream,
                 realm_key,
+                confidential: o.confidential,
+                keyed_since_ms,
             },
             held: Mutex::new(Held {
                 stopped: false,

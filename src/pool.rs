@@ -22,8 +22,9 @@ mod member;
 mod pubsub;
 mod serve;
 
+pub use crate::station_link::Confidentiality;
 pub use crate::station_link::{ConfidentialityError, ConfidentialityReason};
-pub use call::{Call, Confidentiality, Provider, StreamCall};
+pub use call::{Call, Provider, StreamCall};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};
@@ -34,6 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::node_key::{carried_key_well_formed, NodeKey, Purpose};
+use crate::seal::Keyring;
 use crate::statement_issuer::{IssuerError, StatementIssuer};
 use crate::station_link::{
     Admission, AdmissionLimits, EventDedup, Link, LinkError, PublicationSeq,
@@ -193,6 +195,12 @@ pub struct Opts {
     /// macula's defaults, with the cap one share per link the pool may hold.
     pub admission: Option<AdmissionLimits>,
     pub link_selection: LinkSelection,
+    /// Gives the node a KEM keyring and names its current key in the
+    /// advertisements of procedures served confidentially (macula 13, E2E
+    /// design amendment A1), so callers seal to it. Off by default: switch it
+    /// on only once every station runs macula 12.11 or later and every
+    /// caller runs 13. Without it the node opens no sealed request.
+    pub kem_advertise: bool,
     /// Hears every link coming up and going down, on a task of its own.
     pub on_link_event: Option<Arc<dyn Fn(LinkEvent) + Send + Sync>>,
     /// Hears each failure to reissue the node's status statements or rotate
@@ -214,6 +222,7 @@ impl Opts {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             admission: None,
             link_selection: LinkSelection::FirstSuccess,
+            kem_advertise: false,
             on_link_event: None,
             on_issuer_error: None,
         }
@@ -234,6 +243,8 @@ pub(crate) struct PoolInner {
     publication_seq: Arc<PublicationSeq>,
     admission: Arc<Admission>,
     dedup: Arc<EventDedup>,
+    /// One node identity, one keyring, shared by every link.
+    keyring: Option<Arc<Keyring>>,
     state: Mutex<State>,
     ticks: tokio::task::JoinHandle<()>,
     content: content::Sharer,
@@ -275,12 +286,20 @@ impl Pool {
             None => eprintln!("macula-rust pool: the statement issuer failed: {e}"),
         });
         let admission = opts.admission.expect("checked fills the admission limits");
+        let keyring = match opts.kem_advertise {
+            true => Some(Arc::new(
+                Keyring::system(opts.identity.profile())
+                    .map_err(|e| PoolError::InvalidOpts(e.to_string()))?,
+            )),
+            false => None,
+        };
         let inner = Arc::new(PoolInner {
             self_id,
             issuer,
             publication_seq: Arc::default(),
             admission: Arc::new(Admission::new(admission)),
             dedup: Arc::default(),
+            keyring,
             state: Mutex::new(State {
                 members: Vec::new(),
                 subs: HashMap::new(),
