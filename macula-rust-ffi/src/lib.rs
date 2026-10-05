@@ -38,8 +38,8 @@ mod stream;
 pub use content::FfiContentOptions;
 pub use node_key::{FfiNodeKey, FfiProfile};
 pub use pool::{
-    own_procedure, FfiLinkStatus, FfiPool, FfiPoolOptions, FfiProvider, FfiRealmKey, FfiRecord,
-    FfiSeed,
+    own_procedure, FfiConfidentiality, FfiLinkStatus, FfiPool, FfiPoolOptions, FfiProvider,
+    FfiRealmKey, FfiRecord, FfiSeed,
 };
 pub use pubsub::{FfiEvent, FfiSubscription};
 pub use serve::{FfiCallHandler, FfiRequest, FfiServed};
@@ -154,6 +154,9 @@ impl From<LinkError> for FfiError {
             LinkError::Stream { code, message, .. } => FfiError::Stream { code, message },
             LinkError::EndOfStream => FfiError::EndOfStream,
             LinkError::Closed | LinkError::StreamClosed | LinkError::Stopped => FfiError::Closed,
+            e @ LinkError::KemAdvertiseDisabled => FfiError::InvalidArgument {
+                message: e.to_string(),
+            },
             other => FfiError::Other {
                 message: other.to_string(),
             },

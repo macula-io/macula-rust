@@ -193,6 +193,12 @@ impl fmt::Display for LinkError {
                 f.write_str("the provider opens no sealed payload")
             }
             LinkError::ClearAnswerToSealed => f.write_str("a clear answer to a sealed request"),
+            LinkError::KemAdvertiseDisabled => {
+                f.write_str("a required-confidential procedure needs kem_advertise on")
+            }
+            LinkError::SealedFramesExhausted => {
+                f.write_str("this sealed stream has sealed all the frames it may")
+            }
             other => write!(f, "{other:?}"),
         }
     }

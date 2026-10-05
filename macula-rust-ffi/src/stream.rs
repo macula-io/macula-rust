@@ -9,7 +9,7 @@ use macula_rust::frame::{StreamEncoding, StreamMode, StreamRole};
 use macula_rust::pool::StreamCall;
 use macula_rust::station_link::{Stream, StreamEvent};
 
-use crate::pool::FfiPool;
+use crate::pool::{FfiConfidentiality, FfiPool};
 use crate::{millis, to_32, FfiError, FfiValue};
 
 /// Who pushes data on a stream: the provider, the caller, or both.
@@ -101,6 +101,7 @@ impl FfiPool {
     /// `realm` (`provider`, or any trusted one when `None`), its deadline
     /// `deadline_ms` ahead (0 for macula's 30 seconds). A refusal arrives on
     /// the first [`FfiStream::recv`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_stream(
         &self,
         realm: Vec<u8>,
@@ -109,6 +110,7 @@ impl FfiPool {
         payload: FfiValue,
         provider: Option<Vec<u8>>,
         deadline_ms: u64,
+        confidential: FfiConfidentiality,
     ) -> Result<Arc<FfiStream>, FfiError> {
         let stream = self
             .0
@@ -119,6 +121,7 @@ impl FfiPool {
                 mode: mode.into(),
                 payload: payload.into(),
                 deadline: millis(deadline_ms),
+                confidential: confidential.into(),
                 ..StreamCall::default()
             })
             .await?;
@@ -131,6 +134,11 @@ impl FfiStream {
     /// The session's caller, its node_id.
     pub fn caller(&self) -> Vec<u8> {
         self.0.request().caller.to_vec()
+    }
+
+    /// Whether the session is sealed end to end.
+    pub fn sealed(&self) -> bool {
+        self.0.sealed()
     }
 
     /// The payload the session was opened with.

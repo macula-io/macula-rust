@@ -12,9 +12,9 @@ use std::time::Duration;
 use common::lab::{Lab, LabStation};
 use macula_rust::profile::Profile;
 use macula_rust_ffi::{
-    own_procedure, FfiCallHandler, FfiContentOptions, FfiError, FfiNodeKey, FfiPool,
-    FfiPoolOptions, FfiProfile, FfiRealmKey, FfiRequest, FfiSeed, FfiStream, FfiStreamEvent,
-    FfiStreamHandler, FfiStreamMode, FfiValue,
+    own_procedure, FfiCallHandler, FfiConfidentiality, FfiContentOptions, FfiError, FfiNodeKey,
+    FfiPool, FfiPoolOptions, FfiProfile, FfiRealmKey, FfiRequest, FfiSeed, FfiStream,
+    FfiStreamEvent, FfiStreamHandler, FfiStreamMode, FfiValue,
 };
 
 const ORG_PROCEDURE: &str = "mcl-echo/echo";
@@ -66,6 +66,16 @@ impl FfiCallHandler for Echo {
     }
 }
 
+/// A foreign handler that answers whether the request came sealed.
+struct SealedOrNot;
+
+#[async_trait::async_trait]
+impl FfiCallHandler for SealedOrNot {
+    async fn handle(&self, request: FfiRequest) -> Result<FfiValue, FfiError> {
+        Ok(FfiValue::Int(i64::from(request.sealed)))
+    }
+}
+
 /// A foreign stream handler: sends "a" then "b".
 struct Chunks;
 
@@ -113,7 +123,12 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
     let provider = pool(&provider_key, &serving, options()).await;
     let ring = own_procedure(provider.node_id(), "ring".into()).unwrap();
     let served = provider
-        .serve(realm.clone(), ring.clone(), Arc::new(Echo))
+        .serve(
+            realm.clone(),
+            ring.clone(),
+            Arc::new(Echo),
+            FfiConfidentiality::Preferred,
+        )
         .await
         .unwrap();
 
@@ -126,6 +141,7 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
             FfiValue::Text("hi".into()),
             None,
             5_000,
+            FfiConfidentiality::Preferred,
         )
         .await
         .unwrap();
@@ -142,6 +158,7 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
             FfiValue::Text("fail".into()),
             None,
             5_000,
+            FfiConfidentiality::Preferred,
         )
         .await
     {
@@ -161,7 +178,14 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
     served.stop().await.unwrap();
     // An org procedure in a realm the pool pins no key for is refused.
     let unpinned = caller
-        .call(realm, ORG_PROCEDURE.into(), FfiValue::Null, None, 2_000)
+        .call(
+            realm,
+            ORG_PROCEDURE.into(),
+            FfiValue::Null,
+            None,
+            2_000,
+            FfiConfidentiality::Preferred,
+        )
         .await;
     assert!(
         matches!(unpinned, Err(FfiError::NoRealmKey)),
@@ -188,7 +212,12 @@ async fn an_org_procedure_is_served_under_the_pinned_realm_key() {
     lab.admit(&realm, &s, &[provider_id]);
     let provider = pool(&provider_key, &s, trust.clone()).await;
     provider
-        .serve(realm.id.to_vec(), ORG_PROCEDURE.into(), Arc::new(Echo))
+        .serve(
+            realm.id.to_vec(),
+            ORG_PROCEDURE.into(),
+            Arc::new(Echo),
+            FfiConfidentiality::Preferred,
+        )
         .await
         .unwrap();
     let caller = pool(
@@ -204,6 +233,7 @@ async fn an_org_procedure_is_served_under_the_pinned_realm_key() {
             FfiValue::Int(7),
             None,
             5_000,
+            FfiConfidentiality::Preferred,
         )
         .await
         .unwrap();
@@ -282,6 +312,7 @@ async fn a_stream_from_a_foreign_handler_is_heard_and_released() {
             watch.clone(),
             FfiStreamMode::ServerStream,
             Arc::new(Chunks),
+            FfiConfidentiality::Preferred,
         )
         .await
         .unwrap();
@@ -299,6 +330,7 @@ async fn a_stream_from_a_foreign_handler_is_heard_and_released() {
             FfiValue::Null,
             None,
             0,
+            FfiConfidentiality::Preferred,
         )
         .await
         .unwrap();
@@ -427,4 +459,87 @@ async fn content_is_shared_by_one_node_and_fetched_by_another() {
         ),
         "{bad:?}"
     );
+}
+
+/// A pool with kem_advertise serves a required procedure: a required call
+/// through the bindings is sealed end to end, and a pool without it cannot
+/// serve one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
+    let lab = Lab::start(Profile::PqHybrid);
+    let (serving, callers) = (
+        lab.station("ffi sealed serving"),
+        lab.station("ffi sealed callers"),
+    );
+    lab.share(&[&serving, &callers]);
+    let realm = vec![0x13; 32];
+    let provider_key = FfiNodeKey::generate(FfiProfile::PqHybrid).unwrap();
+    let keyed = FfiPoolOptions {
+        kem_advertise: true,
+        ..options()
+    };
+    let provider = pool(&provider_key, &serving, keyed).await;
+    let vault = own_procedure(provider.node_id(), "vault".into()).unwrap();
+    provider
+        .serve(
+            realm.clone(),
+            vault.clone(),
+            Arc::new(SealedOrNot),
+            FfiConfidentiality::Required,
+        )
+        .await
+        .unwrap();
+
+    let caller_key = FfiNodeKey::generate(FfiProfile::PqHybrid).unwrap();
+    let caller = pool(&caller_key, &callers, options()).await;
+    let answered = caller
+        .call(
+            realm.clone(),
+            vault.clone(),
+            FfiValue::Text("secret".into()),
+            None,
+            5_000,
+            FfiConfidentiality::Required,
+        )
+        .await
+        .unwrap();
+    assert_eq!(answered, FfiValue::Int(1));
+    let off = caller
+        .call(
+            realm.clone(),
+            vault,
+            FfiValue::Null,
+            None,
+            5_000,
+            FfiConfidentiality::Off,
+        )
+        .await;
+    assert!(
+        matches!(off, Err(FfiError::InvalidArgument { .. })),
+        "{off:?}"
+    );
+
+    let unkeyed = pool(
+        &FfiNodeKey::generate(FfiProfile::PqHybrid).unwrap(),
+        &serving,
+        options(),
+    )
+    .await;
+    let mine = own_procedure(unkeyed.node_id(), "vault".into()).unwrap();
+    let refused = unkeyed
+        .serve(
+            realm,
+            mine,
+            Arc::new(SealedOrNot),
+            FfiConfidentiality::Required,
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(FfiError::InvalidArgument { .. })),
+        "{:?}",
+        refused.err()
+    );
+    for p in [caller, provider, unkeyed] {
+        p.close().await;
+    }
 }

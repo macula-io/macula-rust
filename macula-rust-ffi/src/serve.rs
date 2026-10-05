@@ -9,7 +9,7 @@ use std::sync::Arc;
 use macula_rust::pool::{Offer, Served};
 use macula_rust::station_link::{handler, stream_handler, Request};
 
-use crate::pool::FfiPool;
+use crate::pool::{FfiConfidentiality, FfiPool};
 use crate::stream::{FfiStream, FfiStreamHandler, FfiStreamMode};
 use crate::{to_32, FfiError, FfiValue};
 
@@ -23,6 +23,9 @@ pub struct FfiRequest {
     pub procedure: String,
     pub payload: FfiValue,
     pub deadline_ms: u64,
+    /// Whether the request came sealed end to end; its answer goes back
+    /// sealed.
+    pub sealed: bool,
 }
 
 impl TryFrom<Request> for FfiRequest {
@@ -35,6 +38,7 @@ impl TryFrom<Request> for FfiRequest {
             procedure: r.procedure,
             payload: r.payload.try_into()?,
             deadline_ms: r.deadline_ms,
+            sealed: r.sealed,
         })
     }
 }
@@ -53,14 +57,16 @@ pub struct FfiServed(Served);
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiPool {
-    /// Serves `procedure` in `realm` with `handler` on every link. An org
-    /// procedure needs its realm's key pinned; one in the node's own
-    /// namespace (see [`own_procedure`](crate::own_procedure)) needs none.
+    /// Serves `procedure` in `realm` with `handler` on every link, taking
+    /// requests as `confidential` says. An org procedure needs its realm's
+    /// key pinned; one in the node's own namespace (see
+    /// [`own_procedure`](crate::own_procedure)) needs none.
     pub async fn serve(
         &self,
         realm: Vec<u8>,
         procedure: String,
         handler_impl: Arc<dyn FfiCallHandler>,
+        confidential: FfiConfidentiality,
     ) -> Result<Arc<FfiServed>, FfiError> {
         let answer = handler(move |r: Request| {
             let handler_impl = handler_impl.clone();
@@ -73,10 +79,9 @@ impl FfiPool {
                 Ok(answered.into())
             }
         });
-        let served = self
-            .0
-            .serve(Offer::unary(to_32(realm)?, &procedure, answer))
-            .await?;
+        let mut offer = Offer::unary(to_32(realm)?, &procedure, answer);
+        offer.confidential = confidential.into();
+        let served = self.0.serve(offer).await?;
         Ok(Arc::new(FfiServed(served)))
     }
 
@@ -89,6 +94,7 @@ impl FfiPool {
         procedure: String,
         mode: FfiStreamMode,
         handler_impl: Arc<dyn FfiStreamHandler>,
+        confidential: FfiConfidentiality,
     ) -> Result<Arc<FfiServed>, FfiError> {
         let session = stream_handler(move |s| {
             let handler_impl = handler_impl.clone();
@@ -99,15 +105,9 @@ impl FfiPool {
                     .map_err(|e| e.to_string())
             }
         });
-        let served = self
-            .0
-            .serve(Offer::stream(
-                to_32(realm)?,
-                &procedure,
-                mode.into(),
-                session,
-            ))
-            .await?;
+        let mut offer = Offer::stream(to_32(realm)?, &procedure, mode.into(), session);
+        offer.confidential = confidential.into();
+        let served = self.0.serve(offer).await?;
         Ok(Arc::new(FfiServed(served)))
     }
 }

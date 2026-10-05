@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use macula_rust::pool::{Call, Opts, Pool, Seed};
+use macula_rust::pool::{Call, Confidentiality, Opts, Pool, Seed};
 use macula_rust::record::{self, RecordType, Verified};
 
 use crate::node_key::FfiNodeKey;
@@ -45,6 +45,36 @@ pub struct FfiPoolOptions {
     /// Try the links in a fresh random order each time, not seed order.
     #[uniffi(default = false)]
     pub random_link_order: bool,
+    /// Give the node a KEM keyring and name its key in the advertisements
+    /// of procedures served confidentially, so callers seal to it. Switch
+    /// it on only once every station runs macula 12.11 or later and every
+    /// caller runs 13.
+    #[uniffi(default = false)]
+    pub kem_advertise: bool,
+}
+
+/// How a served procedure takes its requests, and how a call or an open is
+/// kept (macula 13, end-to-end payload sealing). Serving: `Preferred` names
+/// the node's KEM key when the pool's `kem_advertise` is on and still takes
+/// clear requests for a while; `Required` takes sealed ones only and needs
+/// `kem_advertise`; `Off` names no key. Calling: `Preferred` seals to a
+/// provider that names a key and calls one that names none in the clear;
+/// `Required` calls only providers that name one; `Off` is refused.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfiConfidentiality {
+    Preferred,
+    Required,
+    Off,
+}
+
+impl From<FfiConfidentiality> for Confidentiality {
+    fn from(c: FfiConfidentiality) -> Self {
+        match c {
+            FfiConfidentiality::Preferred => Confidentiality::Preferred,
+            FfiConfidentiality::Required => Confidentiality::Required,
+            FfiConfidentiality::Off => Confidentiality::Off,
+        }
+    }
 }
 
 /// One of the pool's links.
@@ -130,6 +160,7 @@ impl FfiPool {
         opts.replication_factor = options.replication_factor as usize;
         opts.max_seeds = options.max_seeds as usize;
         opts.max_direct_links = options.max_direct_links as usize;
+        opts.kem_advertise = options.kem_advertise;
         if options.random_link_order {
             opts.link_selection = macula_rust::pool::LinkSelection::Random;
         }
@@ -181,6 +212,7 @@ impl FfiPool {
         payload: FfiValue,
         provider: Option<Vec<u8>>,
         timeout_ms: u64,
+        confidential: FfiConfidentiality,
     ) -> Result<FfiValue, FfiError> {
         let answered = self
             .0
@@ -190,6 +222,7 @@ impl FfiPool {
                 provider: provider.map(to_32).transpose()?.unwrap_or([0; 32]),
                 payload: payload.into(),
                 timeout: millis(timeout_ms),
+                confidential: confidential.into(),
                 ..Call::default()
             })
             .await?;
