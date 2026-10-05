@@ -220,8 +220,8 @@ crate 1.89.
   a key the provider no longer holds fails closed with
   `LinkError::SealedRefused`, naming the provider's new key; it is not sent
   again sealed to that key.
-- **Station discovery beyond the seeds.** macula's discovery call is not
-  served by the fleet today (macula-io/macula#31); give the pool its seeds.
+- **Station discovery beyond the seeds.** macula discovers stations through
+  mcl-stations/list_stations; this pool does not call it, so give it its seeds.
 
 ## Testing
 
