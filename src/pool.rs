@@ -12,9 +12,8 @@
 //! the provider called there. Station procedures (`_dht.*`) go to the pool's
 //! links.
 //!
-//! Station discovery beyond the seeds is not here: macula's discovery calls
-//! hecate_stations.list_stations, which the fleet no longer serves
-//! (macula-io/macula#31).
+//! Station discovery beyond the seeds is not here: macula discovers stations
+//! through mcl-stations/list_stations, which this pool does not call.
 
 mod call;
 mod content;
