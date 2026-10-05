@@ -146,14 +146,21 @@ pub(super) fn stated(
 }
 
 /// What a sealed request agreed: the key id, the reply key, a stream's two
-/// keys, and the routing fields its answers are bound to.
-#[derive(Debug, Clone)]
+/// keys, and the routing fields its answers are bound to. Showing it gives
+/// the key id, never a key.
+#[derive(Clone)]
 pub(super) struct CallSeal {
     pub(super) key_id: [u8; KEY_ID_SIZE],
     k_rep: [u8; 32],
     pub(super) k_c2p: [u8; 32],
     pub(super) k_p2c: [u8; 32],
     request: seal::Request,
+}
+
+impl fmt::Debug for CallSeal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CallSeal(key id {})", hex(&self.key_id))
+    }
 }
 
 /// A request's payload sealed to the provider key carried as `to`, in place
@@ -219,15 +226,20 @@ pub(super) fn sealed_request(
     ))
 }
 
-/// The key id a sealed_refused's detail names, `None` for none.
+/// The key id a sealed_refused's detail names, `None` for none: exactly 16
+/// lowercase hex digits, as macula writes a key id, and nothing else.
 pub(super) fn refused_key(detail: Option<&str>) -> Option<[u8; KEY_ID_SIZE]> {
     let detail = detail?;
-    if detail.len() != 2 * KEY_ID_SIZE {
+    let lowercase_hex = detail.len() == 2 * KEY_ID_SIZE
+        && detail
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !lowercase_hex {
         return None;
     }
     let mut id = [0; KEY_ID_SIZE];
     for (i, byte) in id.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(detail.get(2 * i..2 * i + 2)?, 16).ok()?;
+        *byte = u8::from_str_radix(&detail[2 * i..2 * i + 2], 16).ok()?;
     }
     Some(id)
 }
@@ -298,13 +310,20 @@ pub(super) fn reply_outcome(
 
 /// One side's keys for a sealed stream: a caller's frames seal under k_c2p
 /// with their seq as the nonce; a provider's under k_p2c with a random nonce
-/// each, carried. A STREAM_END has nothing to seal.
-#[derive(Debug, Clone)]
+/// each, carried. A STREAM_END has nothing to seal. Showing it gives the key
+/// id, never a key.
+#[derive(Clone)]
 pub(super) struct StreamSeal {
     key_id: [u8; KEY_ID_SIZE],
     request_id: [u8; 16],
     send: [u8; 32],
     recv: [u8; 32],
+}
+
+impl fmt::Debug for StreamSeal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StreamSeal(key id {})", hex(&self.key_id))
+    }
 }
 
 impl StreamSeal {
@@ -473,5 +492,29 @@ pub(super) fn unsealed(
             Ok(frame.fields)
         }
         (Some(_), false, _) => Err(LinkError::ClearAnswerToSealed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refusal_names_a_key_only_as_sixteen_lowercase_hex_digits() {
+        assert_eq!(
+            refused_key(Some("0966848943d688e2")),
+            Some([0x09, 0x66, 0x84, 0x89, 0x43, 0xd6, 0x88, 0xe2])
+        );
+        for not_one in [
+            "+1+2+3+4+5+6+7+8",
+            "0966848943D688E2",
+            "0966848943d688e",
+            "0966848943d688e2f",
+            NO_KEY_DETAIL,
+            "",
+        ] {
+            assert_eq!(refused_key(Some(not_one)), None, "{not_one:?}");
+        }
+        assert_eq!(refused_key(None), None);
     }
 }
