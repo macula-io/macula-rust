@@ -586,21 +586,34 @@ async fn two_station_providers(
 // and its answer returned, for the share bounds reaching a station, not the
 // call (macula's call_work and failure_scope/1; macula-go#8). A retry would
 // run a handler that is not idempotent twice.
+//
+// The handler holds until the test releases it at three quarters of the
+// timeout: past the first candidate's share (half of what is left after the
+// lookup, so unless the lookup itself took half the timeout), with a quarter
+// left for the answer. A fixed sleep spent the budget a loaded machine needs
+// to reach the station (macula-io/macula-rust#15).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_that_went_out_is_never_sent_again() {
     let lab = Lab::start(Profile::PqPure);
     let entered = Arc::new(AtomicUsize::new(0));
     let counted = entered.clone();
+    let (entries, mut entry) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (release, released) = tokio::sync::watch::channel(false);
     let (caller, realm, _providers) = two_station_providers(&lab, "once", move || {
         let counted = counted.clone();
+        let entries = entries.clone();
+        let released = released.clone();
         Offer::unary(
             [0; 32],
             PROCEDURE,
             handler(move |r| {
                 let counted = counted.clone();
+                let entries = entries.clone();
+                let mut released = released.clone();
                 async move {
                     counted.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    let _ = entries.send(());
+                    let _ = released.wait_for(|r| *r).await;
                     Ok(r.payload)
                 }
             }),
@@ -608,8 +621,16 @@ async fn a_call_that_went_out_is_never_sent_again() {
     })
     .await;
     let mut c = call(realm.id, PROCEDURE, Value::text("hello"));
-    c.timeout = Duration::from_secs(4);
-    let answered = caller.call(c).await;
+    let timeout = Duration::from_secs(12);
+    c.timeout = timeout;
+    let release_at = Instant::now() + timeout * 3 / 4;
+    let releasing = async {
+        if tokio::time::timeout(timeout, entry.recv()).await.is_ok() {
+            tokio::time::sleep_until(release_at.into()).await;
+        }
+        let _ = release.send(true);
+    };
+    let (answered, ()) = tokio::join!(caller.call(c), releasing);
     assert!(
         matches!(&answered, Ok(v) if *v == Value::text("hello")),
         "the one provider's answer: {answered:?}"
