@@ -16,6 +16,7 @@
 //! `_macula.ping` call.
 
 mod admission;
+mod authorize;
 mod call;
 mod confidential;
 mod dht;

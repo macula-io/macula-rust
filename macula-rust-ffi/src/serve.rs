@@ -9,9 +9,11 @@ use std::sync::Arc;
 use macula_rust::cbor::Value;
 use macula_rust::pool::{Offer, Served};
 use macula_rust::station_link::{handler, stream_handler, Request, Stream};
+use macula_rust::ucan::Policy;
 
 use crate::pool::{FfiConfidentiality, FfiPool};
 use crate::stream::{FfiStream, FfiStreamHandler, FfiStreamMode};
+use crate::ucan::FfiPolicy;
 use crate::{to_32, FfiError, FfiValue};
 
 /// A CALL a served procedure answers: the caller's node_id (the key its
@@ -59,8 +61,10 @@ pub struct FfiServed(Served);
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiPool {
     /// Serves `procedure` in `realm` with `handler` on every link, taking
-    /// requests as `confidential` says. An org procedure needs its realm's
-    /// key pinned; one in the node's own namespace (see
+    /// requests as `confidential` says, and gated on `policy` when given: a
+    /// request whose UCAN it does not authorize is refused unauthorized and
+    /// never reaches the handler. An org procedure needs its realm's key
+    /// pinned; one in the node's own namespace (see
     /// [`own_procedure`](crate::own_procedure)) needs none.
     pub async fn serve(
         &self,
@@ -68,17 +72,21 @@ impl FfiPool {
         procedure: String,
         handler_impl: Arc<dyn FfiCallHandler>,
         confidential: FfiConfidentiality,
+        policy: Option<FfiPolicy>,
     ) -> Result<Arc<FfiServed>, FfiError> {
         let answer = handler(move |r: Request| answer_call(handler_impl.clone(), r));
         let mut offer = Offer::unary(to_32(realm)?, &procedure, answer);
         offer.confidential = confidential.into();
+        offer.policy = policy.map(Policy::try_from).transpose()?;
         let served = self.0.serve(offer).await?;
         Ok(Arc::new(FfiServed(served)))
     }
 
     /// Serves `procedure` in `realm` as a streaming procedure of `mode`,
     /// each session handed to `handler_impl`: a session it returns from
-    /// without ending is closed, and one it fails is aborted.
+    /// without ending is closed, and one it fails is aborted. A `policy`
+    /// gates the opens as [`serve`](Self::serve) gates calls.
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve_stream(
         &self,
         realm: Vec<u8>,
@@ -86,10 +94,12 @@ impl FfiPool {
         mode: FfiStreamMode,
         handler_impl: Arc<dyn FfiStreamHandler>,
         confidential: FfiConfidentiality,
+        policy: Option<FfiPolicy>,
     ) -> Result<Arc<FfiServed>, FfiError> {
         let session = stream_handler(move |s| run_session(handler_impl.clone(), s));
         let mut offer = Offer::stream(to_32(realm)?, &procedure, mode.into(), session);
         offer.confidential = confidential.into();
+        offer.policy = policy.map(Policy::try_from).transpose()?;
         let served = self.0.serve(offer).await?;
         Ok(Arc::new(FfiServed(served)))
     }

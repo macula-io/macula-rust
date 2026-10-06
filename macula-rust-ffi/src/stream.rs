@@ -9,7 +9,8 @@ use macula_rust::frame::{StreamEncoding, StreamMode, StreamRole};
 use macula_rust::pool::StreamCall;
 use macula_rust::station_link::{Stream, StreamEvent};
 
-use crate::pool::{FfiConfidentiality, FfiPool, FfiSealReport};
+use crate::pool::{presented, FfiConfidentiality, FfiPool, FfiSealReport};
+use crate::ucan::FfiUcan;
 use crate::{millis, to_32, FfiError, FfiValue};
 
 /// Who pushes data on a stream: the provider, the caller, or both.
@@ -100,7 +101,8 @@ impl FfiPool {
     /// Opens a streaming session of `mode` at a provider of `procedure` in
     /// `realm` (`provider`, or any trusted one when `None`), its deadline
     /// `deadline_ms` ahead (0 for macula's 30 seconds). A refusal arrives on
-    /// the first [`FfiStream::recv`].
+    /// the first [`FfiStream::recv`]: unauthorized for a `ucan` a gated
+    /// procedure does not accept.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_stream(
         &self,
@@ -111,7 +113,9 @@ impl FfiPool {
         provider: Option<Vec<u8>>,
         deadline_ms: u64,
         confidential: FfiConfidentiality,
+        ucan: Option<FfiUcan>,
     ) -> Result<Arc<FfiStream>, FfiError> {
+        let (token, proofs) = presented(ucan);
         let stream = self
             .0
             .open_stream(StreamCall {
@@ -122,7 +126,8 @@ impl FfiPool {
                 payload: payload.into(),
                 deadline: millis(deadline_ms),
                 confidential: confidential.into(),
-                ..StreamCall::default()
+                token,
+                proofs,
             })
             .await?;
         Ok(Arc::new(FfiStream(stream)))

@@ -14,8 +14,9 @@
 //! this node's KEM key, and a request sealed to it is opened and answered
 //! sealed (confidential.rs).
 //!
-//! Only open procedures are served: a gated one needs a post-quantum UCAN
-//! verifier, which this crate does not have.
+//! A procedure is served open, or gated on a UCAN policy: a request whose
+//! token the policy does not authorize is refused unauthorized
+//! (authorize.rs).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,8 +33,10 @@ use crate::record::{
     TombstoneOptions, Trust,
 };
 use crate::seal;
+use crate::ucan::Policy;
 
 use super::admission::Verdict;
+use super::authorize::authorize;
 use super::confidential::{
     clear_allowed, opened_request, CallSeal, Confidentiality, CODE_SEALED_REFUSED,
     CODE_SEALED_REQUIRED,
@@ -119,6 +122,10 @@ pub struct Offer {
     /// `None`. A pool keeps it across the links it serves on, so no link
     /// reopens the window.
     pub keyed_since_ms: Option<i64>,
+    /// What the procedure requires of a request's UCAN: `None` serves any
+    /// caller (an open procedure ignores any token), and a [`Policy`] serves
+    /// only a request whose token it authorizes (authorize.rs).
+    pub policy: Option<Policy>,
 }
 
 impl Offer {
@@ -132,6 +139,7 @@ impl Offer {
             realm_key: None,
             confidential: Confidentiality::Preferred,
             keyed_since_ms: None,
+            policy: None,
         }
     }
 
@@ -150,6 +158,7 @@ impl Offer {
             realm_key: None,
             confidential: Confidentiality::Preferred,
             keyed_since_ms: None,
+            policy: None,
         }
     }
 }
@@ -196,7 +205,10 @@ impl Link {
     /// half its lifetime.
     pub async fn serve(&self, mut o: Offer) -> Result<Served, LinkError> {
         let own = record::in_own_namespace(&o.procedure);
-        if o.handler.is_some() == o.stream.is_some() || (!own && o.realm_key.is_none()) {
+        if o.handler.is_some() == o.stream.is_some()
+            || (!own && o.realm_key.is_none())
+            || o.policy.as_ref().is_some_and(|p| !p.valid())
+        {
             return Err(LinkError::InvalidOffer);
         }
         if !matches!(record::procedure_org(&o.procedure), Ok(Some(_))) {
@@ -553,7 +565,8 @@ async fn answer(inner: Arc<Inner>, request: VerifiedRequest) {
 /// serves no such procedure), in macula 13's order: a sealed request opened
 /// first, or refused sealed_refused in the clear when it does not open; a
 /// clear one to a procedure past its keyless window refused sealed_required;
-/// then the procedure and its handler, answered sealed when the request was.
+/// then the procedure, its policy and its handler, answered sealed when the
+/// request was.
 async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -> Option<Value> {
     let (payload, sealing) = match &request.sealed {
         Some(_) => match opened_request(inner.keyring.as_deref(), request) {
@@ -572,13 +585,30 @@ async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -
             (request.payload.clone(), None)
         }
     };
-    let outcome = match offer.and_then(|o| o.handler) {
-        None => Outcome::Refused(CODE_UNKNOWN_PROCEDURE, None),
-        Some(handler) => {
-            handled(handler, request, without_caller(payload), sealing.is_some()).await
-        }
+    let outcome = match gated(inner.profile, offer, request) {
+        Ok(handler) => handled(handler, request, without_caller(payload), sealing.is_some()).await,
+        Err(code) => Outcome::Refused(code, None),
     };
     answered(&inner.signer(), request, sealing.as_ref(), outcome)
+}
+
+/// The handler that serves `request` under `offer`'s policy, or the code it
+/// is refused with: unknown_procedure when this link serves no such unary
+/// procedure, and the policy's refusal when its token does not authorize it.
+fn gated(
+    profile: crate::profile::Profile,
+    offer: Option<Offer>,
+    request: &VerifiedRequest,
+) -> Result<Handler, &'static str> {
+    let Some(Offer {
+        handler: Some(handler),
+        policy,
+        ..
+    }) = offer
+    else {
+        return Err(CODE_UNKNOWN_PROCEDURE);
+    };
+    authorize(profile, policy.as_ref(), request).map_or(Ok(handler), Err)
 }
 
 /// `payload` as a handler receives it: a map loses a text "caller" key, so

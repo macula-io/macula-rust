@@ -33,8 +33,11 @@
 > sealed requests and answers them sealed, and a caller's seal report says
 > whether the exchange behind a result was sealed and to which key; both
 > directions are held to macula's vectors and run live against macula 13
-> with `confidential => required` (`scripts/interop/sealed.sh`). Not here yet: UCAN-gated calls;
-> see [Not yet implemented](#not-yet-implemented). Releases before 0.4.0 speak
+> with `confidential => required` (`scripts/interop/sealed.sh`). A call or
+> an open presents a UCAN, and a procedure served under a UCAN policy answers
+> only what it authorizes, every verdict held to macula's UCAN_V1 vectors and
+> every minted token authorized by macula's own `macula_ucan`
+> (`scripts/interop/ucan.sh`). Releases before 0.4.0 speak
 > the retired 10.x wire and cannot reach the current fleet.
 
 ## What is this?
@@ -143,8 +146,8 @@ compatibility layer.
   every station is pinned by its node_id.
 - The 10.x content transfer (`content`, `manifest`, `put_direct`/`get_direct`)
   is replaced by node-served content: `Pool::share_content`/`get_content`, with
-  macula 12's SHA-384 `manifest`. `ucan` and `cert_chain` are gone until macula
-  12's own arrive (see [Not yet implemented](#not-yet-implemented)).
+  macula 12's SHA-384 `manifest`. The 10.x `ucan` is replaced by macula 12's
+  post-quantum UCAN (`ucan`, below); `cert_chain` is gone.
 - Serving an org procedure needs the realm's org directory and the org's
   delegation to your node in the DHT: a realm admits orgs through a human.
 
@@ -160,6 +163,7 @@ compatibility layer.
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
 | Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links |
 | End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; `call_report` and `Stream::report` give the caller's seal report |
+| UCAN (`ucan`, `Call::token`, `Offer::policy`) | ✅ | ✅ | macula 12's tokens (D7) in the node's profile: `ucan::create` mints, a call or open presents a token and its chain's proofs, and an `Offer` gated on `Policy::UcanRequired` or `RealmMemberRequired` refuses what `ucan::authorize` does not accept `unauthorized` (a stray proof `malformed_frame`) before its handler runs; held to macula v13.6.0's `ucan_v1.json` |
 | Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |
 | DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | Records verified before they are handed on |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | `macula-rust-ffi`, below |
@@ -181,7 +185,9 @@ integers within ±2^63, text or integer map keys, no duplicates).
 `macula-rust-ffi` wraps the pool with [UniFFI](https://mozilla.github.io/uniffi-rs/)
 proc macros: `FfiNodeKey`, `FfiPool`, `FfiSubscription`, `FfiStream`, and two
 handlers the app implements, `FfiCallHandler` and `FfiStreamHandler`
-(`suspend fun` in Kotlin, `async throws` in Swift). `FfiPool` also shares and
+(`suspend fun` in Kotlin, `async throws` in Swift). A node key mints UCANs
+(`mintUcan`), a call or an open presents one (`FfiUcan`), and `serve` takes an
+`FfiPolicy` to gate a procedure on them. `FfiPool` also shares and
 fetches content (`shareContent`, `getContent`, `FfiContentOptions`). Every id
 crosses as bytes and is checked for its length (32 bytes, or 50 for a content
 id).
@@ -205,8 +211,13 @@ val key = try {
 }
 val pool = FfiPool.connect(key, listOf(FfiSeed(host, 4433.toUShort(), stationId)),
     FfiPoolOptions(realmTrust = listOf(FfiRealmKey(realm, realmKey))))
-pool.serve(realm, ownProcedure(pool.nodeId(), "ring"), Echo())
-val answer = pool.call(realm, "mcl-echo/echo", FfiValue.Text("hello"), null, 5_000uL)
+pool.serve(realm, ownProcedure(pool.nodeId(), "ring"), Echo(), FfiConfidentiality.PREFERRED, null)
+val answer = pool.call(realm, "mcl-echo/echo", FfiValue.Text("hello"), null, 5_000uL,
+    FfiConfidentiality.PREFERRED, null)
+
+// A UCAN for another node, presented on its calls to a gated procedure.
+val token = key.mintUcan(otherNodeId, listOf(FfiCapability("mri:org:io.macula/acme", "invoke")),
+    FfiUcanOptions(exp = nowSeconds + 3600, nbf = null, nnc = null, fctJson = null, parent = null))
 ```
 
 On Android the platform keystore needs one call at app start,
@@ -219,13 +230,11 @@ crate 1.89.
 
 ## Not yet implemented
 
-- **UCAN-gated calls and serving.** macula 12 uses post-quantum UCANs; calls
-  carry no token yet, and a gated procedure cannot be served.
-- **Resealing a stream after a provider's key rotation.** A pool call
-  refused `sealed_refused` is sealed once more to the key the provider names
-  (#20); a stream, whose refusal arrives after it opened, still fails closed
-  with `LinkError::Stream` (`sealed_refused`), and so does a call made
-  directly on a `Link` (`LinkError::SealedRefused`) (#21).
+- **Resealing on a bare link.** A pool call or stream refused
+  `sealed_refused` after the provider's key rotated is sealed once more to
+  the key the provider names (#20, #21); one made directly on a `Link` fails
+  closed (`LinkError::SealedRefused`, or `LinkError::Stream` with
+  `sealed_refused`), naming that key.
 - **Station discovery beyond the seeds.** macula discovers stations through
   mcl-stations/list_stations; this pool does not call it, so give it its seeds.
 

@@ -34,6 +34,7 @@ mod pool;
 mod pubsub;
 mod serve;
 mod stream;
+mod ucan;
 
 pub use content::FfiContentOptions;
 pub use node_key::{FfiNodeKey, FfiProfile};
@@ -44,6 +45,7 @@ pub use pool::{
 pub use pubsub::{FfiEvent, FfiSubscription};
 pub use serve::{FfiCallHandler, FfiRequest, FfiServed};
 pub use stream::{FfiStream, FfiStreamEncoding, FfiStreamEvent, FfiStreamHandler, FfiStreamMode};
+pub use ucan::{ucan_proof_id, FfiCapability, FfiPolicy, FfiUcan, FfiUcanOptions};
 
 use macula_rust::pool::PoolError;
 use macula_rust::station_link::{LinkError, ReportError};

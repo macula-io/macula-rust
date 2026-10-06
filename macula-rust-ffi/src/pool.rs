@@ -9,6 +9,7 @@ use macula_rust::pool::{Call, Confidentiality, Opts, Pool, Report, Seed};
 use macula_rust::record::{self, RecordType, Verified};
 
 use crate::node_key::FfiNodeKey;
+use crate::ucan::FfiUcan;
 use crate::{millis, to_32, FfiError, FfiValue};
 
 /// A station to link to: where it is dialed and the node_id it must prove.
@@ -234,7 +235,10 @@ impl FfiPool {
 
     /// Calls `procedure` in `realm` at a provider that serves it (`provider`,
     /// or any trusted one when `None`), waiting up to `timeout_ms` (0 for
-    /// macula's 5 seconds). A provider's ERROR is [`FfiError::Provider`].
+    /// macula's 5 seconds), presenting `ucan` to a gated procedure. A
+    /// provider's ERROR is [`FfiError::Provider`]: unauthorized for a token a
+    /// gated procedure does not accept.
+    #[allow(clippy::too_many_arguments)]
     pub async fn call(
         &self,
         realm: Vec<u8>,
@@ -243,7 +247,9 @@ impl FfiPool {
         provider: Option<Vec<u8>>,
         timeout_ms: u64,
         confidential: FfiConfidentiality,
+        ucan: Option<FfiUcan>,
     ) -> Result<FfiValue, FfiError> {
+        let (token, proofs) = presented(ucan);
         let answered = self
             .0
             .call(Call {
@@ -253,7 +259,8 @@ impl FfiPool {
                 payload: payload.into(),
                 timeout: millis(timeout_ms),
                 confidential: confidential.into(),
-                ..Call::default()
+                token,
+                proofs,
             })
             .await?;
         answered.try_into()
@@ -261,6 +268,7 @@ impl FfiPool {
 
     /// [`FfiPool::call`], returning with its result the call's seal report.
     /// An error comes with no report.
+    #[allow(clippy::too_many_arguments)]
     pub async fn call_report(
         &self,
         realm: Vec<u8>,
@@ -269,7 +277,9 @@ impl FfiPool {
         provider: Option<Vec<u8>>,
         timeout_ms: u64,
         confidential: FfiConfidentiality,
+        ucan: Option<FfiUcan>,
     ) -> Result<FfiCallReport, FfiError> {
+        let (token, proofs) = presented(ucan);
         let (result, report) = self
             .0
             .call_report(Call {
@@ -279,7 +289,8 @@ impl FfiPool {
                 payload: payload.into(),
                 timeout: millis(timeout_ms),
                 confidential: confidential.into(),
-                ..Call::default()
+                token,
+                proofs,
             })
             .await?;
         Ok(FfiCallReport {
@@ -326,4 +337,10 @@ impl FfiPool {
     pub async fn put_record(&self, wire: Vec<u8>) -> Result<(), FfiError> {
         Ok(self.0.put_record(&wire).await?)
     }
+}
+
+/// A presented UCAN as a request carries it: the token, `None` for none,
+/// and its chain's proofs.
+pub(crate) fn presented(ucan: Option<FfiUcan>) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+    ucan.map_or((None, Vec::new()), |u| (Some(u.token), u.proofs))
 }

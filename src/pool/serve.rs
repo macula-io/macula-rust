@@ -13,6 +13,7 @@ use crate::station_link::{
     self, Confidentiality, Handler, Link, LinkError, StreamHandler, StreamOffer,
     DEFAULT_CALL_TIMEOUT,
 };
+use crate::ucan::Policy;
 
 use super::{Pool, PoolError, PoolInner};
 
@@ -23,7 +24,8 @@ static NEXT_SERVED: AtomicU64 = AtomicU64::new(1);
 /// exactly one of a unary handler and a stream offer, and how it takes its
 /// requests: with [`super::Opts::kem_advertise`] its advertisement names the
 /// node's KEM key unless `confidential` is off, and sealed requests are
-/// answered sealed.
+/// answered sealed; and its policy: `None` serves any caller, and a
+/// [`Policy`] serves only a request whose UCAN it authorizes.
 #[derive(Clone)]
 pub struct Offer {
     pub realm: [u8; 32],
@@ -31,6 +33,7 @@ pub struct Offer {
     pub handler: Option<Handler>,
     pub stream: Option<StreamOffer>,
     pub confidential: Confidentiality,
+    pub policy: Option<Policy>,
 }
 
 impl Offer {
@@ -42,6 +45,7 @@ impl Offer {
             handler: Some(handler),
             stream: None,
             confidential: Confidentiality::Preferred,
+            policy: None,
         }
     }
 
@@ -58,6 +62,7 @@ impl Offer {
             handler: None,
             stream: Some(StreamOffer { mode, handler }),
             confidential: Confidentiality::Preferred,
+            policy: None,
         }
     }
 }
@@ -86,6 +91,9 @@ impl Pool {
     /// naming its own station, and renews it and puts it in the DHT as
     /// [`Link::serve`] does.
     pub async fn serve(&self, o: Offer) -> Result<Served, PoolError> {
+        if o.policy.as_ref().is_some_and(|p| !p.valid()) {
+            return Err(PoolError::Link(LinkError::InvalidOffer));
+        }
         let realm_key = self.inner.realm_key_for(&o.realm, &o.procedure)?;
         let kem_advertise = self.inner.opts.kem_advertise;
         if o.confidential == Confidentiality::Required && !kem_advertise {
@@ -106,6 +114,7 @@ impl Pool {
                 realm_key,
                 confidential: o.confidential,
                 keyed_since_ms,
+                policy: o.policy,
             },
             held: Mutex::new(Held {
                 stopped: false,

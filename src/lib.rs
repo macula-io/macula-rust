@@ -21,4 +21,5 @@ pub mod signed_object;
 pub mod statement_issuer;
 pub mod station_link;
 pub mod transport;
+pub mod ucan;
 mod uuid_v7;

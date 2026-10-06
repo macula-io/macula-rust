@@ -15,13 +15,37 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+macula 12's post-quantum UCAN (D7), minted, presented and enforced, at
+parity with macula, macula-go, Python, .NET and PHP (#12); a sealed stream
+reseals after a key rotation (#21); identity layout v1 (#16).
+
 #### Breaking
 
+- `station_link::Offer` and `pool::Offer` gain the public field `policy`;
+  build them with `Offer::unary` / `Offer::stream` or set it (#12).
 - `KeyFileError` gains `IdentityName`, `OldKey`, `OldKeyPlaceTaken` and
   `StoredKey`, for stored identities (#16).
 
 #### Added
 
+- `ucan`: `macula_ucan` in Rust (#12). `authorize` reaches macula's verdict,
+  in macula's order, for a token signed in the node's profile (ML-DSA-87, or
+  the LAMPS composite in pq_hybrid) under `Policy::UcanRequired` or
+  `RealmMemberRequired`, with a delegation chain whose parents travel as
+  proofs keyed by `proof_id` (SHA-384). An `exp` more than `MAX_LIFETIME`
+  (ten years) past now is `exp_beyond_max_lifetime`, at every link (macula
+  13.6.0, macula#68). `create` mints a token, refusing a window no verifier
+  accepts and naming its values (`CreateError`); `covers`, `did_key` and
+  `carried_key` as macula has them. Held to macula v13.6.0's `ucan_v1.json`
+  (tests/vectors/ucan): every case of both profiles, every proof id, did:key
+  key and narrowing.
+- `Offer::policy` (#12): a gated procedure refuses a call or a stream open
+  whose token the policy does not authorize `unauthorized`, and one carrying
+  a proof no link names `malformed_frame`, before its handler runs. An open
+  procedure ignores any token. A realm member policy without a `can` is
+  `InvalidOffer`.
+- `scripts/interop/ucan.sh`: tokens this crate mints, authorized by macula's
+  own `macula_ucan` (with macula-go's `erlang_ucan.escript`).
 - Identity layout v1 (macula#76, #16), on unix: `NodeKey::stored_identity`
   loads, or generates and stores, the identity a program keeps for a name and
   profile at `<identity_dir>/<name>.<profile>.key`, and answers the path; a
@@ -619,6 +643,26 @@ this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
 same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
+
+### [Unreleased]
+
+On `macula-rust` 0.9: UCAN through the bindings (core #12).
+
+#### Added
+
+- `FfiNodeKey::mint_ucan(audience, capabilities, options)` with
+  `FfiCapability` and `FfiUcanOptions` (exp, nbf, nnc, facts as JSON text, the
+  parent's proof id); a window macula refuses is `InvalidArgument` naming its
+  values. `ucan_proof_id(token)`.
+- `FfiUcan { token, proofs }` and `FfiPolicy` (`UcanRequired`,
+  `RealmMemberRequired`).
+
+#### Changed
+
+- **Breaking:** `FfiPool::call`, `call_report` and `open_stream` take a last
+  `ucan: Option<FfiUcan>`; `serve` and `serve_stream` a last
+  `policy: Option<FfiPolicy>`.
+- A pool stream reseals once after a key rotation (core #21).
 
 ### [ffi-0.8.0] - 2026-10-07
 

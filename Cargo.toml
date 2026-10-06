@@ -39,6 +39,14 @@ macula-mldsa = "0.3"
 # The RSA-PSS-4096 half of pq_hybrid's LAMPS composite: already linked through
 # rustls for the key exchange, constant-time, and with a FIPS path.
 aws-lc-rs = "1"
+# ucan.rs: a UCAN is a JWT, base64url parts of JSON, read and written as
+# macula's macula_ucan does; `raw_value` keeps a claim's number as written, so
+# exp and nbf are judged integers by their text, as Erlang's json decodes them.
+serde_json = { version = "1", features = ["raw_value"] }
+# ucan/first_wins.rs: a key written twice keeps its first value, as Erlang's
+# json decodes it, through serde's own visitor traits.
+serde = "1"
+base64 = "0.22"
 rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
 tokio = { version = "1", features = ["full"] }
 # keystore.rs: platform-native secure storage for a node key

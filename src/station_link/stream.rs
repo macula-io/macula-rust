@@ -36,6 +36,7 @@ use crate::frame::{
 use crate::seal::KEY_ID_SIZE;
 
 use super::admission::{Admission, SessionPlace, Verdict};
+use super::authorize::authorize;
 use super::confidential::{
     clear_allowed, opened_request, refused_key, sealed_request, stated, unsealed, Seal, StreamSeal,
     CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
@@ -841,9 +842,12 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     };
     // From here a refusal of a sealed open goes sealed.
     let s = StreamInner::new(inner.clone(), send, session_open, false, sealing);
-    let Some(offer) = offer.and_then(|o| o.stream) else {
+    let Some((offer, policy)) = offer.and_then(|o| Some((o.stream?, o.policy))) else {
         return refuse(&s, CODE_STREAM_NOT_FOUND, "", recv).await;
     };
+    if let Some(code) = authorize(inner.profile, policy.as_ref(), &open) {
+        return refuse(&s, code, "", recv).await;
+    }
     if Some(offer.mode) != open.mode {
         return refuse(&s, CODE_MODE_MISMATCH, "", recv).await;
     }

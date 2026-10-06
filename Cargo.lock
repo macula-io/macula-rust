@@ -1229,6 +1229,7 @@ version = "0.8.0"
 dependencies = [
  "apple-native-keyring-store",
  "aws-lc-rs",
+ "base64 0.22.1",
  "hex",
  "keyring",
  "keyring-core",
@@ -1239,6 +1240,7 @@ dependencies = [
  "rcgen",
  "rustix",
  "rustls",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -1254,6 +1256,7 @@ dependencies = [
  "hex",
  "macula-rust",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

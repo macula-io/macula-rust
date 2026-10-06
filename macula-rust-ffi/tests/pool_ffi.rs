@@ -16,6 +16,7 @@ use macula_rust_ffi::{
     FfiPool, FfiPoolOptions, FfiProfile, FfiRealmKey, FfiRequest, FfiSeed, FfiStream,
     FfiStreamEvent, FfiStreamHandler, FfiStreamMode, FfiValue,
 };
+use macula_rust_ffi::{ucan_proof_id, FfiCapability, FfiPolicy, FfiUcan, FfiUcanOptions};
 
 const ORG_PROCEDURE: &str = "mcl-echo/echo";
 const TOPIC: &str = "mcl-rust/ffi/greeting_sent_v1";
@@ -124,6 +125,7 @@ async fn the_handler_s_refusal_reaches_the_caller(caller: &FfiPool, realm: &[u8]
             None,
             5_000,
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
     {
@@ -152,6 +154,7 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
             ring.clone(),
             Arc::new(Echo),
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
         .unwrap();
@@ -166,6 +169,7 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
             None,
             5_000,
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
         .unwrap();
@@ -191,6 +195,7 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
             None,
             2_000,
             FfiConfidentiality::Preferred,
+            None,
         )
         .await;
     assert!(
@@ -223,6 +228,7 @@ async fn an_org_procedure_is_served_under_the_pinned_realm_key() {
             ORG_PROCEDURE.into(),
             Arc::new(Echo),
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
         .unwrap();
@@ -240,6 +246,7 @@ async fn an_org_procedure_is_served_under_the_pinned_realm_key() {
             None,
             5_000,
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
         .unwrap();
@@ -352,6 +359,7 @@ async fn a_stream_from_a_foreign_handler_is_heard_and_released() {
             FfiStreamMode::ServerStream,
             Arc::new(Chunks),
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
         .unwrap();
@@ -370,6 +378,7 @@ async fn a_stream_from_a_foreign_handler_is_heard_and_released() {
             None,
             0,
             FfiConfidentiality::Preferred,
+            None,
         )
         .await
         .unwrap();
@@ -505,6 +514,7 @@ async fn a_required_call_reports_its_seal(
             None,
             5_000,
             FfiConfidentiality::Required,
+            None,
         )
         .await
         .unwrap();
@@ -533,6 +543,7 @@ async fn an_unkeyed_pool_cannot_serve_required(
             mine,
             Arc::new(SealedOrNot),
             FfiConfidentiality::Required,
+            None,
         )
         .await;
     assert!(
@@ -568,6 +579,7 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
             vault.clone(),
             Arc::new(SealedOrNot),
             FfiConfidentiality::Required,
+            None,
         )
         .await
         .unwrap();
@@ -582,6 +594,7 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
             None,
             5_000,
             FfiConfidentiality::Required,
+            None,
         )
         .await
         .unwrap();
@@ -595,6 +608,7 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
             None,
             5_000,
             FfiConfidentiality::Off,
+            None,
         )
         .await;
     assert!(
@@ -606,4 +620,93 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
     for p in [caller, provider, unkeyed] {
         p.close().await;
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gated_procedure_answers_a_minted_ucan_and_refuses_none() {
+    let lab = Lab::start(Profile::PqPure);
+    let station = lab.station("ffi gated");
+    // The realm id is SHA-256 over the name the capability names.
+    let realm_name = "io.macula";
+    let realm = realm_id_of(realm_name);
+    let provider_key = FfiNodeKey::generate(FfiProfile::PqPure).unwrap();
+    let provider = pool(&provider_key, &station, options()).await;
+    let count = own_procedure(provider.node_id(), "count".into()).unwrap();
+    let _served = provider
+        .serve(
+            realm.clone(),
+            count.clone(),
+            Arc::new(Echo),
+            FfiConfidentiality::Preferred,
+            Some(FfiPolicy::UcanRequired {
+                issuer: provider_key.node_id(),
+            }),
+        )
+        .await
+        .unwrap();
+    let caller_key = FfiNodeKey::generate(FfiProfile::PqPure).unwrap();
+    let caller = pool(&caller_key, &station, options()).await;
+    let grant = vec![FfiCapability {
+        with: format!("mri:proc:{realm_name}/{count}"),
+        can: "invoke".into(),
+    }];
+    let window = FfiUcanOptions {
+        exp: unix_now() + 300,
+        nbf: None,
+        nnc: None,
+        fct_json: None,
+        parent: None,
+    };
+    let token = provider_key
+        .mint_ucan(caller_key.node_id(), grant.clone(), window.clone())
+        .unwrap();
+    assert_eq!(ucan_proof_id(token.clone()).len(), 96);
+    let call = |ucan: Option<FfiUcan>| {
+        caller.call(
+            realm.clone(),
+            count.clone(),
+            FfiValue::Text("hi".into()),
+            Some(provider.node_id()),
+            5_000,
+            FfiConfidentiality::Preferred,
+            ucan,
+        )
+    };
+    let answered = call(Some(FfiUcan {
+        token,
+        proofs: vec![],
+    }))
+    .await
+    .unwrap();
+    assert!(matches!(answered, FfiValue::Fields(_)), "{answered:?}");
+    match call(None).await {
+        Err(FfiError::Provider { code, .. }) => assert_eq!(code, "unauthorized"),
+        other => panic!("{other:?}"),
+    }
+    let in_ms = provider_key.mint_ucan(
+        caller_key.node_id(),
+        grant,
+        FfiUcanOptions {
+            exp: (unix_now() + 300) * 1000,
+            ..window
+        },
+    );
+    assert!(
+        matches!(&in_ms, Err(FfiError::InvalidArgument { message }) if message.contains("exp_beyond_max_lifetime")),
+        "{in_ms:?}"
+    );
+    caller.close().await;
+    provider.close().await;
+}
+
+fn realm_id_of(name: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(name.as_bytes()).to_vec()
 }
