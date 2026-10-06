@@ -140,7 +140,7 @@ mod tests {
         for bad in [&b"[]"[..], b"null", b"1", b"{} {}", b"{", b"\"x\""] {
             assert_eq!(object(bad), None, "{}", String::from_utf8_lossy(bad));
         }
-        assert_eq!(written(b"[]"), None);
+        assert!(written(b"[]").is_none());
         assert!(object(b" {} ").is_some());
     }
 }
