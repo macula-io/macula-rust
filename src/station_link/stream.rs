@@ -33,7 +33,9 @@ use super::confidential::{
     CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
 };
 use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
-use super::serve::{bounded_detail, BoxFuture, Offer, StreamOffer, CODE_REQUEST_COPY};
+use super::serve::{
+    bounded_detail, without_caller, BoxFuture, Offer, StreamOffer, CODE_REQUEST_COPY,
+};
 use super::{frame_type_of, now_ms, Inner, Link, LinkError};
 
 const STREAM_OPEN_BYTES: usize = 1024 * 1024;
@@ -163,7 +165,8 @@ pub(super) struct StreamSide {
 impl Stream {
     /// The stream's verified STREAM_OPEN: its caller, procedure, mode and
     /// payload. On a provider's side of a sealed stream the payload is the
-    /// open's opened plaintext.
+    /// open's opened plaintext, and on a provider's side a map payload has
+    /// no text "caller" key: the caller is `caller`, as verified.
     pub fn request(&self) -> &VerifiedRequest {
         &self.inner.open
     }
@@ -743,7 +746,8 @@ async fn read_open(
 /// The open as its session sees it, opened when it came sealed, with the
 /// provider's keys for the stream; or the code and message to refuse it with
 /// in the clear: a sealed open that does not open, or a clear one to a
-/// procedure past its keyless window.
+/// procedure past its keyless window. A map payload loses a text "caller"
+/// key (macula-rust#13), clear or opened.
 fn session_open(
     inner: &Inner,
     open: &VerifiedRequest,
@@ -754,7 +758,7 @@ fn session_open(
             .map(|(payload, sealed)| {
                 (
                     VerifiedRequest {
-                        payload,
+                        payload: without_caller(payload),
                         ..open.clone()
                     },
                     Some(StreamSeal::provider(&sealed)),
@@ -767,7 +771,13 @@ fn session_open(
             let message = "this procedure takes sealed opens only";
             Err((CODE_SEALED_REQUIRED, message.to_string()))
         }
-        None => Ok((open.clone(), None)),
+        None => Ok((
+            VerifiedRequest {
+                payload: without_caller(open.payload.clone()),
+                ..open.clone()
+            },
+            None,
+        )),
     }
 }
 

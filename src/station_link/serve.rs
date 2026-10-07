@@ -566,9 +566,22 @@ async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -
     };
     let outcome = match offer.and_then(|o| o.handler) {
         None => Outcome::Refused(CODE_UNKNOWN_PROCEDURE, None),
-        Some(handler) => handled(handler, request, payload, sealing.is_some()).await,
+        Some(handler) => {
+            handled(handler, request, without_caller(payload), sealing.is_some()).await
+        }
     };
     answered(inner, request, sealing.as_ref(), outcome)
+}
+
+/// `payload` as a handler receives it: a map loses a text "caller" key, so
+/// the only caller a handler can learn is the verified one
+/// ([`Request::caller`]), as macula's `with_caller/2` and macula-go's
+/// `withoutCaller` arrange (macula-rust#13). Any other payload is untouched.
+pub(super) fn without_caller(payload: Value) -> Value {
+    match payload {
+        Value::Map(_) => payload.without(&["caller"]),
+        other => other,
+    }
 }
 
 /// What answers a request: a RESULT's payload, or an ERROR's code and

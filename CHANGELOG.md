@@ -26,6 +26,15 @@ usually touches both, but their version numbers don't move in lockstep.
   `DialError::Connection`. The negotiated group is not read back after the
   handshake: quinn 0.11 reports it only under a private test feature.
 
+#### Fixed
+
+- A served handler no longer sees a caller the sender wrote (#13). A map
+  payload loses a text `"caller"` key before the handler runs, for calls
+  and stream opens, clear and sealed, as macula 12.11.1 (`with_caller/2`)
+  and macula-go do; `Request::caller` and `Stream::request().caller`, as
+  verified, are the only caller a handler learns. Any other payload is
+  untouched.
+
 ### [0.7.0] - 2026-10-06
 
 macula 13's end-to-end sealing on both sides, and the caller's seal report.
