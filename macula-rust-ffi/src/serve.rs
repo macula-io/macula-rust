@@ -6,8 +6,9 @@
 
 use std::sync::Arc;
 
+use macula_rust::cbor::Value;
 use macula_rust::pool::{Offer, Served};
-use macula_rust::station_link::{handler, stream_handler, Request};
+use macula_rust::station_link::{handler, stream_handler, Request, Stream};
 
 use crate::pool::{FfiConfidentiality, FfiPool};
 use crate::stream::{FfiStream, FfiStreamHandler, FfiStreamMode};
@@ -68,17 +69,7 @@ impl FfiPool {
         handler_impl: Arc<dyn FfiCallHandler>,
         confidential: FfiConfidentiality,
     ) -> Result<Arc<FfiServed>, FfiError> {
-        let answer = handler(move |r: Request| {
-            let handler_impl = handler_impl.clone();
-            async move {
-                let request = FfiRequest::try_from(r).map_err(|e| e.to_string())?;
-                let answered = handler_impl
-                    .handle(request)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(answered.into())
-            }
-        });
+        let answer = handler(move |r: Request| answer_call(handler_impl.clone(), r));
         let mut offer = Offer::unary(to_32(realm)?, &procedure, answer);
         offer.confidential = confidential.into();
         let served = self.0.serve(offer).await?;
@@ -96,20 +87,31 @@ impl FfiPool {
         handler_impl: Arc<dyn FfiStreamHandler>,
         confidential: FfiConfidentiality,
     ) -> Result<Arc<FfiServed>, FfiError> {
-        let session = stream_handler(move |s| {
-            let handler_impl = handler_impl.clone();
-            async move {
-                handler_impl
-                    .handle(Arc::new(FfiStream::new(s)))
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        });
+        let session = stream_handler(move |s| run_session(handler_impl.clone(), s));
         let mut offer = Offer::stream(to_32(realm)?, &procedure, mode.into(), session);
         offer.confidential = confidential.into();
         let served = self.0.serve(offer).await?;
         Ok(Arc::new(FfiServed(served)))
     }
+}
+
+/// Answers one CALL with the foreign handler, a refusal or failure as its
+/// text.
+async fn answer_call(handler_impl: Arc<dyn FfiCallHandler>, r: Request) -> Result<Value, String> {
+    let request = FfiRequest::try_from(r).map_err(|e| e.to_string())?;
+    let answered = handler_impl
+        .handle(request)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(answered.into())
+}
+
+/// Hands one streaming session to the foreign handler, a failure as its text.
+async fn run_session(handler_impl: Arc<dyn FfiStreamHandler>, s: Stream) -> Result<(), String> {
+    handler_impl
+        .handle(Arc::new(FfiStream::new(s)))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[uniffi::export(async_runtime = "tokio")]

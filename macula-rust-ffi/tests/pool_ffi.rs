@@ -113,6 +113,29 @@ fn a_node_key_is_made_in_either_profile_and_survives_its_key_file() {
     assert!(matches!(missing, Err(FfiError::Key { .. })));
 }
 
+/// A call asking "fail" comes back as the foreign handler's refusal.
+async fn the_handler_s_refusal_reaches_the_caller(caller: &FfiPool, realm: &[u8], ring: &str) {
+    match caller
+        .call(
+            realm.to_vec(),
+            ring.to_string(),
+            FfiValue::Text("fail".into()),
+            None,
+            5_000,
+            FfiConfidentiality::Preferred,
+        )
+        .await
+    {
+        Err(FfiError::Provider { code, detail, .. }) => {
+            assert_eq!(code, "handler_error");
+            assert!(detail
+                .unwrap_or_default()
+                .contains("refused by the handler"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
     let lab = Lab::start(Profile::PqPure);
@@ -151,25 +174,7 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
     assert_eq!(fields[0].value, FfiValue::Text("hi".into()));
     assert_eq!(fields[1].value, FfiValue::Bytes(caller.node_id()));
 
-    match caller
-        .call(
-            realm.clone(),
-            ring.clone(),
-            FfiValue::Text("fail".into()),
-            None,
-            5_000,
-            FfiConfidentiality::Preferred,
-        )
-        .await
-    {
-        Err(FfiError::Provider { code, detail, .. }) => {
-            assert_eq!(code, "handler_error");
-            assert!(detail
-                .unwrap_or_default()
-                .contains("refused by the handler"));
-        }
-        other => panic!("{other:?}"),
-    }
+    the_handler_s_refusal_reaches_the_caller(&caller, &realm, &ring).await;
     let providers = caller.providers(realm.clone(), ring.clone()).await.unwrap();
     assert_eq!(providers.len(), 1);
     assert_eq!(providers[0].node, provider.node_id());
@@ -243,6 +248,16 @@ async fn an_org_procedure_is_served_under_the_pinned_realm_key() {
     assert_eq!(fields[0].value, FfiValue::Int(7));
 }
 
+/// Waits up to 5 s for `me`'s subscription to TOPIC to reach `s`.
+async fn wait_subscribed(lab: &Lab, s: &LabStation, me: &[u8; 32], r: &[u8; 32]) {
+    for _ in 0..200 {
+        if lab.subscribed(s, me, r, TOPIC) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscription_hears_a_publication_once() {
     let lab = Lab::start(Profile::PqPure);
@@ -266,12 +281,7 @@ async fn a_subscription_hears_a_publication_once() {
         .unwrap();
     let me: [u8; 32] = listener.node_id().try_into().unwrap();
     let r: [u8; 32] = realm.clone().try_into().unwrap();
-    for _ in 0..200 {
-        if lab.subscribed(&s, &me, &r, TOPIC) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    wait_subscribed(&lab, &s, &me, &r).await;
     publisher
         .publish(
             realm.clone(),
@@ -288,6 +298,34 @@ async fn a_subscription_hears_a_publication_once() {
     assert!(sub.next(300).await.unwrap().is_none(), "heard once");
     sub.unsubscribe().await.unwrap();
     assert!(matches!(sub.next(100).await, Err(FfiError::Closed)));
+}
+
+/// The byte chunks `stream` delivers until its end.
+async fn bytes_until_end(stream: &FfiStream) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    loop {
+        match stream.recv(5_000).await.unwrap() {
+            FfiStreamEvent::Data {
+                body: FfiValue::Bytes(b),
+                ..
+            } => got.push(b),
+            FfiStreamEvent::End { .. } => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    got
+}
+
+/// Waits up to 2 s for both stations to have released every relayed
+/// stream, and fails the test otherwise.
+async fn released_within_2s(lab: &Lab, serving: &LabStation, callers: &LabStation) {
+    for _ in 0..100 {
+        if lab.relayed(serving) == 0 && lab.relayed(callers) == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the stream was not released within 2 s");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -334,29 +372,13 @@ async fn a_stream_from_a_foreign_handler_is_heard_and_released() {
         )
         .await
         .unwrap();
-    let mut got = Vec::new();
-    loop {
-        match stream.recv(5_000).await.unwrap() {
-            FfiStreamEvent::Data {
-                body: FfiValue::Bytes(b),
-                ..
-            } => got.push(b),
-            FfiStreamEvent::End { .. } => break,
-            other => panic!("{other:?}"),
-        }
-    }
+    let got = bytes_until_end(&stream).await;
     assert_eq!(got, vec![b"a".to_vec(), b"b".to_vec()]);
     assert!(matches!(
         stream.recv(1_000).await,
         Err(FfiError::EndOfStream)
     ));
-    for _ in 0..100 {
-        if lab.relayed(&serving) == 0 && lab.relayed(&callers) == 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("the stream was not released within 2 s");
+    released_within_2s(&lab, &serving, &callers).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -392,6 +414,23 @@ async fn records_go_through_the_pool() {
             })
         ),
         "{bad_id:?}"
+    );
+}
+
+/// An mcid a byte short is refused for its length.
+async fn a_short_mcid_is_refused(fetcher: &FfiPool, realm: Vec<u8>) {
+    let bad = fetcher
+        .get_content(realm, vec![2; 49], FfiContentOptions::default())
+        .await;
+    assert!(
+        matches!(
+            bad,
+            Err(FfiError::WrongByteLength {
+                expected: 50,
+                actual: 49
+            })
+        ),
+        "{bad:?}"
     );
 }
 
@@ -446,19 +485,61 @@ async fn content_is_shared_by_one_node_and_fetched_by_another() {
         .get_content(realm.clone(), mcid.clone(), FfiContentOptions::default())
         .await;
     assert!(matches!(gone, Err(FfiError::NotShared)), "{gone:?}");
-    let bad = fetcher
-        .get_content(realm, vec![2; 49], FfiContentOptions::default())
+    a_short_mcid_is_refused(&fetcher, realm).await;
+}
+
+/// A required call's report says it was sealed, by `provider`, to a key
+/// named by its 8-byte id.
+async fn a_required_call_reports_its_seal(
+    caller: &FfiPool,
+    realm: &[u8],
+    vault: &str,
+    provider: Vec<u8>,
+) {
+    let reported = caller
+        .call_report(
+            realm.to_vec(),
+            vault.to_string(),
+            FfiValue::Text("secret".into()),
+            None,
+            5_000,
+            FfiConfidentiality::Required,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reported.result, FfiValue::Int(1));
+    assert_eq!(reported.report.sealed, 1);
+    assert_eq!(reported.report.provider, provider);
+    assert_eq!(reported.report.seal_key_id.map(|id| id.len()), Some(8));
+}
+
+/// A pool without kem_advertise on `serving` is refused a required
+/// procedure; answers the pool, for the test to close.
+async fn an_unkeyed_pool_cannot_serve_required(
+    serving: &LabStation,
+    realm: Vec<u8>,
+) -> Arc<FfiPool> {
+    let unkeyed = pool(
+        &FfiNodeKey::generate(FfiProfile::PqHybrid).unwrap(),
+        serving,
+        options(),
+    )
+    .await;
+    let mine = own_procedure(unkeyed.node_id(), "vault".into()).unwrap();
+    let refused = unkeyed
+        .serve(
+            realm,
+            mine,
+            Arc::new(SealedOrNot),
+            FfiConfidentiality::Required,
+        )
         .await;
     assert!(
-        matches!(
-            bad,
-            Err(FfiError::WrongByteLength {
-                expected: 50,
-                actual: 49
-            })
-        ),
-        "{bad:?}"
+        matches!(refused, Err(FfiError::InvalidArgument { .. })),
+        "{:?}",
+        refused.err()
     );
+    unkeyed
 }
 
 /// A pool with kem_advertise serves a required procedure: a required call
@@ -504,21 +585,7 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
         .await
         .unwrap();
     assert_eq!(answered, FfiValue::Int(1));
-    let reported = caller
-        .call_report(
-            realm.clone(),
-            vault.clone(),
-            FfiValue::Text("secret".into()),
-            None,
-            5_000,
-            FfiConfidentiality::Required,
-        )
-        .await
-        .unwrap();
-    assert_eq!(reported.result, FfiValue::Int(1));
-    assert_eq!(reported.report.sealed, 1);
-    assert_eq!(reported.report.provider, provider.node_id());
-    assert_eq!(reported.report.seal_key_id.map(|id| id.len()), Some(8));
+    a_required_call_reports_its_seal(&caller, &realm, &vault, provider.node_id()).await;
     let off = caller
         .call(
             realm.clone(),
@@ -534,26 +601,7 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
         "{off:?}"
     );
 
-    let unkeyed = pool(
-        &FfiNodeKey::generate(FfiProfile::PqHybrid).unwrap(),
-        &serving,
-        options(),
-    )
-    .await;
-    let mine = own_procedure(unkeyed.node_id(), "vault".into()).unwrap();
-    let refused = unkeyed
-        .serve(
-            realm,
-            mine,
-            Arc::new(SealedOrNot),
-            FfiConfidentiality::Required,
-        )
-        .await;
-    assert!(
-        matches!(refused, Err(FfiError::InvalidArgument { .. })),
-        "{:?}",
-        refused.err()
-    );
+    let unkeyed = an_unkeyed_pool_cannot_serve_required(&serving, realm).await;
     for p in [caller, provider, unkeyed] {
         p.close().await;
     }
