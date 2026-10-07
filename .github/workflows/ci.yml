@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ilammy/setup-nasm@v1
-      - run: cargo test -p macula-rust --lib --locked -- keystore:: node_key::
+      - run: "cargo test -p macula-rust --lib --locked -- keystore:: node_key::"
 
   doc:
     name: docs (deny broken links)
