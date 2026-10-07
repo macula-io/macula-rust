@@ -1,0 +1,5 @@
+# Hard limits on a function's shape, denied in Cargo.toml [lints.clippy] and
+# so gated by CI's clippy -D warnings.
+excessive-nesting-threshold = 3
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 60
