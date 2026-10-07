@@ -412,31 +412,36 @@ impl Decoder<'_> {
                 self.count()?;
                 Ok(Value::Null)
             }
-            25..=27 => {
-                let width = match ai {
-                    25 => 2,
-                    26 => 4,
-                    _ => 8,
-                };
-                let bytes = self.take(width)?;
-                let value = match bytes.len() {
-                    2 => half_to_f64(u16::from_be_bytes([bytes[0], bytes[1]])),
-                    4 => f64::from(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
-                    _ => f64::from_be_bytes(bytes.try_into().map_err(|_| DecodeError::Malformed)?),
-                };
-                self.count()?;
-                if value.is_finite() {
-                    Ok(Value::Float(value))
-                } else {
-                    Err(DecodeError::Malformed)
-                }
-            }
+            25..=27 => self.float(ai),
             0..=24 => {
                 self.argument(ai)?;
                 self.count()?;
                 Err(DecodeError::Malformed)
             }
             _ => Err(DecodeError::Malformed),
+        }
+    }
+
+    /// A half, single or double float, for additional information 25, 26 or
+    /// 27, counted once its bytes have been read. Infinities and NaN are
+    /// malformed.
+    fn float(&mut self, ai: u8) -> Result<Value, DecodeError> {
+        let width = match ai {
+            25 => 2,
+            26 => 4,
+            _ => 8,
+        };
+        let bytes = self.take(width)?;
+        let value = match bytes.len() {
+            2 => half_to_f64(u16::from_be_bytes([bytes[0], bytes[1]])),
+            4 => f64::from(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+            _ => f64::from_be_bytes(bytes.try_into().map_err(|_| DecodeError::Malformed)?),
+        };
+        self.count()?;
+        if value.is_finite() {
+            Ok(Value::Float(value))
+        } else {
+            Err(DecodeError::Malformed)
         }
     }
 
@@ -477,19 +482,34 @@ impl Decoder<'_> {
         let mut pairs = Vec::with_capacity(hint);
         let mut seen = std::collections::HashSet::with_capacity(hint);
         for _ in 0..count {
-            let key = self.item(depth + 1)?;
-            let value = self.item(depth + 1)?;
-            let id = match &key {
-                Value::Text(text) => KeyId::Text(text.clone()),
-                Value::Int(n) => KeyId::Int(*n),
-                _ => return Err(DecodeError::BadKey),
-            };
-            if !seen.insert(id) {
-                return Err(DecodeError::DuplicateKey);
-            }
-            pairs.push((key, value));
+            pairs.push(self.map_entry(depth, &mut seen)?);
         }
         Ok(Value::Map(pairs))
+    }
+
+    /// One map entry: its key, then its value, then the key judged, refused
+    /// when it is neither text nor an integer, or when `seen` already holds it.
+    fn map_entry(
+        &mut self,
+        depth: usize,
+        seen: &mut std::collections::HashSet<KeyId>,
+    ) -> Result<(Value, Value), DecodeError> {
+        let key = self.item(depth + 1)?;
+        let value = self.item(depth + 1)?;
+        if !seen.insert(key_id(&key)?) {
+            return Err(DecodeError::DuplicateKey);
+        }
+        Ok((key, value))
+    }
+}
+
+/// The identity a map key is checked for duplicates by: its text or its
+/// integer. Any other key is refused.
+fn key_id(key: &Value) -> Result<KeyId, DecodeError> {
+    match key {
+        Value::Text(text) => Ok(KeyId::Text(text.clone())),
+        Value::Int(n) => Ok(KeyId::Int(*n)),
+        _ => Err(DecodeError::BadKey),
     }
 }
 
