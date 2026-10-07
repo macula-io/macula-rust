@@ -26,6 +26,7 @@ use tokio::sync::watch;
 
 use crate::cbor::{self, Value};
 use crate::frame::{self, StreamMode, VerifiedRequest};
+use crate::node_key::NodeKey;
 use crate::record::{
     self, Authorization, ProcedureAdvertisementOptions, Reason, Record, RecordError,
     TombstoneOptions, Trust,
@@ -505,14 +506,8 @@ pub(super) fn called(inner: &Arc<Inner>, v: &Value) {
     }
     let inner = inner.clone();
     match inner.admission.admit(&request, &inner.share, now_ms()) {
-        Verdict::Refused(code) => {
-            let reply = provider_error(&inner, &request, code, None);
-            tokio::spawn(async move { send_reply(&inner, reply).await });
-        }
-        Verdict::Copy(None) => {
-            let reply = provider_error(&inner, &request, CODE_REQUEST_COPY, None);
-            tokio::spawn(async move { send_reply(&inner, reply).await });
-        }
+        Verdict::Refused(code) => refuse_call(inner, &request, code),
+        Verdict::Copy(None) => refuse_call(inner, &request, CODE_REQUEST_COPY),
         Verdict::Copy(Some(stored)) => {
             tokio::spawn(async move {
                 let _ = inner.control.write(&stored, MAX_FRAME_BYTES).await;
@@ -524,6 +519,16 @@ pub(super) fn called(inner: &Arc<Inner>, v: &Value) {
     }
 }
 
+/// Sends this node's ERROR for `request` with `code`, or counts it
+/// unsignable_reply when it does not sign.
+fn refuse_call(inner: Arc<Inner>, request: &VerifiedRequest, code: &'static str) {
+    let Some(reply) = provider_error(&inner.signer(), request, code, None) else {
+        inner.count("unsignable_reply");
+        return;
+    };
+    tokio::spawn(async move { send_reply(&inner, reply).await });
+}
+
 /// Serves a request and sends its signed reply, storing it for the
 /// request's copies.
 async fn answer(inner: Arc<Inner>, request: VerifiedRequest) {
@@ -532,7 +537,10 @@ async fn answer(inner: Arc<Inner>, request: VerifiedRequest) {
         .served
         .get(&(request.realm, request.procedure.clone()))
         .map(|s| s.offer.clone());
-    let reply = reply(&inner, &request, offer).await;
+    let Some(reply) = reply(&inner, &request, offer).await else {
+        inner.count("unsignable_reply");
+        return;
+    };
     let Ok(encoded) = cbor::encode(&reply) else {
         inner.count("unencodable_reply");
         return;
@@ -546,12 +554,12 @@ async fn answer(inner: Arc<Inner>, request: VerifiedRequest) {
 /// first, or refused sealed_refused in the clear when it does not open; a
 /// clear one to a procedure past its keyless window refused sealed_required;
 /// then the procedure and its handler, answered sealed when the request was.
-async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -> Value {
+async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -> Option<Value> {
     let (payload, sealing) = match &request.sealed {
         Some(_) => match opened_request(inner.keyring.as_deref(), request) {
             Ok((payload, sealing)) => (payload, Some(sealing)),
             Err(detail) => {
-                return provider_error(inner, request, CODE_SEALED_REFUSED, Some(&detail))
+                return provider_error(&inner.signer(), request, CODE_SEALED_REFUSED, Some(&detail))
             }
         },
         None => {
@@ -559,7 +567,7 @@ async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -
                 .as_ref()
                 .is_some_and(|o| !clear_allowed(o.confidential, inner.keyed_since(o), now_ms()));
             if refused {
-                return provider_error(inner, request, CODE_SEALED_REQUIRED, None);
+                return provider_error(&inner.signer(), request, CODE_SEALED_REQUIRED, None);
             }
             (request.payload.clone(), None)
         }
@@ -570,7 +578,7 @@ async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -
             handled(handler, request, without_caller(payload), sealing.is_some()).await
         }
     };
-    answered(inner, request, sealing.as_ref(), outcome)
+    answered(&inner.signer(), request, sealing.as_ref(), outcome)
 }
 
 /// `payload` as a handler receives it: a map loses a text "caller" key, so
@@ -629,41 +637,59 @@ async fn handled(
     }
 }
 
+/// What signs this node's replies: its identity key and its node id, the
+/// replies' responded_by.
+pub(super) struct Signer<'a> {
+    pub(super) key: &'a NodeKey,
+    pub(super) self_id: [u8; 32],
+}
+
+impl Inner {
+    /// This node's [`Signer`].
+    fn signer(&self) -> Signer<'_> {
+        Signer {
+            key: &self.key,
+            self_id: self.self_id,
+        }
+    }
+}
+
 /// An outcome as the clear signed reply to a clear `request`.
-fn clear_answer(inner: &Inner, request: &VerifiedRequest, outcome: Outcome) -> Value {
+fn clear_answer(signer: &Signer, request: &VerifiedRequest, outcome: Outcome) -> Option<Value> {
     match outcome {
-        Outcome::Refused(code, detail) => provider_error(inner, request, code, detail.as_deref()),
-        Outcome::Result(payload) => clear_result(inner, request, &payload),
+        Outcome::Refused(code, detail) => provider_error(signer, request, code, detail.as_deref()),
+        Outcome::Result(payload) => clear_result(signer, request, &payload),
     }
 }
 
 /// A result as the signed RESULT to a clear `request`, or payload_too_large
 /// or unknown_error when the wire cannot carry it.
-fn clear_result(inner: &Inner, request: &VerifiedRequest, payload: &Value) -> Value {
-    match frame::sign_result(request, payload, None, &inner.key) {
-        Ok(signed) => signed,
+fn clear_result(signer: &Signer, request: &VerifiedRequest, payload: &Value) -> Option<Value> {
+    match frame::sign_result(request, payload, None, signer.key) {
+        Ok(signed) => Some(signed),
         Err(_) if cbor::encode(payload).is_ok_and(|e| e.len() > frame::MAX_FRAME_BYTES) => {
-            provider_error(inner, request, CODE_PAYLOAD_TOO_LARGE, None)
+            provider_error(signer, request, CODE_PAYLOAD_TOO_LARGE, None)
         }
-        Err(_) => provider_error(inner, request, CODE_UNSENDABLE, None),
+        Err(_) => provider_error(signer, request, CODE_UNSENDABLE, None),
     }
 }
 
 /// An outcome as the signed reply to `request`: clear to a clear request,
 /// sealed to a sealed one. A result the wire cannot carry is answered
-/// payload_too_large or unknown_error, as macula answers it.
+/// payload_too_large or unknown_error, as macula answers it. `None` when no
+/// reply signs: the request is left unanswered (macula-rust#14).
 fn answered(
-    inner: &Inner,
+    signer: &Signer,
     request: &VerifiedRequest,
     sealing: Option<&CallSeal>,
     outcome: Outcome,
-) -> Value {
+) -> Option<Value> {
     let Some(sealing) = sealing else {
-        return clear_answer(inner, request, outcome);
+        return clear_answer(signer, request, outcome);
     };
     let payload = match outcome {
         Outcome::Refused(code, detail) => {
-            return sealed_error(inner, request, sealing, code, detail.as_deref())
+            return sealed_error(signer, request, sealing, code, detail.as_deref())
         }
         Outcome::Result(payload) => payload,
     };
@@ -671,50 +697,72 @@ fn answered(
         .ok()
         .and_then(|_| cbor::encode(&payload).ok());
     let Some(plain) = plain else {
-        return sealed_error(inner, request, sealing, CODE_UNSENDABLE, None);
+        return sealed_error(signer, request, sealing, CODE_UNSENDABLE, None);
     };
     let signed = sealing
         .sealed_answer(
             seal::FRAME_RESULT,
             &plain,
             &request.request_hash,
-            &inner.self_id,
+            &signer.self_id,
         )
         .and_then(|sealed| {
-            frame::sign_sealed_result(request, &sealed, None, &inner.key).map_err(LinkError::from)
+            frame::sign_sealed_result(request, &sealed, None, signer.key).map_err(LinkError::from)
         });
+    match sealed_result_refusal(signed) {
+        Ok(reply) => Some(reply),
+        Err(Refusal::Sealed(code)) => sealed_error(signer, request, sealing, code, None),
+        Err(Refusal::Clear(code)) => provider_error(signer, request, code, None),
+    }
+}
+
+/// How a sealed RESULT that cannot go is refused: sealed, or in the clear
+/// from the closed set.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    Sealed(&'static str),
+    Clear(&'static str),
+}
+
+/// A signed sealed RESULT, or how to refuse it: payload_too_large sealed when
+/// it is over the frame cap, unavailable in the clear when it could not be
+/// sealed (no randomness), unknown_error sealed when it did not sign
+/// (macula-rust#14).
+fn sealed_result_refusal(signed: Result<Value, LinkError>) -> Result<Value, Refusal> {
     match signed {
-        Ok(reply) if cbor::encode(&reply).is_ok_and(|e| e.len() <= frame::MAX_FRAME_BYTES) => reply,
-        Ok(_) => sealed_error(inner, request, sealing, CODE_PAYLOAD_TOO_LARGE, None),
-        Err(LinkError::Io(_)) => provider_error(inner, request, CODE_UNAVAILABLE, None),
-        Err(_) => sealed_error(inner, request, sealing, CODE_PAYLOAD_TOO_LARGE, None),
+        Ok(reply) if cbor::encode(&reply).is_ok_and(|e| e.len() <= frame::MAX_FRAME_BYTES) => {
+            Ok(reply)
+        }
+        Ok(_) => Err(Refusal::Sealed(CODE_PAYLOAD_TOO_LARGE)),
+        Err(LinkError::Io(_)) => Err(Refusal::Clear(CODE_UNAVAILABLE)),
+        Err(_) => Err(Refusal::Sealed(CODE_UNSENDABLE)),
     }
 }
 
 /// This node's ERROR for a sealed request, its code and detail sealed as
-/// cbor([code, detail]). One that cannot be sealed (no randomness) is
-/// answered unavailable in the clear, from the closed set: never the code
-/// or detail in the clear.
+/// cbor([code, detail]). One that cannot be sealed (no randomness) or does
+/// not sign is answered unavailable in the clear, from the closed set: never
+/// the code or detail in the clear (macula-rust#14).
 fn sealed_error(
-    inner: &Inner,
+    signer: &Signer,
     request: &VerifiedRequest,
     sealing: &CallSeal,
     code: &str,
     detail: Option<&str>,
-) -> Value {
+) -> Option<Value> {
     let plain = seal::error_plain(code, detail.unwrap_or(""));
-    match sealing.sealed_answer(
-        seal::FRAME_ERROR,
-        &plain,
-        &request.request_hash,
-        &inner.self_id,
-    ) {
-        Ok(sealed) => frame::sign_sealed_provider_error(request, &sealed, None, &inner.key)
-            .unwrap_or_else(|e| {
-                panic!("station_link: a sealed provider error that does not sign: {e}")
-            }),
-        Err(_) => provider_error(inner, request, CODE_UNAVAILABLE, None),
-    }
+    sealing
+        .sealed_answer(
+            seal::FRAME_ERROR,
+            &plain,
+            &request.request_hash,
+            &signer.self_id,
+        )
+        .ok()
+        .and_then(|sealed| {
+            frame::sign_sealed_provider_error(request, &sealed, None, signer.key).ok()
+        })
+        .or_else(|| provider_error(signer, request, CODE_UNAVAILABLE, None))
 }
 
 impl Inner {
@@ -736,17 +784,16 @@ impl Inner {
     }
 }
 
-/// This node's signed ERROR for `request`. The request verified with this
-/// node as its target, so signing cannot fail on the key; a code or detail
-/// out of bounds is a bug in this module.
+/// This node's signed ERROR for `request`, `None` when it does not sign: a
+/// request this key cannot answer, or a key that fails to sign. Either leaves
+/// the request unanswered, counted by the caller of this, never a panic.
 fn provider_error(
-    inner: &Inner,
+    signer: &Signer,
     request: &VerifiedRequest,
     code: &str,
     detail: Option<&str>,
-) -> Value {
-    frame::sign_provider_error(request, code, detail, None, &inner.key)
-        .unwrap_or_else(|e| panic!("station_link: a provider error that does not sign: {e}"))
+) -> Option<Value> {
+    frame::sign_provider_error(request, code, detail, None, signer.key).ok()
 }
 
 async fn send_reply(inner: &Inner, reply: Value) {
@@ -763,4 +810,101 @@ pub(super) fn bounded_detail(text: &str) -> &str {
         cut -= 1;
     }
     &text[..cut]
+}
+
+#[cfg(test)]
+mod tests {
+    //! A provider's sealed answer on its error paths (macula-rust#14): a
+    //! RESULT is called payload_too_large only when it is over the frame cap,
+    //! and an answer that does not sign never panics.
+
+    use super::*;
+    use crate::frame::{FrameError, RequestType};
+    use crate::node_key::NodeKey;
+    use crate::profile::Profile;
+    use crate::seal::Keyring;
+    use crate::station_link::confidential::sealed_request;
+
+    const CALLER: [u8; 32] = [1; 32];
+
+    /// A call sealed to `keyring` and targeting `target`, as its provider
+    /// verified it, and the provider's keys for the answer.
+    fn sealed_call(keyring: &Keyring, target: [u8; 32]) -> (VerifiedRequest, CallSeal) {
+        let to = keyring.current().public_key().carried().to_vec();
+        let (sealed, _) = sealed_request(
+            keyring.profile(),
+            &to,
+            seal::FRAME_CALL,
+            [3; 32],
+            "~ring",
+            CALLER,
+            target,
+            [4; 16],
+            1_790_000_000_000,
+            &Value::text("secret"),
+        )
+        .unwrap();
+        let request = VerifiedRequest {
+            frame_type: RequestType::Call,
+            key: Vec::new(),
+            request_hash: [5; 48],
+            caller: CALLER,
+            request_id: [4; 16],
+            realm: [3; 32],
+            procedure: "~ring".into(),
+            target,
+            deadline: 1_790_000_000_000,
+            payload: Value::Null,
+            sealed: Some(sealed),
+            mode: None,
+            token: None,
+            proofs: None,
+        };
+        let (_, sealing) = opened_request(Some(keyring), &request).unwrap();
+        (request, sealing)
+    }
+
+    #[test]
+    fn only_a_result_over_the_frame_cap_is_payload_too_large() {
+        let oversize = Value::Bytes(vec![0; frame::MAX_FRAME_BYTES + 1]);
+        assert_eq!(
+            sealed_result_refusal(Ok(oversize)),
+            Err(Refusal::Sealed(CODE_PAYLOAD_TOO_LARGE))
+        );
+        assert_eq!(
+            sealed_result_refusal(Err(LinkError::Io("no randomness".into()))),
+            Err(Refusal::Clear(CODE_UNAVAILABLE))
+        );
+        assert_eq!(
+            sealed_result_refusal(Err(LinkError::Frame(FrameError::Unsignable))),
+            Err(Refusal::Sealed(CODE_UNSENDABLE))
+        );
+        assert_eq!(
+            sealed_result_refusal(Ok(Value::text("fits"))),
+            Ok(Value::text("fits"))
+        );
+    }
+
+    #[test]
+    fn a_sealed_answer_that_does_not_sign_does_not_panic() {
+        let profile = Profile::PqPure;
+        let keyring = Keyring::system(profile).unwrap();
+        let key = NodeKey::generate_identity(profile, 0).unwrap();
+        let signer = Signer {
+            key: &key,
+            self_id: key.key_id(),
+        };
+        // Answered as this node, the request names another node as its
+        // target, so no reply to it signs.
+        let (request, sealing) = sealed_call(&keyring, [2; 32]);
+        let refused = Outcome::Refused(CODE_HANDLER_ERROR, Some("no".into()));
+        assert_eq!(answered(&signer, &request, Some(&sealing), refused), None);
+        let result = Outcome::Result(Value::text("answer"));
+        assert_eq!(answered(&signer, &request, Some(&sealing), result), None);
+        // Targeting this node, the same answers sign, sealed.
+        let (request, sealing) = sealed_call(&keyring, key.key_id());
+        let result = Outcome::Result(Value::text("answer"));
+        let reply = answered(&signer, &request, Some(&sealing), result).unwrap();
+        assert!(reply.get("reply").is_some(), "{reply:?}");
+    }
 }

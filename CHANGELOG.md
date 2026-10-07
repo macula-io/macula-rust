@@ -34,6 +34,12 @@ usually touches both, but their version numbers don't move in lockstep.
   and macula-go do; `Request::caller` and `Stream::request().caller`, as
   verified, are the only caller a handler learns. Any other payload is
   untouched.
+- A provider's sealed answer has no panic path (#14). A sealed ERROR that
+  does not sign is answered `unavailable` in the clear, from the closed set,
+  as one that cannot be sealed already was; a reply that does not sign at
+  all leaves the request unanswered and is counted `unsignable_reply`. A
+  sealed RESULT that does not sign is `unknown_error` (sealed); only one
+  over the frame cap is `payload_too_large`.
 
 ### [0.7.0] - 2026-10-06
 
