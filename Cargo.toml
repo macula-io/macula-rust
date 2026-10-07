@@ -28,8 +28,8 @@ too_many_lines = "deny"
 sha2 = "0.11"
 quinn = "0.11"
 # The key exchange for every connection this crate dials: every TLS
-# configuration starts from macula-pqc's client_builder(), which offers
-# SecP384r1MLKEM1024 then SecP256r1MLKEM768 and nothing classical, and whose
+# configuration starts from macula-pqc's provider, narrowed to
+# SecP384r1MLKEM1024 alone (nothing classical is in it), and its
 # KeyPossessionVerifier accepts one ML-DSA-87 station certificate. So rustls
 # selects no crypto provider of its own here. See transport.rs.
 macula-pqc = "0.3"

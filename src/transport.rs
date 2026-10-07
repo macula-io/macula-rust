@@ -1,8 +1,15 @@
 //! Dialing a macula 12 station over QUIC, as macula-go's `transport` does.
 //!
-//! Raw QUIC (RFC 9000) with the ALPN `"macula"`, TLS 1.3 only, and the key
-//! exchange macula-pqc fixes: SecP384r1MLKEM1024, then SecP256r1MLKEM768, and
-//! nothing classical. A station's certificate is self-signed, so it is not
+//! Raw QUIC (RFC 9000) with the ALPN `"macula"`, TLS 1.3 only, and one key
+//! exchange group: SecP384r1MLKEM1024 (ML-KEM-1024, NIST category 5), as
+//! macula-go offers since 0.23.0. macula-pqc's provider also carries
+//! SecP256r1MLKEM768 for peers that still lead with it; a dial keeps only
+//! SecP384r1MLKEM1024 from it. Offering one group is what refuses every
+//! other: rustls aborts a handshake whose ServerHello or HelloRetryRequest
+//! names a group the client did not offer (RFC 8446, 4.1.3 and 4.1.4), and a
+//! station that has no SecP384r1MLKEM1024 fails the handshake itself. The
+//! negotiated group cannot be read back afterwards: quinn 0.11 reports it
+//! only under a private test feature (macula-rust#18). A station's certificate is self-signed, so it is not
 //! checked against a CA: macula-pqc's [`KeyPossessionVerifier`] accepts
 //! exactly one certificate whose key is ML-DSA-87, then the station's
 //! handshake signature under that key. That proves the station holds the key,
@@ -68,8 +75,9 @@ pub enum DialError {
     Config(String),
     /// The connection could not be started.
     Connect(quinn::ConnectError),
-    /// The QUIC or TLS handshake failed, the station's certificate among the
-    /// reasons: not exactly one, or not an ML-DSA-87 key.
+    /// The QUIC or TLS handshake failed. Among the reasons: the station's
+    /// certificate (not exactly one, or not an ML-DSA-87 key), and a station
+    /// that does not agree on SecP384r1MLKEM1024.
     Connection(quinn::ConnectionError),
     /// The station presented no certificate the connection could hand back.
     NoLeaf,
@@ -91,7 +99,7 @@ impl std::fmt::Display for DialError {
 
 impl std::error::Error for DialError {}
 
-/// Dials `target`: QUIC and TLS 1.3 with the post-quantum key exchange,
+/// Dials `target`: QUIC and TLS 1.3 with SecP384r1MLKEM1024 alone,
 /// the station's certificate checked for an ML-DSA-87 key it holds.
 pub async fn dial_target(target: &Target) -> Result<Dialed, DialError> {
     if target.expected_node_id == [0u8; 32] {
@@ -151,11 +159,35 @@ fn client_config() -> Result<ClientConfig, DialError> {
     Ok(config)
 }
 
-/// The rustls half of a dial: macula-pqc's client builder, its key possession
-/// verifier, the ALPN, and no session resumption.
+/// SecP384r1MLKEM1024's code point, the one key exchange group a dial offers.
+const SECP384R1MLKEM1024: rustls::NamedGroup = rustls::NamedGroup::Unknown(0x11ED);
+
+/// The rustls half of a dial: macula-pqc's provider narrowed to
+/// SecP384r1MLKEM1024, its key possession verifier, the ALPN, and no session
+/// resumption.
 pub(crate) fn tls_client_config() -> Result<rustls::ClientConfig, DialError> {
     let verifier = KeyPossessionVerifier::new();
-    let mut config = macula_pqc::client_builder()
+    let pqc = macula_pqc::client_builder();
+    let kx_groups: Vec<_> = pqc
+        .crypto_provider()
+        .kx_groups
+        .iter()
+        .copied()
+        .filter(|group| group.name() == SECP384R1MLKEM1024)
+        .collect();
+    if kx_groups.len() != 1 {
+        return Err(DialError::Config(format!(
+            "macula-pqc's provider carries {} SecP384r1MLKEM1024 groups, not 1",
+            kx_groups.len()
+        )));
+    }
+    let provider = rustls::crypto::CryptoProvider {
+        kx_groups,
+        ..(**pqc.crypto_provider()).clone()
+    };
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| DialError::Config(e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
@@ -257,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dial_offers_exactly_macula_pqcs_groups() {
+    fn a_dial_offers_secp384r1mlkem1024_alone() {
         let config = tls_client_config().expect("a configuration");
         let offered: Vec<NamedGroup> = config
             .crypto_provider()
@@ -265,10 +297,51 @@ mod tests {
             .iter()
             .map(|g| g.name())
             .collect();
-        assert_eq!(
-            offered,
-            vec![SECP384R1MLKEM1024, NamedGroup::secp256r1MLKEM768]
-        );
+        assert_eq!(offered, vec![SECP384R1MLKEM1024]);
+    }
+
+    /// A station that offers SecP256r1MLKEM768 alone, signing with ML-DSA-87
+    /// as a macula station does: everything about it is acceptable except
+    /// its key exchange group.
+    fn station_on_group(group: NamedGroup) -> (quinn::Endpoint, u16) {
+        let (certificate, key) = mldsa_certificate();
+        let pqc = macula_pqc::server_builder();
+        let provider = CryptoProvider {
+            kx_groups: pqc
+                .crypto_provider()
+                .kx_groups
+                .iter()
+                .copied()
+                .filter(|g| g.name() == group)
+                .collect(),
+            ..(**pqc.crypto_provider()).clone()
+        };
+        assert_eq!(provider.kx_groups.len(), 1, "macula-pqc offers {group:?}");
+        let config = ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate], key)
+            .expect("a station configuration");
+        station(config, ALPN)
+    }
+
+    #[tokio::test]
+    async fn a_station_that_offers_only_secp256r1mlkem768_is_refused() {
+        let (_station, port) = station_on_group(NamedGroup::secp256r1MLKEM768);
+        assert!(matches!(
+            dial_target(&target(port)).await,
+            Err(DialError::Connection(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_station_that_offers_only_secp384r1mlkem1024_is_reached() {
+        let (_station, port) = station_on_group(SECP384R1MLKEM1024);
+        let dialed = dial_target(&target(port))
+            .await
+            .expect("the station is reached");
+        dialed.connection.close(0u32.into(), b"done");
     }
 
     #[tokio::test]

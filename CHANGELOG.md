@@ -13,6 +13,19 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [Unreleased]
+
+#### Changed
+
+- A dial offers SecP384r1MLKEM1024 (ML-KEM-1024, NIST category 5) alone,
+  as macula-go does since 0.23.0 (#18). 0.7.0 also offered
+  SecP256r1MLKEM768, so a station or path that answered only for it got a
+  category 3 exchange. Offering one group is what refuses every other:
+  rustls aborts a handshake whose server names a group the client did not
+  offer, and a station without SecP384r1MLKEM1024 fails the handshake as
+  `DialError::Connection`. The negotiated group is not read back after the
+  handshake: quinn 0.11 reports it only under a private test feature.
+
 ### [0.7.0] - 2026-10-06
 
 macula 13's end-to-end sealing on both sides, and the caller's seal report.
