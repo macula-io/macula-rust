@@ -15,7 +15,7 @@
 //! - **mobile**: the platform's secure store, through [`KeyringStore`].
 //!
 //! Every store keeps the key's private part only, in one write: the
-//! ML-DSA-87 seed, and in pq_hybrid the RSA-PSS key as PKCS #1, at most 2,429
+//! ML-DSA-87 seed, and in pq_hybrid the RSA-PSS key as PKCS #1, at most 2,431
 //! bytes, within Credential Manager's 2,560-byte limit on one secret. The
 //! public keys are derived again on load. A key kept by macula-rust 0.7.0, in
 //! the key-file form, no longer loads; create the identity again.
@@ -106,21 +106,38 @@ pub trait KeyStore {
 }
 
 /// The default [`KeyStore`]: the platform-native secure store `keyring`
-/// selects for the current target (see this module's own doc). `service`
+/// selects for the current target (see this module's own doc). On Windows a
+/// Credential Manager credential persisted on this machine only
+/// (CRED_PERSIST_LOCAL_MACHINE): the default, Enterprise persistence, roams
+/// with a domain user's profile, and a node's key does not leave the node
+/// (macula-rust#19). `service`
 /// and `account` are the same two strings every `keyring` consumer already
 /// uses to address one credential — pick values scoped to this
 /// application, e.g. `("com.example.myapp", "macula-identity")`, since the
 /// underlying stores are shared OS-wide facilities, not sandboxed to this
 /// crate.
 pub struct KeyringStore {
-    entry: Entry,
+    entry: keyring_core::Entry,
 }
 
 impl KeyringStore {
+    #[cfg(not(windows))]
     pub fn new(service: &str, account: &str) -> Result<Self, KeyStoreError> {
         Ok(Self {
-            entry: Entry::new(service, account)?,
+            entry: Entry::new(service, account)?.inner,
         })
+    }
+
+    /// Built against Windows Credential Manager directly, persisted on this
+    /// machine only, not through `keyring`'s default store.
+    #[cfg(windows)]
+    pub fn new(service: &str, account: &str) -> Result<Self, KeyStoreError> {
+        use keyring_core::api::CredentialStoreApi;
+
+        let local = std::collections::HashMap::from([("persistence", "local")]);
+        let store = windows_native_keyring_store::Store::new()?;
+        let entry = store.build(service, account, Some(&local))?;
+        Ok(Self { entry })
     }
 }
 
@@ -133,7 +150,7 @@ impl KeyStore for KeyringStore {
     fn load_key(&self) -> Result<Zeroizing<Vec<u8>>, KeyStoreError> {
         match self.entry.get_secret() {
             Ok(secret) => Ok(Zeroizing::new(secret)),
-            Err(keyring::Error::NoEntry) => Err(KeyStoreError::NotFound),
+            Err(keyring_core::Error::NoEntry) => Err(KeyStoreError::NotFound),
             Err(e) => Err(e.into()),
         }
     }
@@ -141,7 +158,7 @@ impl KeyStore for KeyringStore {
     fn delete_key(&self) -> Result<(), KeyStoreError> {
         match self.entry.delete_credential() {
             Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -324,6 +341,7 @@ mod tests {
             assert_eq!(loaded.public_key(), key.public_key(), "{profile:?}");
         }
         let path = std::env::temp_dir().join("macula-rust-test-key");
+        let _ = std::fs::remove_file(&path);
         let refused = NodeKey::load_or_create(&path, Profile::PqPure);
         assert!(matches!(refused, Err(KeyFileError::NoKeyFile)));
         assert!(!path.exists(), "no key file written");

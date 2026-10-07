@@ -1243,6 +1243,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "windows-native-keyring-store",
 ]
 
 [[package]]

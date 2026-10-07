@@ -1,7 +1,8 @@
 //! A node's identity key: made in either profile with the admission puzzle
-//! solved, and kept in an owner-only key file or the platform's secure
-//! store (Keychain on iOS, the Android Keystore; see
-//! [`macula_rust::keystore`] for the one-time Android setup).
+//! solved, and kept in an owner-only key file (unix only) or the platform's
+//! secure store (Keychain on iOS, the Android Keystore, Credential Manager on
+//! Windows, where a key file is refused; see [`macula_rust::keystore`] for the
+//! one-time Android setup).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -106,7 +107,9 @@ impl FfiNodeKey {
         Ok(Arc::new(FfiNodeKey(Arc::new(key))))
     }
 
-    /// Writes the key to an owner-only key file at `path`.
+    /// Writes the key to an owner-only key file at `path`. Unix only: on
+    /// Windows it is refused, and the key goes to Credential Manager with
+    /// [`save_to_keystore`](Self::save_to_keystore).
     pub fn save(&self, path: String) -> Result<(), FfiError> {
         Ok(self.0.save(Path::new(&path))?)
     }

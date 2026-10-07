@@ -71,6 +71,15 @@ keyring = { version = "4", features = ["android-native-keyring-store"] }
 keyring-core = "1"
 linux-keyutils-keyring-store = "1"
 
+# Windows: KeyringStore builds its Credential Manager credential directly
+# against windows-native-keyring-store, persisted on this machine only
+# (persistence=local), since keyring's v1::Entry takes the store's default,
+# Enterprise, which roams with a domain profile (#19). Same "1" constraints
+# keyring 4.2.0 uses, so both resolve to one crate instance.
+[target.'cfg(windows)'.dependencies]
+keyring-core = "1"
+windows-native-keyring-store = "1"
+
 # Unifies apple-native-keyring-store's `protected` feature into the same
 # optional dependency keyring (v1, above) already pulls in for
 # cfg(any(macos, ios)) -- see the comment on the main `keyring` line.

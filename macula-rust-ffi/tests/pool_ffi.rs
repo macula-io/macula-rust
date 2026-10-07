@@ -89,6 +89,7 @@ impl FfiStreamHandler for Chunks {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_node_key_is_made_in_either_profile_and_survives_its_key_file() {
     let dir = tempfile::tempdir().unwrap();

@@ -27,6 +27,9 @@ const MAGIC: &[u8] = b"macula-node-key-seed-v1\0";
 /// ML-DSA-87 public key alone exceeds.
 const STORE_MAGIC: &[u8] = b"macula-node-key-private-v1\0";
 
+/// More than the longest layout, a pq_hybrid key file.
+const LAYOUT_CAPACITY: usize = 8 * 1024;
+
 /// Which layout a key is read or written in: a key file's, with its public
 /// keys, or a key store's, with none.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -132,7 +135,7 @@ impl From<std::io::Error> for KeyFileError {
 impl NodeKey {
     /// Keeps the key in `store` in one write, as its private part only: the
     /// ML-DSA-87 seed, and in pq_hybrid the RSA-PSS key as PKCS #1, at most
-    /// 2,429 bytes, within Windows Credential Manager's 2,560 (see
+    /// 2,431 bytes, within Windows Credential Manager's 2,560 (see
     /// `crate::keystore`). The public keys are derived again on load.
     pub fn save_to_keystore(&self, store: &dyn KeyStore) -> Result<(), KeyFileError> {
         store
@@ -160,13 +163,13 @@ impl NodeKey {
     }
 
     /// The key laid out as a key file.
-    pub(super) fn file_bytes(&self) -> Result<Vec<u8>, KeyFileError> {
+    pub(super) fn file_bytes(&self) -> Result<Zeroizing<Vec<u8>>, KeyFileError> {
         self.laid_out(Form::File)
     }
 
     /// The key laid out in `form`: a key store's leaves every public key
-    /// empty.
-    fn laid_out(&self, form: Form) -> Result<Vec<u8>, KeyFileError> {
+    /// empty. It holds the private keys, so it is wiped when dropped.
+    fn laid_out(&self, form: Form) -> Result<Zeroizing<Vec<u8>>, KeyFileError> {
         let (magic, with_public) = match form {
             Form::File => (MAGIC, true),
             Form::Store => (STORE_MAGIC, false),
@@ -177,7 +180,10 @@ impl NodeKey {
                 false => Vec::new(),
             }
         };
-        let mut out = magic.to_vec();
+        // Room for the longest layout (a pq_hybrid key file, about 5.6 KiB),
+        // so no growth leaves an unwiped copy of the private keys behind.
+        let mut out = Zeroizing::new(Vec::with_capacity(LAYOUT_CAPACITY));
+        out.extend_from_slice(magic);
         out.extend([
             purpose_tag(self.purpose),
             profile_tag(self.profile),
