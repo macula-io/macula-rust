@@ -248,19 +248,7 @@ impl StatementIssuer {
         on_error: impl Fn(IssuerError) + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
         let weak = Arc::downgrade(&self.state);
-        tokio::spawn(async move {
-            let mut ticks =
-                tokio::time::interval(std::time::Duration::from_millis(STATEMENT_EVERY_MS as u64));
-            ticks.tick().await;
-            loop {
-                ticks.tick().await;
-                let Some(state) = weak.upgrade() else { return };
-                let issuer = StatementIssuer { state };
-                if let Err(e) = issuer.tick() {
-                    on_error(e);
-                }
-            }
-        })
+        tokio::spawn(tick_until_dropped(weak, on_error))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -286,48 +274,33 @@ impl State {
     }
 
     fn rotate(&mut self, now: i64) -> Result<(), IssuerError> {
-        match self.rotate_connect(now) {
-            Ok(()) => {
-                self.rotation_failures = 0;
-                Ok(())
-            }
-            Err(e) => {
-                self.rotation_failures += 1;
-                let left = self
-                    .bindings
-                    .get(&self.current)
-                    .map_or(0, |b| b.not_after - now);
-                if left < ROTATION_MARGIN_MS {
-                    return Err(IssuerError::RotationOverdue {
-                        failures: self.rotation_failures,
-                        left_ms: left,
-                    });
-                }
-                Err(e)
-            }
+        let Err(e) = self.rotate_connect(now) else {
+            self.rotation_failures = 0;
+            return Ok(());
+        };
+        self.rotation_failures += 1;
+        let left = self
+            .bindings
+            .get(&self.current)
+            .map_or(0, |b| b.not_after - now);
+        if left < ROTATION_MARGIN_MS {
+            return Err(IssuerError::RotationOverdue {
+                failures: self.rotation_failures,
+                left_ms: left,
+            });
         }
+        Err(e)
     }
 
     fn reissue(&mut self, now: i64) -> Result<(), IssuerError> {
         let mut first_error = Ok(());
-        for (hash, held) in self.bindings.iter_mut() {
-            if held.not_after < now {
-                continue;
-            }
-            match status_statement(&self.identity, &held.binding, now, now + STATEMENT_VALID_MS) {
-                Ok(statement) => {
-                    held.statement = statement.clone();
-                    held.stated_at = now;
-                    for slot in self.subscribers.get(hash).into_iter().flatten() {
-                        deliver(slot, statement.clone());
-                    }
-                }
-                Err(e) => {
-                    if first_error.is_ok() {
-                        first_error = Err(e.into());
-                    }
-                }
-            }
+        let unexpired = self
+            .bindings
+            .iter_mut()
+            .filter(|(_, held)| held.not_after >= now);
+        for (hash, held) in unexpired {
+            let stated = restate(&self.identity, &self.subscribers, hash, held, now);
+            first_error = first_error.and_then(|()| stated.map_err(IssuerError::from));
         }
         first_error
     }
@@ -340,12 +313,18 @@ impl State {
             .map(|(h, _)| *h)
             .collect();
         for hash in expired {
-            for slot in self.subscribers.remove(&hash).into_iter().flatten() {
-                close(&slot);
-            }
-            if hash != self.current {
-                self.bindings.remove(&hash);
-            }
+            self.let_go(hash);
+        }
+    }
+
+    /// Closes an expired binding's subscriptions and forgets the binding,
+    /// unless it is still the current one.
+    fn let_go(&mut self, hash: [u8; 48]) {
+        for slot in self.subscribers.remove(&hash).into_iter().flatten() {
+            close(&slot);
+        }
+        if hash != self.current {
+            self.bindings.remove(&hash);
         }
     }
 
@@ -372,6 +351,40 @@ impl State {
         self.current = hash;
         Ok(())
     }
+}
+
+/// Ticks every 15 minutes while some handle still holds the issuer's state,
+/// handing a failed tick's error to `on_error`.
+async fn tick_until_dropped(weak: Weak<Mutex<State>>, on_error: impl Fn(IssuerError)) {
+    let mut ticks =
+        tokio::time::interval(std::time::Duration::from_millis(STATEMENT_EVERY_MS as u64));
+    ticks.tick().await;
+    loop {
+        ticks.tick().await;
+        let Some(state) = weak.upgrade() else { return };
+        let issuer = StatementIssuer { state };
+        if let Err(e) = issuer.tick() {
+            on_error(e);
+        }
+    }
+}
+
+/// Issues a new statement for one binding in force, keeps it as the newest,
+/// and hands it to the binding's subscribers.
+fn restate(
+    identity: &NodeKey,
+    subscribers: &HashMap<[u8; 48], Vec<Arc<Slot>>>,
+    hash: &[u8; 48],
+    held: &mut StatedBinding,
+    now: i64,
+) -> Result<(), BindingError> {
+    let statement = status_statement(identity, &held.binding, now, now + STATEMENT_VALID_MS)?;
+    held.statement = statement.clone();
+    held.stated_at = now;
+    for slot in subscribers.get(hash).into_iter().flatten() {
+        deliver(slot, statement.clone());
+    }
+    Ok(())
 }
 
 fn deliver(slot: &Slot, statement: SignedTbs) {
