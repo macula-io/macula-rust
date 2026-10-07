@@ -118,20 +118,12 @@ impl Pool {
         }
         let mut errors = Vec::new();
         for link in &links {
-            if let Err(e) = served.serve_on(link).await {
-                errors.push(e);
-            }
+            errors.extend(served.serve_on(link).await.err());
         }
         if errors.len() == links.len() {
             return Err(PoolError::NotServed(errors));
         }
-        {
-            let mut state = self.inner.lock();
-            if state.closed {
-                return Err(PoolError::Closed);
-            }
-            state.served.insert(served.id, served.clone());
-        }
+        self.inner.hold_served(&served)?;
         for link in self.inner.links() {
             served.attach(link);
         }
@@ -140,6 +132,17 @@ impl Pool {
 }
 
 impl PoolInner {
+    /// Keeps `served` among the procedures replayed on every new link;
+    /// [`PoolError::Closed`] on a closed pool.
+    fn hold_served(&self, served: &Arc<ServedInner>) -> Result<(), PoolError> {
+        let mut state = self.lock();
+        if state.closed {
+            return Err(PoolError::Closed);
+        }
+        state.served.insert(served.id, served.clone());
+        Ok(())
+    }
+
     /// Gives a new link the node's subscriptions, then its served
     /// procedures, as macula's pool replays them on a respawned link.
     pub(super) async fn replay(&self, link: &Link) {
@@ -165,19 +168,13 @@ impl Served {
         if let Some(pool) = self.inner.pool.upgrade() {
             pool.lock().served.remove(&self.inner.id);
         }
-        let on_links = {
-            let mut held = self.inner.lock();
-            if held.stopped {
-                return Ok(());
-            }
-            held.stopped = true;
-            std::mem::take(&mut held.on_links)
+        let Some(on_links) = self.inner.mark_stopped() else {
+            return Ok(());
         };
         let mut result = Ok(());
         for on_link in on_links.into_values() {
-            if let Err(e) = on_link.stop().await {
-                result = Err(e);
-            }
+            // The last link's failure is the one returned.
+            result = on_link.stop().await.and(result);
         }
         result
     }
@@ -188,54 +185,83 @@ impl ServedInner {
         self.held.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Marks the offer stopped and hands back its serving on each link to
+    /// withdraw; nothing when it was stopped already.
+    fn mark_stopped(&self) -> Option<HashMap<u64, station_link::Served>> {
+        let mut held = self.lock();
+        if held.stopped {
+            return None;
+        }
+        held.stopped = true;
+        Some(std::mem::take(&mut held.on_links))
+    }
+
+    /// Whether `link` needs no serving of the offer: it is stopped, or
+    /// already served there.
+    fn needs_no_serving(&self, link: &Link) -> bool {
+        let held = self.lock();
+        held.stopped || held.on_links.contains_key(&link.serial())
+    }
+
+    /// Holds the offer's serving on `link` and watches it there, unless the
+    /// offer was stopped meanwhile: then the serving is handed back to be
+    /// withdrawn.
+    fn hold_on_link(
+        self: &Arc<Self>,
+        link: &Link,
+        on_link: station_link::Served,
+    ) -> Option<station_link::Served> {
+        let mut held = self.lock();
+        if held.stopped {
+            return Some(on_link);
+        }
+        held.on_links.insert(link.serial(), on_link.clone());
+        drop(held);
+        tokio::spawn(watch(self.clone(), link.clone(), on_link));
+        None
+    }
+
     fn respawn_delay(&self) -> Option<Duration> {
         self.pool.upgrade().map(|p| p.opts.respawn_delay)
     }
 
     /// Serves the offer on `link`, once, and watches it there.
     async fn serve_on(self: &Arc<Self>, link: &Link) -> Result<(), LinkError> {
-        {
-            let held = self.lock();
-            if held.stopped || held.on_links.contains_key(&link.serial()) {
-                return Ok(());
-            }
+        if self.needs_no_serving(link) {
+            return Ok(());
         }
         let on_link = match link.serve(self.offer.clone()).await {
             Err(LinkError::AlreadyServed) => return Ok(()),
             other => other?,
         };
-        {
-            let mut held = self.lock();
-            if !held.stopped {
-                held.on_links.insert(link.serial(), on_link.clone());
-                drop(held);
-                tokio::spawn(watch(self.clone(), link.clone(), on_link));
-                return Ok(());
-            }
-        }
-        on_link.stop().await
+        let Some(stopped_meanwhile) = self.hold_on_link(link, on_link) else {
+            return Ok(());
+        };
+        stopped_meanwhile.stop().await
     }
 
     /// Serves the offer on a link the pool dialed, trying again every
     /// respawn delay while the link lives and the offer is not served there.
     pub(super) fn attach(self: &Arc<Self>, link: Link) {
-        let served = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let outcome =
-                    tokio::time::timeout(DEFAULT_CALL_TIMEOUT, served.serve_on(&link)).await;
-                if matches!(outcome, Ok(Ok(()))) {
-                    return;
-                }
-                let Some(delay) = served.respawn_delay() else {
-                    return;
-                };
-                tokio::select! {
-                    _ = link.done() => return,
-                    _ = tokio::time::sleep(delay) => {}
-                }
-            }
-        });
+        tokio::spawn(serve_while_linked(self.clone(), link));
+    }
+}
+
+/// Serves the offer on `link` until it is served there, trying again every
+/// respawn delay while the link lives and the pool does.
+async fn serve_while_linked(served: Arc<ServedInner>, link: Link) {
+    loop {
+        let outcome = tokio::time::timeout(DEFAULT_CALL_TIMEOUT, served.serve_on(&link)).await;
+        if matches!(outcome, Ok(Ok(()))) {
+            return;
+        }
+        let Some(delay) = served.respawn_delay() else {
+            return;
+        };
+        tokio::select! {
+            _ = link.done() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
     }
 }
 

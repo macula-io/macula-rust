@@ -30,6 +30,7 @@ use crate::station_link::{
 };
 use crate::transport::Target;
 
+use super::member::Member;
 use super::{Pool, PoolError, PoolInner};
 
 /// No candidate gets less than a second of a call's time.
@@ -169,29 +170,9 @@ impl Pool {
         };
         let candidates = bounded(deadline, inner.candidates(&key, realm_key)).await?;
         let candidates = callable(candidates, c.confidential)?;
-        let mut tried = Vec::new();
-        let count = candidates.len();
-        for (i, cand) in candidates.into_iter().enumerate() {
-            match inner
-                .reach(&cand, candidate_share(deadline, count - i))
-                .await
-            {
-                Ok(link) => {
-                    let outcome =
-                        bounded(deadline, inner.call_at(&link, &cand, &c, deadline)).await;
-                    return inner.settled(key, cand, outcome);
-                }
-                Err(PoolError::Closed) => return Err(PoolError::Closed),
-                Err(e) => {
-                    inner.forget(&key);
-                    tried.push((cand.provider, e));
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(PoolError::NoProvider(tried))
+        let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
+        let outcome = bounded(deadline, inner.call_at(&link, &cand, &c, deadline)).await;
+        inner.settled(key, cand, outcome)
     }
 
     /// Every provider whose advertisement of `procedure` in `realm` the
@@ -228,28 +209,9 @@ impl Pool {
         };
         let candidates = bounded(deadline, inner.candidates(&key, realm_key)).await?;
         let candidates = callable(candidates, c.confidential)?;
-        let mut tried = Vec::new();
-        let count = candidates.len();
-        for (i, cand) in candidates.into_iter().enumerate() {
-            match inner
-                .reach(&cand, candidate_share(deadline, count - i))
-                .await
-            {
-                Ok(link) => {
-                    let outcome = bounded(deadline, inner.open_at(&link, &cand, &c)).await;
-                    return inner.settled(key, cand, outcome);
-                }
-                Err(PoolError::Closed) => return Err(PoolError::Closed),
-                Err(e) => {
-                    inner.forget(&key);
-                    tried.push((cand.provider, e));
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(PoolError::NoProvider(tried))
+        let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
+        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c)).await;
+        inner.settled(key, cand, outcome)
     }
 
     /// Where `station` is dialed, from the station_endpoint record the
@@ -318,11 +280,11 @@ impl PoolInner {
         realm_key: Option<Vec<u8>>,
     ) -> Result<Vec<Candidate>, PoolError> {
         let remembered = self.lock().remember.get(key).cloned();
-        if let Some(cand) = remembered {
-            if cand.expires_at as i64 > now_ms() && self.linked_to(&cand.provider.station).is_some()
-            {
-                return Ok(vec![cand]);
-            }
+        let live = remembered.filter(|cand| {
+            cand.expires_at as i64 > now_ms() && self.linked_to(&cand.provider.station).is_some()
+        });
+        if let Some(cand) = live {
+            return Ok(vec![cand]);
         }
         self.resolve(key, realm_key).await
     }
@@ -346,24 +308,7 @@ impl PoolInner {
         let mut out: Vec<Candidate> = found
             .iter()
             .filter(|v| v.record().record_type == RecordType::PROCEDURE_ADVERTISEMENT)
-            .filter_map(|v| {
-                let ad = record::read_procedure_advertisement(v.record()).ok()?;
-                let wanted = ad.realm_id == key.realm
-                    && ad.procedure == key.procedure
-                    && (key.provider == [0; 32] || ad.advertiser_node == key.provider);
-                if !wanted || record::verify_authorization(v, &trust, now).is_err() {
-                    return None;
-                }
-                Some(Candidate {
-                    provider: Provider {
-                        node: ad.advertiser_node,
-                        station: ad.serving_station,
-                    },
-                    expires_at: v.record().expires_at,
-                    created_at: v.record().created_at,
-                    kem_key: ad.kem_key.map(|(key, _)| key),
-                })
-            })
+            .filter_map(|v| trusted_candidate(v, key, &trust, now))
             .collect();
         if out.is_empty() {
             return Err(PoolError::NoProvider(Vec::new()));
@@ -458,28 +403,11 @@ impl PoolInner {
         if let Some(link) = self.linked_to(station) {
             return Ok(link);
         }
-        let (existing, direct) = {
-            let state = self.lock();
-            if state.closed {
-                return Err(PoolError::Closed);
-            }
-            let existing = state
-                .members
-                .iter()
-                .find(|m| m.target.expected_node_id == *station)
-                .cloned();
-            (existing, state.members.iter().filter(|m| m.direct).count())
-        };
+        let (existing, direct) = self.member_for(station)?;
         let fresh = existing.is_none();
         let member = match existing {
             Some(m) => m,
-            None => {
-                if direct >= self.opts.max_direct_links {
-                    return Err(PoolError::DirectLinksFull);
-                }
-                let target = bounded(deadline, self.station_target(station)).await?;
-                self.start_member(target, true)
-            }
+            None => self.start_direct(station, direct, deadline).await?,
         };
         if let Some(link) = member.await_up(deadline, fresh).await {
             return Ok(link);
@@ -491,6 +419,36 @@ impl PoolInner {
             station: *station,
             cause: member.last_error(),
         })
+    }
+
+    /// The member already linking to `station`, if any, and how many direct
+    /// links the pool holds; [`PoolError::Closed`] on a closed pool.
+    fn member_for(&self, station: &[u8; 32]) -> Result<(Option<Arc<Member>>, usize), PoolError> {
+        let state = self.lock();
+        if state.closed {
+            return Err(PoolError::Closed);
+        }
+        let existing = state
+            .members
+            .iter()
+            .find(|m| m.target.expected_node_id == *station)
+            .cloned();
+        Ok((existing, state.members.iter().filter(|m| m.direct).count()))
+    }
+
+    /// Starts a direct link to `station`, at the address its own endpoint
+    /// record names, when fewer than `max_direct_links` are held.
+    async fn start_direct(
+        self: &Arc<Self>,
+        station: &[u8; 32],
+        direct: usize,
+        deadline: Instant,
+    ) -> Result<Arc<Member>, PoolError> {
+        if direct >= self.opts.max_direct_links {
+            return Err(PoolError::DirectLinksFull);
+        }
+        let target = bounded(deadline, self.station_target(station)).await?;
+        Ok(self.start_member(target, true))
     }
 
     async fn station_target(&self, station: &[u8; 32]) -> Result<Target, PoolError> {
@@ -540,6 +498,64 @@ impl PoolInner {
         }
         Err(PoolError::NoLink(errors))
     }
+}
+
+/// The first of `candidates` whose serving station is reached within its
+/// share of `deadline`, and the link to it; nothing is sent. A candidate not
+/// reached is forgotten and named in [`PoolError::NoProvider`], and none is
+/// tried once `deadline` has passed.
+async fn first_reached(
+    inner: &Arc<PoolInner>,
+    key: &ResolvedKey,
+    candidates: Vec<Candidate>,
+    deadline: Instant,
+) -> Result<(Link, Candidate), PoolError> {
+    let mut tried = Vec::new();
+    let count = candidates.len();
+    for (i, cand) in candidates.into_iter().enumerate() {
+        match inner
+            .reach(&cand, candidate_share(deadline, count - i))
+            .await
+        {
+            Ok(link) => return Ok((link, cand)),
+            Err(PoolError::Closed) => return Err(PoolError::Closed),
+            Err(e) => {
+                inner.forget(key);
+                tried.push((cand.provider, e));
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+    }
+    Err(PoolError::NoProvider(tried))
+}
+
+/// The candidate an advertisement under `key`'s slot makes, when it is one
+/// of `key`'s procedure (by `key.provider` when it is set) and `trust`
+/// authorizes it at `now`.
+fn trusted_candidate(
+    v: &Verified,
+    key: &ResolvedKey,
+    trust: &Trust,
+    now: i64,
+) -> Option<Candidate> {
+    let ad = record::read_procedure_advertisement(v.record()).ok()?;
+    let wanted = ad.realm_id == key.realm
+        && ad.procedure == key.procedure
+        && (key.provider == [0; 32] || ad.advertiser_node == key.provider);
+    if !wanted || record::verify_authorization(v, trust, now).is_err() {
+        return None;
+    }
+    Some(Candidate {
+        provider: Provider {
+            node: ad.advertiser_node,
+            station: ad.serving_station,
+        },
+        expires_at: v.record().expires_at,
+        created_at: v.record().created_at,
+        kem_key: ad.kem_key.map(|(key, _)| key),
+    })
 }
 
 /// A failure of the link to carry a request, as opposed to the station's

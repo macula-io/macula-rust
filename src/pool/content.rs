@@ -249,19 +249,7 @@ impl PoolInner {
         }
         let pool = Arc::downgrade(self);
         let r = *realm;
-        let answer = stream_handler(move |s| {
-            let pool = pool.clone();
-            async move {
-                match pool.upgrade() {
-                    Some(inner) => inner.answer_fetch(&r, &s).await,
-                    None => {
-                        s.abort("not_shared", "the node no longer shares content")
-                            .await
-                    }
-                }
-                .map_err(|e| e.to_string())
-            }
-        });
+        let answer = stream_handler(move |s| answer_fetch_while_pooled(pool.clone(), r, s));
         let procedure = record::own_procedure(&self.self_id, CONTENT_PROCEDURE);
         let served = Pool {
             inner: self.clone(),
@@ -325,11 +313,7 @@ impl PoolInner {
         let mut realms = self.content.lock();
         let shared = realms.get_mut(realm)?;
         if let Some(Root::Chunked(m)) = shared.roots.remove(mcid) {
-            for i in 0..m.chunks.len() {
-                if let Some(c) = chunk_mcid(&m, i) {
-                    shared.chunks.remove(&c);
-                }
-            }
+            forget_chunks(&mut shared.chunks, &m);
         }
         shared.announcements.remove(mcid)
     }
@@ -423,11 +407,8 @@ impl PoolInner {
             .await?;
         let (kind, body) = fetch_one(&link, realm, s, mcid, "root", opts.chunk_timeout).await?;
         if kind == "block" {
-            let bytes = wire_bytes(&body, "bytes").unwrap_or_default();
-            if block_mcid(&bytes) != *mcid {
-                return Err(PoolError::ContentMismatch("the block".into()));
-            }
-            return Ok(bytes);
+            return verified_block(&body, mcid)
+                .ok_or_else(|| PoolError::ContentMismatch("the block".into()));
         }
         let m = manifest::from_wire(body.get("manifest").unwrap_or(&Value::Null))
             .map_err(|e| PoolError::ContentReply(format!("the manifest: {e}")))?;
@@ -468,6 +449,38 @@ impl SharedRealm {
             ])),
         }
     }
+}
+
+/// Answers one fetch of `realm`'s content while the pool lives, and refuses
+/// it as not shared once the pool is gone.
+async fn answer_fetch_while_pooled(
+    pool: Weak<PoolInner>,
+    realm: [u8; 32],
+    s: Stream,
+) -> Result<(), String> {
+    match pool.upgrade() {
+        Some(inner) => inner.answer_fetch(&realm, &s).await,
+        None => {
+            s.abort("not_shared", "the node no longer shares content")
+                .await
+        }
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Drops every chunk of `m` from a realm's shared chunks.
+fn forget_chunks(chunks: &mut HashMap<Mcid, Vec<u8>>, m: &Manifest) {
+    for i in 0..m.chunks.len() {
+        if let Some(c) = chunk_mcid(m, i) {
+            chunks.remove(&c);
+        }
+    }
+}
+
+/// A block body's bytes, when they are the block `mcid` names.
+fn verified_block(body: &Value, mcid: &Mcid) -> Option<Vec<u8>> {
+    let bytes = wire_bytes(body, "bytes").unwrap_or_default();
+    (block_mcid(&bytes) == *mcid).then_some(bytes)
 }
 
 /// Signs `mcid`'s announcement again at half its lifetime, naming the
@@ -518,48 +531,16 @@ async fn fetch_chunks(
     let failed_tx = Arc::new(failed_tx);
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..opts.parallel.max(1).min(count) {
-        let (link, s, m, parts, next, failed_tx) = (
-            link.clone(),
-            s.clone(),
-            m.clone(),
-            parts.clone(),
-            next.clone(),
-            failed_tx.clone(),
-        );
-        let timeout = opts.chunk_timeout;
-        workers.spawn(async move {
-            loop {
-                if failed_tx.borrow().is_some() {
-                    return;
-                }
-                let i = next.fetch_add(1, Ordering::SeqCst);
-                let Some(want) = chunk_mcid(&m, i) else {
-                    return;
-                };
-                let fetched = fetch_one(&link, &realm, &s, &want, "block", timeout).await;
-                let outcome = fetched.and_then(|(_, body)| {
-                    let bytes = wire_bytes(&body, "bytes").unwrap_or_default();
-                    if block_mcid(&bytes) == want {
-                        Ok(bytes)
-                    } else {
-                        Err(PoolError::ContentMismatch(format!("chunk {i}")))
-                    }
-                });
-                match outcome {
-                    Ok(bytes) => parts.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(bytes),
-                    Err(e) => {
-                        failed_tx.send_if_modified(|f| {
-                            let first = f.is_none();
-                            if first {
-                                *f = Some(e);
-                            }
-                            first
-                        });
-                        return;
-                    }
-                }
-            }
-        });
+        workers.spawn(fetch_chunks_in_turn(ChunkWorker {
+            link: link.clone(),
+            realm,
+            s: s.clone(),
+            m: m.clone(),
+            parts: parts.clone(),
+            next: next.clone(),
+            failed_tx: failed_tx.clone(),
+            timeout: opts.chunk_timeout,
+        }));
     }
     while workers.join_next().await.is_some() {}
     if let Some(e) = failed.borrow().clone() {
@@ -573,6 +554,57 @@ async fn fetch_chunks(
     manifest::verify(&m, &whole)
         .map_err(|e| PoolError::ContentMismatch(format!("the whole: {e}")))?;
     Ok(whole)
+}
+
+/// One of a fetch's chunk workers: the link, realm and sharer it asks, the
+/// manifest it fetches by, what it shares with the other workers (the parts
+/// fetched, the next chunk to ask for and the first failure), and each
+/// chunk's timeout.
+struct ChunkWorker {
+    link: Link,
+    realm: [u8; 32],
+    s: Sharing,
+    m: Arc<Manifest>,
+    parts: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+    next: Arc<AtomicUsize>,
+    failed_tx: Arc<watch::Sender<Option<PoolError>>>,
+    timeout: Duration,
+}
+
+/// Fetches the next chunk no worker has asked for, checked against its own
+/// content id, until none is left or a fetch has failed; a failure is kept
+/// when it is the first.
+async fn fetch_chunks_in_turn(w: ChunkWorker) {
+    loop {
+        if w.failed_tx.borrow().is_some() {
+            return;
+        }
+        let i = w.next.fetch_add(1, Ordering::SeqCst);
+        let Some(want) = chunk_mcid(&w.m, i) else {
+            return;
+        };
+        let fetched = fetch_one(&w.link, &w.realm, &w.s, &want, "block", w.timeout).await;
+        let outcome = fetched.and_then(|(_, body)| {
+            verified_block(&body, &want)
+                .ok_or_else(|| PoolError::ContentMismatch(format!("chunk {i}")))
+        });
+        let bytes = match outcome {
+            Ok(bytes) => bytes,
+            Err(e) => return keep_first_failure(&w.failed_tx, e),
+        };
+        w.parts.lock().unwrap_or_else(|p| p.into_inner())[i] = Some(bytes);
+    }
+}
+
+/// Keeps `e` as the fetch's failure, unless one was kept before it.
+fn keep_first_failure(failed_tx: &watch::Sender<Option<PoolError>>, e: PoolError) {
+    failed_tx.send_if_modified(|f| {
+        let first = f.is_none();
+        if first {
+            *f = Some(e);
+        }
+        first
+    });
 }
 
 /// Asks a sharer for `want` of `mcid` on a stream of its own and reads its

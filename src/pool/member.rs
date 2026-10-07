@@ -76,26 +76,50 @@ impl Member {
         deadline: tokio::time::Instant,
         fail_fast: bool,
     ) -> Option<Link> {
-        let mut state = self.state.subscribe();
-        let mut retired = self.retired.subscribe();
+        let state = self.state.subscribe();
+        let retired = self.retired.subscribe();
         let failures_at_start = state.borrow().failed_dials;
-        loop {
-            {
-                let held = state.borrow_and_update();
-                if let Some(link) = &held.link {
-                    return Some(link.clone());
-                }
-                if fail_fast && held.failed_dials > failures_at_start {
-                    return None;
-                }
-            }
-            tokio::select! {
-                changed = state.changed() => if changed.is_err() { return None },
-                _ = retired.wait_for(|r| *r) => return None,
-                _ = tokio::time::sleep_until(deadline) => return None,
-            }
+        await_up_on(state, retired, deadline, fail_fast, failures_at_start).await
+    }
+}
+
+/// The waiting behind [`Member::await_up`], on the member's state and
+/// retirement as subscribed when it began.
+async fn await_up_on(
+    mut state: watch::Receiver<Held>,
+    mut retired: watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+    fail_fast: bool,
+    failures_at_start: u64,
+) -> Option<Link> {
+    loop {
+        if let Some(answer) = answer_now(&mut state, fail_fast, failures_at_start) {
+            return answer;
+        }
+        tokio::select! {
+            changed = state.changed() => if changed.is_err() { return None },
+            _ = retired.wait_for(|r| *r) => return None,
+            _ = tokio::time::sleep_until(deadline) => return None,
         }
     }
+}
+
+/// What a waiter for the link answers from the state seen now, marking it
+/// seen: the link once it is up, `None` once a dial has failed since
+/// `failures_at_start` while failing fast, or nothing yet.
+fn answer_now(
+    state: &mut watch::Receiver<Held>,
+    fail_fast: bool,
+    failures_at_start: u64,
+) -> Option<Option<Link>> {
+    let held = state.borrow_and_update();
+    if let Some(link) = &held.link {
+        return Some(Some(link.clone()));
+    }
+    if fail_fast && held.failed_dials > failures_at_start {
+        return Some(None);
+    }
+    None
 }
 
 /// Dials the member's station, holds the link until it ends or the member is
@@ -105,52 +129,15 @@ async fn supervise(pool: Weak<PoolInner>, m: Arc<Member>) {
     loop {
         let Some(inner) = pool.upgrade() else { break };
         let respawn = inner.opts.respawn_delay;
-        let mut cfg = Config::new(
-            m.target.clone(),
-            inner.opts.identity.clone(),
-            inner.issuer.clone(),
-        );
-        cfg.publication_seq = Some(inner.publication_seq.clone());
-        cfg.admission = Some(inner.admission.clone());
-        cfg.dedup = Some(inner.dedup.clone());
-        cfg.keyring = inner.keyring.clone();
-        cfg.kem_advertise = inner.opts.kem_advertise;
+        let cfg = link_config(&inner, &m);
         drop(inner);
         let dialed = tokio::select! {
             dialed = Link::dial(cfg) => dialed,
             _ = retired.wait_for(|r| *r) => break,
         };
         match dialed {
-            Err(e) => {
-                m.state.send_modify(|h| {
-                    h.error = Some(e.clone());
-                    h.failed_dials += 1;
-                });
-                event(&pool, &m, false, Some(e));
-            }
-            Ok(link) => {
-                m.state.send_modify(|h| {
-                    h.link = Some(link.clone());
-                    h.error = None;
-                });
-                event(&pool, &m, true, None);
-                if let Some(inner) = pool.upgrade() {
-                    inner.replay(&link).await;
-                }
-                let retiring = tokio::select! {
-                    _ = link.done() => false,
-                    _ = retired.wait_for(|r| *r) => true,
-                };
-                if retiring {
-                    let _ = link.close("client_stop").await;
-                }
-                let ended = link.error();
-                m.state.send_modify(|h| {
-                    h.link = None;
-                    h.error = ended.clone();
-                });
-                event(&pool, &m, false, ended);
-            }
+            Err(e) => dial_failed(&pool, &m, e),
+            Ok(link) => hold(&pool, &m, &mut retired, link).await,
         }
         if *retired.borrow() {
             break;
@@ -161,6 +148,58 @@ async fn supervise(pool: Weak<PoolInner>, m: Arc<Member>) {
         }
     }
     let _ = m.stopped.send_replace(true);
+}
+
+/// The link configuration a member dials its station with, from the pool's
+/// identity, issuer, shared state and options.
+fn link_config(inner: &PoolInner, m: &Member) -> Config {
+    let mut cfg = Config::new(
+        m.target.clone(),
+        inner.opts.identity.clone(),
+        inner.issuer.clone(),
+    );
+    cfg.publication_seq = Some(inner.publication_seq.clone());
+    cfg.admission = Some(inner.admission.clone());
+    cfg.dedup = Some(inner.dedup.clone());
+    cfg.keyring = inner.keyring.clone();
+    cfg.kem_advertise = inner.opts.kem_advertise;
+    cfg
+}
+
+/// Records a failed dial: its error, one more failure, and the event.
+fn dial_failed(pool: &Weak<PoolInner>, m: &Member, e: LinkError) {
+    m.state.send_modify(|h| {
+        h.error = Some(e.clone());
+        h.failed_dials += 1;
+    });
+    event(pool, m, false, Some(e));
+}
+
+/// Holds a dialed link: marks it up, replays the pool onto it, waits until it
+/// ends or the member is retired, closing it then, and marks it down with the
+/// error it ended on.
+async fn hold(pool: &Weak<PoolInner>, m: &Member, retired: &mut watch::Receiver<bool>, link: Link) {
+    m.state.send_modify(|h| {
+        h.link = Some(link.clone());
+        h.error = None;
+    });
+    event(pool, m, true, None);
+    if let Some(inner) = pool.upgrade() {
+        inner.replay(&link).await;
+    }
+    let retiring = tokio::select! {
+        _ = link.done() => false,
+        _ = retired.wait_for(|r| *r) => true,
+    };
+    if retiring {
+        let _ = link.close("client_stop").await;
+    }
+    let ended = link.error();
+    m.state.send_modify(|h| {
+        h.link = None;
+        h.error = ended.clone();
+    });
+    event(pool, m, false, ended);
 }
 
 fn event(pool: &Weak<PoolInner>, m: &Member, up: bool, error: Option<LinkError>) {

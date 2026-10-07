@@ -118,17 +118,11 @@ impl fmt::Display for PoolError {
             }
             PoolError::NoProvider(tried) => {
                 f.write_str("no trusted provider answered:")?;
-                for (p, e) in tried {
-                    write!(f, " [{} at {}: {e}]", short(&p.node), short(&p.station))?;
-                }
-                Ok(())
+                write_providers_tried(f, tried)
             }
             PoolError::ContentUnavailable(tried) => {
                 f.write_str("no sharer gave the content:")?;
-                for (node, e) in tried {
-                    write!(f, " [{}: {e}]", short(node))?;
-                }
-                Ok(())
+                write_sharers_tried(f, tried)
             }
             other => write!(f, "{other:?}"),
         }
@@ -141,6 +135,25 @@ impl From<LinkError> for PoolError {
     fn from(e: LinkError) -> Self {
         PoolError::Link(e)
     }
+}
+
+/// Each provider tried, at its station, and why it failed.
+fn write_providers_tried(
+    f: &mut fmt::Formatter<'_>,
+    tried: &[(Provider, PoolError)],
+) -> fmt::Result {
+    for (p, e) in tried {
+        write!(f, " [{} at {}: {e}]", short(&p.node), short(&p.station))?;
+    }
+    Ok(())
+}
+
+/// Each sharer tried and why it failed.
+fn write_sharers_tried(f: &mut fmt::Formatter<'_>, tried: &[([u8; 32], PoolError)]) -> fmt::Result {
+    for (node, e) in tried {
+        write!(f, " [{}: {e}]", short(node))?;
+    }
+    Ok(())
 }
 
 fn short(id: &[u8; 32]) -> String {
@@ -257,6 +270,9 @@ struct State {
     closed: bool,
 }
 
+/// What a closing pool ends: its links and its subscriptions.
+type Closing = (Vec<Arc<Member>>, HashMap<u64, Arc<pubsub::SubInner>>);
+
 /// One of the pool's links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkStatus {
@@ -354,17 +370,8 @@ impl Pool {
     /// Ends every link with a GOODBYE and every subscription. It withdraws
     /// nothing: an advertisement lapses with its link.
     pub async fn close(&self) {
-        let (members, subs) = {
-            let mut state = self.inner.lock();
-            if state.closed {
-                return;
-            }
-            state.closed = true;
-            state.served.clear();
-            (
-                std::mem::take(&mut state.members),
-                std::mem::take(&mut state.subs),
-            )
+        let Some((members, subs)) = self.inner.mark_closed() else {
+            return;
         };
         self.inner.ticks.abort();
         for m in &members {
@@ -393,6 +400,21 @@ impl PoolInner {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Marks the pool closed, forgets what it serves, and hands back its
+    /// links and subscriptions to end; nothing when it was closed already.
+    fn mark_closed(&self) -> Option<Closing> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        state.closed = true;
+        state.served.clear();
+        Some((
+            std::mem::take(&mut state.members),
+            std::mem::take(&mut state.subs),
+        ))
+    }
+
     /// The links up now, in the pool's selection order.
     fn links(&self) -> Vec<Link> {
         let members = self.lock().members.clone();
@@ -405,24 +427,30 @@ impl PoolInner {
 
     /// Waits until a link is up, or `deadline` passes.
     async fn await_up(self: &Arc<Self>, deadline: tokio::time::Instant) -> Result<(), PoolError> {
-        loop {
-            if !self.links().is_empty() {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let members = self.lock().members.clone();
-                return Err(PoolError::NoLink(
-                    members.iter().filter_map(|m| m.last_error()).collect(),
-                ));
-            }
+        while self.links().is_empty() {
+            self.before_deadline(deadline)?;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        Ok(())
+    }
+
+    /// Nothing while `deadline` is ahead; past it, [`PoolError::NoLink`] with
+    /// each link's last error.
+    fn before_deadline(&self, deadline: tokio::time::Instant) -> Result<(), PoolError> {
+        if tokio::time::Instant::now() < deadline {
+            return Ok(());
+        }
+        let members = self.lock().members.clone();
+        Err(PoolError::NoLink(
+            members.iter().filter_map(|m| m.last_error()).collect(),
+        ))
     }
 
     fn event(&self, e: LinkEvent) {
-        if let Some(f) = self.opts.on_link_event.clone() {
-            tokio::spawn(async move { f(e) });
-        }
+        let Some(f) = self.opts.on_link_event.clone() else {
+            return;
+        };
+        tokio::spawn(async move { f(e) });
     }
 
     /// The key a procedure's authorization is checked against: the realm's

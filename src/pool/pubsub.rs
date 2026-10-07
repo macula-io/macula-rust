@@ -69,13 +69,7 @@ impl Pool {
             }),
             dropped: AtomicU64::new(0),
         });
-        {
-            let mut state = self.inner.lock();
-            if state.closed {
-                return Err(PoolError::Closed);
-            }
-            state.subs.insert(sub.id, sub.clone());
-        }
+        register(&self.inner, &sub)?;
         for link in self.inner.links() {
             sub.attach(&link).await;
         }
@@ -143,12 +137,24 @@ impl Drop for Subscription {
             pool.lock().subs.remove(&self.inner.id);
         }
         let inner = self.inner.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = inner.end().await;
-            });
-        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let _ = inner.end().await;
+        });
     }
+}
+
+/// Puts `sub` among the pool's subscriptions, so links it dials later get it,
+/// unless the pool has closed.
+fn register(pool: &PoolInner, sub: &Arc<SubInner>) -> Result<(), PoolError> {
+    let mut state = pool.lock();
+    if state.closed {
+        return Err(PoolError::Closed);
+    }
+    state.subs.insert(sub.id, sub.clone());
+    Ok(())
 }
 
 impl SubInner {
@@ -159,21 +165,29 @@ impl SubInner {
     /// Ends the subscription once: its events end, and every link
     /// unsubscribes.
     pub(super) async fn end(&self) -> Result<(), LinkError> {
-        let forwarders = {
-            let mut held = self.lock();
-            if held.events.take().is_none() {
-                return Ok(());
-            }
-            std::mem::take(&mut held.on_links)
+        let Some(forwarders) = self.take_forwarders() else {
+            return Ok(());
         };
-        let mut result = Ok(());
-        for (_, f) in forwarders {
-            let _ = f.stop.send(());
-            if let Ok(Err(e)) = f.unsubscribed.await {
-                result = Err(e);
-            }
+        stop_forwarders(forwarders).await
+    }
+
+    /// Ends the subscription's events and takes every link's forwarder, or
+    /// `None` when it had already ended.
+    fn take_forwarders(&self) -> Option<HashMap<u64, Forwarder>> {
+        let mut held = self.lock();
+        held.events.take()?;
+        Some(std::mem::take(&mut held.on_links))
+    }
+
+    /// Keeps `forwarder` as the one for the link with `serial`, when the
+    /// subscription still runs and that link has none yet; whether it did.
+    fn keep_forwarder(&self, serial: u64, forwarder: Forwarder) -> bool {
+        let mut held = self.lock();
+        let wanted = held.events.is_some() && !held.on_links.contains_key(&serial);
+        if wanted {
+            held.on_links.insert(serial, forwarder);
         }
-        result
+        wanted
     }
 
     /// Subscribes on `link`, once, and forwards what it hears until the
@@ -191,15 +205,7 @@ impl SubInner {
         };
         let (stop, stopped) = oneshot::channel();
         let (unsubscribed_tx, unsubscribed) = oneshot::channel();
-        let kept = {
-            let mut held = self.lock();
-            let wanted = held.events.is_some() && !held.on_links.contains_key(&link.serial());
-            if wanted {
-                held.on_links
-                    .insert(link.serial(), Forwarder { stop, unsubscribed });
-            }
-            wanted
-        };
+        let kept = self.keep_forwarder(link.serial(), Forwarder { stop, unsubscribed });
         if !kept {
             let _ = on_link.unsubscribe().await;
             return;
@@ -213,6 +219,19 @@ impl SubInner {
             unsubscribed_tx,
         ));
     }
+}
+
+/// Tells each forwarder to stop and waits for its link to unsubscribe; the
+/// last link that failed to is the error.
+async fn stop_forwarders(forwarders: HashMap<u64, Forwarder>) -> Result<(), LinkError> {
+    let mut result = Ok(());
+    for (_, f) in forwarders {
+        let _ = f.stop.send(());
+        if let Ok(Err(e)) = f.unsubscribed.await {
+            result = Err(e);
+        }
+    }
+    result
 }
 
 async fn forward(
