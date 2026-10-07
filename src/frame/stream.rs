@@ -255,25 +255,37 @@ fn stream_build(
     key: &NodeKey,
     caller: bool,
 ) -> Result<Vec<(Value, Value)>, FrameError> {
+    stream_checks(fields, open, key, caller)?;
+    let mut tbs = stream_body(fields)?;
+    if fields.seq() >= MAX_PROTOCOL_INT {
+        return Err(FrameError::OutOfRange("a seq of 2^53 or more".into()));
+    }
+    tbs.extend([
+        entry("frame_type", Value::text(fields.frame_type())),
+        entry("request_id", Value::Bytes(open.request_id.to_vec())),
+        entry("request_hash", Value::Bytes(open.request_hash.to_vec())),
+        entry("signer", Value::Bytes(key.key_id().to_vec())),
+        entry("seq", uint(fields.seq())),
+    ]);
+    Ok(tbs)
+}
+
+/// A stream frame build's checks before its body: the key against its side's
+/// sender, the frame types its side sends, the sealed shape, the text, then
+/// the body or payload.
+fn stream_checks(
+    fields: &StreamFields,
+    open: &VerifiedRequest,
+    key: &NodeKey,
+    caller: bool,
+) -> Result<(), FrameError> {
     identity_signer(key)?;
     let sender = if caller { open.caller } else { open.target };
     if open.frame_type != RequestType::StreamOpen || open.mode.is_none() || key.key_id() != sender {
         return Err(FrameError::Unsignable);
     }
     if caller {
-        match fields {
-            StreamFields::Reply { .. } | StreamFields::SealedReply { .. } => {
-                return Err(FrameError::NotAllowed("a caller's STREAM_REPLY".into()))
-            }
-            StreamFields::Data { .. } | StreamFields::SealedData { .. }
-                if open.mode == Some(StreamMode::ServerStream) =>
-            {
-                return Err(FrameError::NotAllowed(
-                    "a caller's STREAM_DATA in a server_stream".into(),
-                ))
-            }
-            _ => {}
-        }
+        caller_sends(fields, open)?;
     }
     if fields
         .sealed()
@@ -294,7 +306,31 @@ fn stream_build(
         StreamFields::Reply { payload, .. } => check_payload(payload)?,
         _ => {}
     }
-    let mut tbs = match fields {
+    Ok(())
+}
+
+/// Refuses the frames a caller does not send: a STREAM_REPLY, and a
+/// STREAM_DATA in a server_stream.
+fn caller_sends(fields: &StreamFields, open: &VerifiedRequest) -> Result<(), FrameError> {
+    match fields {
+        StreamFields::Reply { .. } | StreamFields::SealedReply { .. } => {
+            Err(FrameError::NotAllowed("a caller's STREAM_REPLY".into()))
+        }
+        StreamFields::Data { .. } | StreamFields::SealedData { .. }
+            if open.mode == Some(StreamMode::ServerStream) =>
+        {
+            Err(FrameError::NotAllowed(
+                "a caller's STREAM_DATA in a server_stream".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The signed fields of a stream frame's own type, refusing a raw body that
+/// is not a byte string.
+fn stream_body(fields: &StreamFields) -> Result<Vec<(Value, Value)>, FrameError> {
+    let tbs = match fields {
         StreamFields::Data { encoding, body, .. } => {
             if *encoding == StreamEncoding::Raw && !matches!(body, Value::Bytes(_)) {
                 return Err(FrameError::OutOfRange(
@@ -324,16 +360,6 @@ fn stream_build(
             vec![entry("sealed", sealed.value())]
         }
     };
-    if fields.seq() >= MAX_PROTOCOL_INT {
-        return Err(FrameError::OutOfRange("a seq of 2^53 or more".into()));
-    }
-    tbs.extend([
-        entry("frame_type", Value::text(fields.frame_type())),
-        entry("request_id", Value::Bytes(open.request_id.to_vec())),
-        entry("request_hash", Value::Bytes(open.request_hash.to_vec())),
-        entry("signer", Value::Bytes(key.key_id().to_vec())),
-        entry("seq", uint(fields.seq())),
-    ]);
     Ok(tbs)
 }
 
@@ -477,6 +503,32 @@ fn stream_read(
     verified: &VerifiedObject,
     context: SealedContext,
 ) -> Result<([u8; 32], StreamFields, super::Fields), FrameError> {
+    let fields = stream_table_read(frame_type, verified, context)?;
+    let sealed = fields.get("sealed").and_then(|v| read_sealed(v, context));
+    let own: &[&str] = match (frame_type, sealed.is_some()) {
+        (STREAM_DATA, false) => &["encoding", "body"],
+        (STREAM_DATA, true) => &["encoding", "sealed"],
+        (STREAM_END, _) => &["role"],
+        (STREAM_ERROR, false) => &["code", "message"],
+        (_, false) => &["payload"],
+        (_, true) => &["sealed"],
+    };
+    let carried = 5 + own.len() + usize::from(fields.contains_key("alg"));
+    if !has_fields(&fields, own) || fields.len() != carried {
+        return Err(FrameError::Malformed);
+    }
+    let seq = protocol_uint(&fields["seq"]).unwrap_or(0);
+    let parsed = stream_parse(frame_type, seq, sealed, &fields)?;
+    Ok((fixed(&fields["signer"]), parsed, fields))
+}
+
+/// A stream frame's signed fields read through its type's table, which must
+/// hold frame_type, request_id, request_hash, signer and seq.
+fn stream_table_read(
+    frame_type: &str,
+    verified: &VerifiedObject,
+    context: SealedContext,
+) -> Result<super::Fields, FrameError> {
     let types: &'static [&'static str] = match frame_type {
         STREAM_DATA => &[STREAM_DATA],
         STREAM_END => &[STREAM_END],
@@ -505,24 +557,21 @@ fn stream_read(
     ) {
         return Err(FrameError::Malformed);
     }
-    let sealed = fields.get("sealed").and_then(|v| read_sealed(v, context));
-    let own: &[&str] = match (frame_type, sealed.is_some()) {
-        (STREAM_DATA, false) => &["encoding", "body"],
-        (STREAM_DATA, true) => &["encoding", "sealed"],
-        (STREAM_END, _) => &["role"],
-        (STREAM_ERROR, false) => &["code", "message"],
-        (_, false) => &["payload"],
-        (_, true) => &["sealed"],
-    };
-    let carried = 5 + own.len() + usize::from(fields.contains_key("alg"));
-    if !has_fields(&fields, own) || fields.len() != carried {
-        return Err(FrameError::Malformed);
-    }
-    let seq = protocol_uint(&fields["seq"]).unwrap_or(0);
+    Ok(fields)
+}
+
+/// A stream frame's own fields as its type and `sealed` give them, a raw body
+/// a byte string, and a sealed frame of a type that carries none refused.
+fn stream_parse(
+    frame_type: &str,
+    seq: u64,
+    sealed: Option<Sealed>,
+    fields: &super::Fields,
+) -> Result<StreamFields, FrameError> {
     let parsed = match (frame_type, sealed) {
         (STREAM_DATA, Some(sealed)) => StreamFields::SealedData {
             seq,
-            encoding: stream_encoding(&fields),
+            encoding: stream_encoding(fields),
             sealed,
         },
         (STREAM_ERROR, Some(sealed)) => StreamFields::SealedError { seq, sealed },
@@ -537,7 +586,7 @@ fn stream_read(
         },
         (_, Some(_)) => return Err(FrameError::Malformed),
         (STREAM_DATA, None) => {
-            let encoding = stream_encoding(&fields);
+            let encoding = stream_encoding(fields);
             if encoding == StreamEncoding::Raw && !matches!(fields["body"], Value::Bytes(_)) {
                 return Err(FrameError::Malformed);
             }
@@ -557,7 +606,7 @@ fn stream_read(
             payload: fields["payload"].clone(),
         },
     };
-    Ok((fixed(&fields["signer"]), parsed, fields))
+    Ok(parsed)
 }
 
 fn stream_encoding(fields: &super::Fields) -> StreamEncoding {

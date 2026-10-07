@@ -84,44 +84,64 @@ impl RuleCheck {
                 "an integer outside -2^63 to 2^63-1 at {}",
                 self.at(path)
             )),
-            Value::List(items) => {
-                self.nesting(path)?;
-                for (i, item) in items.iter().enumerate() {
-                    path.push(i.to_string());
-                    self.value(item, path)?;
-                    path.pop();
-                }
-                Ok(())
-            }
-            Value::Map(pairs) => {
-                self.nesting(path)?;
-                let mut seen = std::collections::HashSet::with_capacity(pairs.len());
-                for (key, value) in pairs {
-                    if !matches!(key, Value::Text(_) | Value::Int(_)) {
-                        return Err(format!(
-                            "a map key that is not text or an integer at {}",
-                            self.at(path)
-                        ));
-                    }
-                    self.value(key, path)?;
-                    let encoded = cbor::encode(key).map_err(|e| e.to_string())?;
-                    if !seen.insert(encoded) {
-                        return Err(format!(
-                            "two keys of the map at {} encode alike",
-                            self.at(path)
-                        ));
-                    }
-                    path.push(match key {
-                        Value::Text(t) => t.clone(),
-                        other => format!("{other:?}"),
-                    });
-                    self.value(value, path)?;
-                    path.pop();
-                }
-                Ok(())
-            }
+            Value::List(items) => self.list(items, path),
+            Value::Map(pairs) => self.map(pairs, path),
             _ => Ok(()),
         }
+    }
+
+    /// Walks a list at `path`, each item under its index.
+    fn list(&mut self, items: &[Value], path: &mut Vec<String>) -> Result<(), String> {
+        self.nesting(path)?;
+        for (i, item) in items.iter().enumerate() {
+            path.push(i.to_string());
+            self.value(item, path)?;
+            path.pop();
+        }
+        Ok(())
+    }
+
+    /// Walks a map at `path`, refusing a key that is not text or an integer
+    /// and two keys that encode alike.
+    fn map(&mut self, pairs: &[(Value, Value)], path: &mut Vec<String>) -> Result<(), String> {
+        self.nesting(path)?;
+        let mut seen = std::collections::HashSet::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            self.map_entry(key, value, &mut seen, path)?;
+        }
+        Ok(())
+    }
+
+    /// Checks one key and its value of the map at `path`, `seen` holding the
+    /// encodings of the keys before it.
+    fn map_entry(
+        &mut self,
+        key: &Value,
+        value: &Value,
+        seen: &mut std::collections::HashSet<Vec<u8>>,
+        path: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if !matches!(key, Value::Text(_) | Value::Int(_)) {
+            return Err(format!(
+                "a map key that is not text or an integer at {}",
+                self.at(path)
+            ));
+        }
+        self.value(key, path)?;
+        let encoded = cbor::encode(key).map_err(|e| e.to_string())?;
+        if !seen.insert(encoded) {
+            return Err(format!(
+                "two keys of the map at {} encode alike",
+                self.at(path)
+            ));
+        }
+        path.push(match key {
+            Value::Text(t) => t.clone(),
+            other => format!("{other:?}"),
+        });
+        self.value(value, path)?;
+        path.pop();
+        Ok(())
     }
 
     /// Refuses a list or map at `path` that would nest more than the limit.

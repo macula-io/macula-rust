@@ -105,6 +105,19 @@ fn sign_request(
     spec: &RequestSpec,
     key: &NodeKey,
 ) -> Result<Value, FrameError> {
+    let proofs = check_request(frame_type, spec, key)?;
+    let fields = request_fields(frame_type, spec, key, proofs);
+    let request = sign_object(REQUEST_LABEL, &fields, key).map_err(object_refusal)?;
+    Ok(request_frame(frame_type, spec, request.to_value()))
+}
+
+/// Runs [`sign_call`]'s refusals in their order and gives back the proofs as
+/// they will be carried.
+fn check_request(
+    frame_type: RequestType,
+    spec: &RequestSpec,
+    key: &NodeKey,
+) -> Result<Value, FrameError> {
     identity_signer(key)?;
     bounded_text("procedure", spec.procedure.as_bytes(), MAX_PROCEDURE_BYTES)?;
     match &spec.sealed {
@@ -137,6 +150,17 @@ fn sign_request(
     if !proofs_within_bound(&proofs) {
         return Err(FrameError::ProofsOutOfBound);
     }
+    Ok(proofs)
+}
+
+/// The signed fields of a request: the caller's key id, the spec's fields,
+/// and the mode, token and proofs when it carries them.
+fn request_fields(
+    frame_type: RequestType,
+    spec: &RequestSpec,
+    key: &NodeKey,
+    proofs: Value,
+) -> Vec<(Value, Value)> {
     let mut fields = vec![
         entry("frame_type", Value::text(frame_type.name())),
         entry("caller", Value::Bytes(key.key_id().to_vec())),
@@ -159,11 +183,16 @@ fn sign_request(
     if !spec.proofs.is_empty() {
         fields.push(entry("proofs", proofs));
     }
-    let request = sign_object(REQUEST_LABEL, &fields, key).map_err(object_refusal)?;
+    fields
+}
+
+/// The request frame around the signed `request`, with the routing fields
+/// outside the signature.
+fn request_frame(frame_type: RequestType, spec: &RequestSpec, request: Value) -> Value {
     let mut frame = vec![
         entry("version", Value::Int(i128::from(PROTOCOL_VERSION))),
         entry("frame_type", Value::text(frame_type.name())),
-        entry("request", request.to_value()),
+        entry("request", request),
     ];
     if let Some(route) = &spec.source_route {
         frame.push(entry("source_route", Value::Bytes(route.clone())));
@@ -171,7 +200,7 @@ fn sign_request(
     if let Some(budget) = spec.retry_budget {
         frame.push(entry("retry_budget", uint(budget)));
     }
-    Ok(Value::Map(frame))
+    Value::Map(frame)
 }
 
 const REQUEST_ROUTES: &[(&str, Rule)] = &[

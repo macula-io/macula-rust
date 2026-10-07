@@ -86,6 +86,17 @@ mod tests {
         );
     }
 
+    /// Encodes `frame` and decodes it back, which must give a whole frame.
+    fn round_trip(frame: &Value, name: &str) -> Value {
+        let wire = crate::frame::encode(frame).unwrap();
+        let crate::frame::Decoded::Complete { frame: decoded, .. } =
+            crate::frame::decode(&wire).unwrap()
+        else {
+            panic!("{name}: not whole");
+        };
+        decoded
+    }
+
     #[test]
     fn liveness_frames_carry_their_nonce_and_are_never_neighbour_signed() {
         let nonce = [1; 16];
@@ -95,12 +106,7 @@ mod tests {
         ] {
             assert_eq!(liveness_nonce(&frame), Some((kind, nonce)), "{name}");
             assert!(!neighbour_signed(Profile::PqHybrid, name), "{name}");
-            let wire = crate::frame::encode(&frame).unwrap();
-            let crate::frame::Decoded::Complete { frame: decoded, .. } =
-                crate::frame::decode(&wire).unwrap()
-            else {
-                panic!("{name}: not whole");
-            };
+            let decoded = round_trip(&frame, name);
             assert_eq!(liveness_nonce(&decoded), Some((kind, nonce)), "{name}");
         }
         let mut short = base("liveness_ping");
