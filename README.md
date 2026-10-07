@@ -217,10 +217,11 @@ crate 1.89.
 
 - **UCAN-gated calls and serving.** macula 12 uses post-quantum UCANs; calls
   carry no token yet, and a gated procedure cannot be served.
-- **Resealing after a provider's key rotation.** A call or stream sealed to
-  a key the provider no longer holds fails closed with
-  `LinkError::SealedRefused`, naming the provider's new key; it is not sent
-  again sealed to that key.
+- **Resealing a stream after a provider's key rotation.** A pool call
+  refused `sealed_refused` is sealed once more to the key the provider names
+  (#20); a stream, whose refusal arrives after it opened, still fails closed
+  with `LinkError::Stream` (`sealed_refused`), and so does a call made
+  directly on a `Link` (`LinkError::SealedRefused`) (#21).
 - **Station discovery beyond the seeds.** macula discovers stations through
   mcl-stations/list_stations; this pool does not call it, so give it its seeds.
 

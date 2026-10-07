@@ -168,10 +168,17 @@ impl Pool {
             procedure: c.procedure.clone(),
             provider: c.provider,
         };
-        let candidates = bounded(deadline, inner.candidates(&key, realm_key)).await?;
+        let candidates = bounded(deadline, inner.candidates(&key, realm_key.clone())).await?;
         let candidates = callable(candidates, c.confidential)?;
         let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
         let outcome = bounded(deadline, inner.call_at(&link, &cand, &c, deadline)).await;
+        let sent = Sent {
+            link: &link,
+            call: &c,
+            realm_key,
+            deadline,
+        };
+        let (cand, outcome) = inner.resealed(&key, cand, &sent, outcome).await;
         inner.settled(key, cand, outcome)
     }
 
@@ -366,6 +373,42 @@ impl PoolInner {
         Ok((result, Report::of(cand.provider.node, cand.kem_key_id())))
     }
 
+    /// A sealed call refused sealed_refused after its provider's key rotated,
+    /// sealed again once, as macula's `resealed/7` does (E2E design §5.1,
+    /// Amendment A1; macula-rust#20): ONE fresh lookup of the provider's own
+    /// trusted advertisements, then a new request sealed to the one naming
+    /// exactly the key the refusal named, or, from a provider that named
+    /// none, to the first key it advertises. A second refusal is the result.
+    /// Any other key fails key_mismatch naming both, none fails no_kem_key;
+    /// never the clear. Any other outcome is returned as it is. The
+    /// candidate the outcome came from, and the outcome.
+    async fn resealed(
+        &self,
+        key: &ResolvedKey,
+        cand: Candidate,
+        sent: &Sent<'_>,
+        outcome: Result<(Value, Report), PoolError>,
+    ) -> (Candidate, Result<(Value, Report), PoolError>) {
+        let named = match &outcome {
+            Err(PoolError::Link(LinkError::SealedRefused { named })) if cand.kem_key.is_some() => {
+                *named
+            }
+            _ => return (cand, outcome),
+        };
+        let own = ResolvedKey {
+            provider: cand.provider.node,
+            ..key.clone()
+        };
+        let fresh = bounded(sent.deadline, self.resolve(&own, sent.realm_key.clone())).await;
+        let next = match reseal_to(fresh, named) {
+            Ok(next) => next,
+            Err(e) => return (cand, Err(e)),
+        };
+        let resent = self.call_at(sent.link, &next, sent.call, sent.deadline);
+        let outcome = bounded(sent.deadline, resent).await;
+        (next, outcome)
+    }
+
     /// Opens the stream at the candidate's provider on `link`.
     async fn open_at(
         &self,
@@ -498,6 +541,47 @@ impl PoolInner {
         }
         Err(PoolError::NoLink(errors))
     }
+}
+
+/// A call that went out: the link it went on, the call, the realm key its
+/// candidates were trusted under, and its deadline.
+struct Sent<'a> {
+    link: &'a Link,
+    call: &'a Call,
+    realm_key: Option<Vec<u8>>,
+    deadline: Instant,
+}
+
+/// The advertisement a refused sealed call is sealed to again, from the
+/// provider's fresh advertisements (`found`): the one naming exactly the key
+/// the refusal `named`, searched for since the DHT may still serve an older
+/// one, or, when the refusal named none, the first that names a key. When
+/// the named key is not among them, key_mismatch naming both; when none
+/// names a key, no_kem_key.
+fn reseal_to(
+    found: Result<Vec<Candidate>, PoolError>,
+    named: Option<[u8; KEY_ID_SIZE]>,
+) -> Result<Candidate, PoolError> {
+    let keyed: Vec<Candidate> = found
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.kem_key.is_some())
+        .collect();
+    let advertised: Vec<[u8; KEY_ID_SIZE]> =
+        keyed.iter().filter_map(Candidate::kem_key_id).collect();
+    let chosen = match named {
+        Some(id) => keyed.into_iter().find(|c| c.kem_key_id() == Some(id)),
+        None => keyed.into_iter().next(),
+    };
+    let reason = match advertised.is_empty() {
+        true => ConfidentialityReason::NoKemKey,
+        false => ConfidentialityReason::KeyMismatch,
+    };
+    chosen.ok_or(PoolError::Confidentiality(ConfidentialityError {
+        reason,
+        advertised,
+        named,
+    }))
 }
 
 /// The first of `candidates` whose serving station is reached within its
@@ -664,6 +748,28 @@ mod tests {
             Err(PoolError::Confidentiality(e)) => e,
             other => panic!("not a confidentiality refusal: {other:?}"),
         }
+    }
+
+    fn key_id_of(k: u8) -> [u8; KEY_ID_SIZE] {
+        crate::seal::key_id(&[k; 1568])
+    }
+
+    #[test]
+    fn a_refused_call_is_sealed_again_only_to_the_key_named() {
+        let found = || Ok(vec![cand(1, None), cand(1, Some(7)), cand(1, Some(8))]);
+        let next = reseal_to(found(), Some(key_id_of(8))).unwrap();
+        assert_eq!(next, cand(1, Some(8)));
+        let e = refused(reseal_to(found(), Some(key_id_of(9))).map(|c| vec![c]));
+        assert_eq!(e.reason, ConfidentialityReason::KeyMismatch);
+        assert_eq!(e.named, Some(key_id_of(9)));
+        assert_eq!(e.advertised, vec![key_id_of(7), key_id_of(8)]);
+        // A provider that named no key is sealed to the first it advertises.
+        assert_eq!(reseal_to(found(), None).unwrap(), cand(1, Some(7)));
+        // Nothing keyed, or nothing found: no_kem_key, never the clear.
+        let e = refused(reseal_to(Ok(vec![cand(1, None)]), Some(key_id_of(8))).map(|c| vec![c]));
+        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
+        let e = refused(reseal_to(Err(PoolError::NoProvider(Vec::new())), None).map(|c| vec![c]));
+        assert_eq!(e.reason, ConfidentialityReason::NoKemKey);
     }
 
     #[test]

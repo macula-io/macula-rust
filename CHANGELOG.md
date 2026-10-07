@@ -15,6 +15,16 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Added
+
+- A pool call refused `sealed_refused` after its provider's KEM key
+  rotated is sealed again, once, as macula's `resealed/7` does (#20): one
+  fresh lookup of the provider's own trusted advertisements, then a new
+  request sealed to the one naming exactly the key the refusal named (or,
+  when it named none, to the first key advertised). A second refusal is the
+  result; any other key fails `key_mismatch` naming both, none `no_kem_key`;
+  never the clear. A stream still fails closed (#21).
+
 #### Changed
 
 - A dial offers SecP384r1MLKEM1024 (ML-KEM-1024, NIST category 5) alone,
