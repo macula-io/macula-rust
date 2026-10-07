@@ -269,14 +269,7 @@ impl PrivateKey {
             }
         };
         if let (Some(key), Some(point)) = (&p384, public.p384()) {
-            let derived = key
-                .compute_public_key()
-                .map_err(|_| SealError::Unavailable)?;
-            if derived.as_ref() != point {
-                return Err(SealError::Key(
-                    "the P-384 scalar is not the carried point's".into(),
-                ));
-            }
+            check_scalar_answers_point(key, point)?;
         }
         Ok(PrivateKey {
             public,
@@ -298,6 +291,19 @@ impl PrivateKey {
             .map(|b| b.as_ref().to_vec())
             .map_err(|_| SealError::Unavailable)
     }
+}
+
+/// Refuses a P-384 scalar whose public point is not the carried `point`.
+fn check_scalar_answers_point(key: &agreement::PrivateKey, point: &[u8]) -> Result<(), SealError> {
+    let derived = key
+        .compute_public_key()
+        .map_err(|_| SealError::Unavailable)?;
+    if derived.as_ref() != point {
+        return Err(SealError::Key(
+            "the P-384 scalar is not the carried point's".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A fresh shared secret to `recipient`, and the kem_ct that carries it:

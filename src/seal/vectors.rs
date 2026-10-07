@@ -85,124 +85,165 @@ fn every_call_and_stream_vector_reaches_macula_s_bytes() {
     let calls = v["calls"].as_array().unwrap();
     assert_eq!(calls.len(), 4);
     for c in calls {
-        let profile = profile_of(&c["profile"]);
-        let frame_type = c["frame_type"].as_str().unwrap();
-        let what = format!("{} {frame_type}", profile.name());
-        let key = recipient(&v["recipients"][profile.name()], profile);
+        call_vector_reaches_macula_s_bytes(&v, c);
+    }
+}
+
+/// One call vector: the recipient's key id, the combiner's input, the
+/// recipient's secret, the call keys, the request, its replies and, for a
+/// stream, its frames.
+fn call_vector_reaches_macula_s_bytes(v: &Json, c: &Json) {
+    let profile = profile_of(&c["profile"]);
+    let frame_type = c["frame_type"].as_str().unwrap();
+    let what = format!("{} {frame_type}", profile.name());
+    let key = recipient(&v["recipients"][profile.name()], profile);
+    assert_eq!(
+        key.public_key().key_id().to_vec(),
+        b(&c["key_id"]),
+        "{what}"
+    );
+
+    // The combiner's input, from the vector's own parts.
+    let key_hash = key_hash(key.public_key().carried());
+    let ikm = combiner_input(profile, c, &key_hash);
+    assert_eq!(ikm, b(&c["ikm"]), "{what}: ikm");
+
+    // The recipient's side, exactly.
+    let ss = recipient_secret(&key, &b(&c["kem_ct"])).unwrap();
+    assert_eq!(ss.to_vec(), b(&c["ss"]), "{what}: ss");
+    if let (Some(p384), Some(eph_pub)) = (&key.p384, c.get("eph_pub")) {
         assert_eq!(
-            key.public_key().key_id().to_vec(),
-            b(&c["key_id"]),
-            "{what}"
+            ecdh_secret(p384, &b(eph_pub)).unwrap(),
+            b(&c["ss_ecdh"]),
+            "{what}: ss_ecdh"
         );
+    }
 
-        // The combiner's input, from the vector's own parts.
-        let key_hash = key_hash(key.public_key().carried());
-        let ikm = match profile {
-            Profile::PqPure => pure_ikm(&b(&c["ss_mlkem"]), &b(&c["mlkem_ct"]), &key_hash),
-            Profile::PqHybrid => hybrid_ikm(
-                &b(&c["ss_mlkem"]),
-                &b(&c["ss_ecdh"]),
-                &b(&c["mlkem_ct"]),
-                &b(&c["eph_pub"]),
-                &key_hash,
-            ),
+    let parties = Parties {
+        request_id: fixed(&c["request_id"]),
+        caller: fixed(&c["caller"]),
+        target: fixed(&c["target"]),
+    };
+    let (k_req, k_rep) = call_keys(&ss, frame_type, &parties);
+    assert_eq!(k_req.to_vec(), b(&c["k_req"]), "{what}: k_req");
+    assert_eq!(k_rep.to_vec(), b(&c["k_rep"]), "{what}: k_rep");
+
+    let request = request_of(c, frame_type, &parties);
+    assert_eq!(
+        request_aad(&request),
+        b(&c["request"]["aad"]),
+        "{what}: request AAD"
+    );
+    assert_eq!(b(&c["request"]["nonce"]), vec![0; NONCE_SIZE]);
+    sealed_and_opened(&k_req, &c["request"], &format!("{what} request"));
+
+    for reply in ["reply", "error_reply"] {
+        reply_vector_reaches_macula_s_bytes(&request, &k_rep, c, reply, &what);
+    }
+
+    stream_vector_reaches_macula_s_bytes(c, frame_type, &ss, &parties, &what);
+}
+
+/// The combiner's input from a call vector's own parts, in its profile.
+fn combiner_input(profile: Profile, c: &Json, key_hash: &[u8]) -> Vec<u8> {
+    match profile {
+        Profile::PqPure => pure_ikm(&b(&c["ss_mlkem"]), &b(&c["mlkem_ct"]), key_hash),
+        Profile::PqHybrid => hybrid_ikm(
+            &b(&c["ss_mlkem"]),
+            &b(&c["ss_ecdh"]),
+            &b(&c["mlkem_ct"]),
+            &b(&c["eph_pub"]),
+            key_hash,
+        ),
+    }
+}
+
+/// The request a call vector describes, between its parties.
+fn request_of(c: &Json, frame_type: &str, parties: &Parties) -> Request {
+    Request {
+        frame_type: frame_type.to_string(),
+        realm: fixed(&c["realm"]),
+        procedure: c["procedure"].as_str().unwrap().to_string(),
+        caller: parties.caller,
+        target: parties.target,
+        request_id: parties.request_id,
+        deadline: c["deadline"].as_u64().unwrap(),
+    }
+}
+
+/// A call vector's `reply` or `error_reply`, when it has one: its AAD, SEAL
+/// and OPEN, and for an error reply its ERROR plain both ways.
+fn reply_vector_reaches_macula_s_bytes(
+    request: &Request,
+    k_rep: &[u8; 32],
+    c: &Json,
+    reply: &str,
+    what: &str,
+) {
+    let Some(r) = c.get(reply) else { return };
+    let aad = reply_aad(
+        request,
+        r["frame_type"].as_str().unwrap(),
+        &fixed(&r["request_hash"]),
+        &fixed(&r["responded_by"]),
+    );
+    assert_eq!(aad, b(&r["aad"]), "{what}: {reply} AAD");
+    sealed_and_opened(k_rep, r, &format!("{what} {reply}"));
+    if reply == "error_reply" {
+        let (code, detail) = (r["code"].as_str().unwrap(), r["detail"].as_str().unwrap());
+        assert_eq!(
+            error_plain(code, detail),
+            b(&r["plain"]),
+            "{what}: ERROR plain"
+        );
+        assert_eq!(
+            open_error_plain(&b(&r["plain"])),
+            Ok((
+                code.to_string(),
+                (!detail.is_empty()).then(|| detail.to_string())
+            ))
+        );
+    }
+}
+
+/// A stream call's keys and every frame's AAD, nonce, SEAL and OPEN; a call
+/// without frames is a plain call.
+fn stream_vector_reaches_macula_s_bytes(
+    c: &Json,
+    frame_type: &str,
+    ss: &[u8; KEY_HASH_SIZE],
+    parties: &Parties,
+    what: &str,
+) {
+    let Some(frames) = c.get("frames").and_then(Json::as_array) else {
+        assert_eq!(frame_type, FRAME_CALL);
+        return;
+    };
+    assert_eq!(frame_type, FRAME_STREAM_OPEN);
+    let (k_c2p, k_p2c) = stream_keys(ss, parties);
+    assert_eq!(k_c2p.to_vec(), b(&c["k_c2p"]), "{what}: k_c2p");
+    assert_eq!(k_p2c.to_vec(), b(&c["k_p2c"]), "{what}: k_p2c");
+    for f in frames {
+        let seq = f["seq"].as_u64().unwrap();
+        let (direction, key) = match f["direction"].as_u64().unwrap() {
+            0 => (Direction::CallerToProvider, &k_c2p),
+            _ => (Direction::ProviderToCaller, &k_p2c),
         };
-        assert_eq!(ikm, b(&c["ikm"]), "{what}: ikm");
-
-        // The recipient's side, exactly.
-        let ss = recipient_secret(&key, &b(&c["kem_ct"])).unwrap();
-        assert_eq!(ss.to_vec(), b(&c["ss"]), "{what}: ss");
-        if let (Some(p384), Some(eph_pub)) = (&key.p384, c.get("eph_pub")) {
+        let aad = stream_aad(
+            f["frame_type"].as_str().unwrap(),
+            &parties.request_id,
+            seq,
+            direction,
+        );
+        assert_eq!(aad, b(&f["aad"]), "{what}: stream frame {seq} AAD");
+        if direction == Direction::CallerToProvider {
             assert_eq!(
-                ecdh_secret(p384, &b(eph_pub)).unwrap(),
-                b(&c["ss_ecdh"]),
-                "{what}: ss_ecdh"
+                stream_nonce(seq).to_vec(),
+                b(&f["nonce"]),
+                "{what}: seq nonce"
             );
         }
-
-        let parties = Parties {
-            request_id: fixed(&c["request_id"]),
-            caller: fixed(&c["caller"]),
-            target: fixed(&c["target"]),
-        };
-        let (k_req, k_rep) = call_keys(&ss, frame_type, &parties);
-        assert_eq!(k_req.to_vec(), b(&c["k_req"]), "{what}: k_req");
-        assert_eq!(k_rep.to_vec(), b(&c["k_rep"]), "{what}: k_rep");
-
-        let request = Request {
-            frame_type: frame_type.to_string(),
-            realm: fixed(&c["realm"]),
-            procedure: c["procedure"].as_str().unwrap().to_string(),
-            caller: parties.caller,
-            target: parties.target,
-            request_id: parties.request_id,
-            deadline: c["deadline"].as_u64().unwrap(),
-        };
-        assert_eq!(
-            request_aad(&request),
-            b(&c["request"]["aad"]),
-            "{what}: request AAD"
-        );
-        assert_eq!(b(&c["request"]["nonce"]), vec![0; NONCE_SIZE]);
-        sealed_and_opened(&k_req, &c["request"], &format!("{what} request"));
-
-        for reply in ["reply", "error_reply"] {
-            let Some(r) = c.get(reply) else { continue };
-            let aad = reply_aad(
-                &request,
-                r["frame_type"].as_str().unwrap(),
-                &fixed(&r["request_hash"]),
-                &fixed(&r["responded_by"]),
-            );
-            assert_eq!(aad, b(&r["aad"]), "{what}: {reply} AAD");
-            sealed_and_opened(&k_rep, r, &format!("{what} {reply}"));
-            if reply == "error_reply" {
-                let (code, detail) = (r["code"].as_str().unwrap(), r["detail"].as_str().unwrap());
-                assert_eq!(
-                    error_plain(code, detail),
-                    b(&r["plain"]),
-                    "{what}: ERROR plain"
-                );
-                assert_eq!(
-                    open_error_plain(&b(&r["plain"])),
-                    Ok((
-                        code.to_string(),
-                        (!detail.is_empty()).then(|| detail.to_string())
-                    ))
-                );
-            }
-        }
-
-        let Some(frames) = c.get("frames").and_then(Json::as_array) else {
-            assert_eq!(frame_type, FRAME_CALL);
-            continue;
-        };
-        assert_eq!(frame_type, FRAME_STREAM_OPEN);
-        let (k_c2p, k_p2c) = stream_keys(&ss, &parties);
-        assert_eq!(k_c2p.to_vec(), b(&c["k_c2p"]), "{what}: k_c2p");
-        assert_eq!(k_p2c.to_vec(), b(&c["k_p2c"]), "{what}: k_p2c");
-        for f in frames {
-            let seq = f["seq"].as_u64().unwrap();
-            let (direction, key) = match f["direction"].as_u64().unwrap() {
-                0 => (Direction::CallerToProvider, &k_c2p),
-                _ => (Direction::ProviderToCaller, &k_p2c),
-            };
-            let aad = stream_aad(
-                f["frame_type"].as_str().unwrap(),
-                &parties.request_id,
-                seq,
-                direction,
-            );
-            assert_eq!(aad, b(&f["aad"]), "{what}: stream frame {seq} AAD");
-            if direction == Direction::CallerToProvider {
-                assert_eq!(
-                    stream_nonce(seq).to_vec(),
-                    b(&f["nonce"]),
-                    "{what}: seq nonce"
-                );
-            }
-            sealed_and_opened(key, f, &format!("{what} stream frame {seq}"));
-        }
+        sealed_and_opened(key, f, &format!("{what} stream frame {seq}"));
     }
 }
 
