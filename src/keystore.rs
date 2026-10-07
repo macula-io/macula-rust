@@ -336,7 +336,17 @@ mod tests {
             let result = key
                 .save_to_keystore(&store)
                 .and_then(|()| NodeKey::load_from_keystore(&store, Purpose::Identity, profile));
+            // Persisted on this machine only, never roaming with the profile.
+            let persistence = store
+                .entry
+                .get_attributes()
+                .map(|a| a.get("persistence").cloned());
             store.delete_key().expect("cleanup delete should succeed");
+            assert_eq!(
+                persistence.ok().flatten().as_deref(),
+                Some("Local"),
+                "{profile:?}"
+            );
             let loaded = result.expect("save/load round trip through Credential Manager");
             assert_eq!(loaded.public_key(), key.public_key(), "{profile:?}");
         }
