@@ -62,7 +62,42 @@ fn the_shared_vectors_decode_as_every_stack_decodes_them() {
 
 #[test]
 fn every_input_is_refused_for_the_reference_decoder_s_reason() {
-    let cases: Vec<(&str, String, &str)> = vec![
+    let cases = [
+        duplicate_trailing_and_text_cases(),
+        text_and_key_type_cases(),
+        key_encoding_cases(),
+        float_and_nesting_cases(),
+        integer_range_cases(),
+        non_finite_float_cases(),
+        length_tag_and_simple_value_cases(),
+    ]
+    .concat();
+    for (name, hex_input, reason) in cases {
+        held_to_the_reference(name, &hex_input, reason);
+    }
+}
+
+/// One input decoded here, accepted where the reference accepts it (an empty
+/// `reason`) and refused for the reference's reason otherwise.
+fn held_to_the_reference(name: &str, hex_input: &str, reason: &str) {
+    let result = decode(&hex::decode(hex_input).unwrap());
+    if reason.is_empty() {
+        assert!(
+            result.is_ok(),
+            "{name}: {result:?}, but the reference accepts it"
+        );
+    } else {
+        assert_eq!(
+            result,
+            Err(refusal(reason)),
+            "{name}: the reference refuses it as {reason}"
+        );
+    }
+}
+
+/// Duplicate keys, bytes after an item, short input and invalid UTF-8 text.
+fn duplicate_trailing_and_text_cases() -> Vec<Case> {
+    vec![
         (
             "a duplicate key at the top level",
             "a2616101616102".into(),
@@ -100,6 +135,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
             "a161ff01".into(),
             "invalid_text",
         ),
+    ]
+}
+
+/// Text the reference accepts or refuses, and keys of a type it refuses.
+fn text_and_key_type_cases() -> Vec<Case> {
+    vec![
         ("valid multibyte text", "a1616b65636166c3a9".into(), ""),
         (
             "a UTF-16 surrogate in text",
@@ -121,6 +162,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
         ("a null key", "a1f601".into(), "bad_key"),
         ("integer keys 1 and -1", "a201022003".into(), ""),
         ("integer keys -1 and 0", "a220010002".into(), ""),
+    ]
+}
+
+/// One key twice in any of its encodings, and a refusal behind a bad key.
+fn key_encoding_cases() -> Vec<Case> {
+    vec![
         (
             "a duplicate integer key",
             "a201020103".into(),
@@ -161,6 +208,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
             format!("a14161{}", nested(65, "00")),
             "too_deep",
         ),
+    ]
+}
+
+/// Small floats, and containers nested up to and past the limit.
+fn float_and_nesting_cases() -> Vec<Case> {
+    vec![
         ("a half float value", "81f93e00".into(), ""),
         ("negative zero, half width", "f98000".into(), ""),
         ("the smallest half subnormal", "f90001".into(), ""),
@@ -196,6 +249,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
             format!("a16161{}", nested(64, "00")),
             "too_deep",
         ),
+    ]
+}
+
+/// Integers at and past the ends of -2^63 to 2^63-1.
+fn integer_range_cases() -> Vec<Case> {
+    vec![
         (
             "the smallest integer, -2^63",
             "3b7fffffffffffffff".into(),
@@ -226,6 +285,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
             "1bffffffffffffffff".into(),
             "integer_out_of_range",
         ),
+    ]
+}
+
+/// Infinities and NaN in every float width.
+fn non_finite_float_cases() -> Vec<Case> {
+    vec![
         (
             "positive infinity, half width",
             "f97c00".into(),
@@ -263,6 +328,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
             "fb7ff8000000000000".into(),
             "malformed",
         ),
+    ]
+}
+
+/// Indefinite lengths, reserved additional info, lengths past the input, tags and simple values.
+fn length_tag_and_simple_value_cases() -> Vec<Case> {
+    vec![
         ("an indefinite byte string", "5f4161ff".into(), "malformed"),
         ("an indefinite array", "9f01ff".into(), "malformed"),
         ("an indefinite map", "bf616101ff".into(), "malformed"),
@@ -306,23 +377,12 @@ fn every_input_is_refused_for_the_reference_decoder_s_reason() {
         ("simple value 24 in two bytes", "f818".into(), "malformed"),
         ("simple value 32", "f820".into(), "malformed"),
         ("null", "f6".into(), ""),
-    ];
-    for (name, hex_input, reason) in cases {
-        let result = decode(&hex::decode(&hex_input).unwrap());
-        if reason.is_empty() {
-            assert!(
-                result.is_ok(),
-                "{name}: {result:?}, but the reference accepts it"
-            );
-        } else {
-            assert_eq!(
-                result,
-                Err(refusal(reason)),
-                "{name}: the reference refuses it as {reason}"
-            );
-        }
-    }
+    ]
 }
+
+/// An input's name, its hex, and the reference's reason for refusing it,
+/// empty when it accepts it.
+type Case = (&'static str, String, &'static str);
 
 /// An array header for `count` items followed by `present` zeros.
 fn zeros_array(count: u32, present: usize) -> Vec<u8> {

@@ -19,7 +19,7 @@ use macula_rust::seal;
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
     handler, handshake_counters, stream_handler, Call, ConfidentialityError, ConfidentialityReason,
-    Config, Link, LinkError, Offer, Publication, Seal, StreamCall, StreamEvent,
+    Config, Link, LinkError, Offer, Publication, Request, Seal, Stream, StreamCall, StreamEvent,
 };
 
 /// A link as a new node: its own identity key and issuer.
@@ -165,6 +165,29 @@ async fn a_publication_is_heard_once_by_each_subscriber() {
     sub.unsubscribe().await.unwrap();
 }
 
+/// Answers who rang, and refuses "fail" with a handler error.
+async fn ring_answer(r: Request) -> Result<Value, String> {
+    if r.payload == Value::text("fail") {
+        return Err("refused by the handler".to_string());
+    }
+    Ok(Value::Map(vec![(
+        Value::text("rung_by"),
+        Value::Bytes(r.caller.to_vec()),
+    )]))
+}
+
+/// A clear call of `procedure` at `target` in the test realm.
+fn clear_call(env: &TestStations, procedure: &str, target: [u8; 32], payload: Value) -> Call {
+    Call {
+        realm: env.realm_id,
+        procedure: procedure.to_string(),
+        target,
+        payload,
+        seal: Some(Seal::Clear),
+        ..Call::default()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_procedure_in_a_node_s_own_namespace_is_served_and_called() {
     let env = TestStations::start(Profile::PqPure);
@@ -172,29 +195,10 @@ async fn a_procedure_in_a_node_s_own_namespace_is_served_and_called() {
     let caller = node(&env, 0).await;
     let ring = record::own_procedure(&provider.node_id(), "ring");
     let served = provider
-        .serve(Offer::unary(
-            env.realm_id,
-            &ring,
-            handler(|r| async move {
-                if r.payload == Value::text("fail") {
-                    return Err("refused by the handler".to_string());
-                }
-                Ok(Value::Map(vec![(
-                    Value::text("rung_by"),
-                    Value::Bytes(r.caller.to_vec()),
-                )]))
-            }),
-        ))
+        .serve(Offer::unary(env.realm_id, &ring, handler(ring_answer)))
         .await
         .unwrap();
-    let call = |payload: Value| Call {
-        realm: env.realm_id,
-        procedure: ring.clone(),
-        target: provider.node_id(),
-        payload,
-        seal: Some(Seal::Clear),
-        ..Call::default()
-    };
+    let call = |payload: Value| clear_call(&env, &ring, provider.node_id(), payload);
     let answered = caller.call(call(Value::Null)).await.unwrap();
     assert_eq!(
         answered.get("rung_by"),
@@ -284,69 +288,56 @@ async fn an_org_procedure_is_served_once_the_org_delegates_to_the_node() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn streams_deliver_their_frames_and_are_released() {
-    let env = TestStations::start(Profile::PqPure);
-    let provider = node(&env, 0).await;
-    let caller = node(&env, 0).await;
-    let watch = record::own_procedure(&provider.node_id(), "watch");
-    let count = record::own_procedure(&provider.node_id(), "count");
-    let _watch = provider
-        .serve(Offer::stream(
-            env.realm_id,
-            &watch,
-            StreamMode::ServerStream,
-            stream_handler(|stream| async move {
-                for chunk in ["one", "two", "three"] {
-                    stream
-                        .send(chunk.as_bytes())
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            }),
-        ))
-        .await
-        .unwrap();
-    let _count = provider
-        .serve(Offer::stream(
-            env.realm_id,
-            &count,
-            StreamMode::ClientStream,
-            stream_handler(|stream| async move {
-                let mut total = 0i128;
-                while let Ok(event) = stream.recv().await {
-                    match event {
-                        StreamEvent::Data {
-                            body: Value::Bytes(b),
-                            ..
-                        } => total += b.len() as i128,
-                        StreamEvent::End { .. } => break,
-                        _ => {}
-                    }
-                }
-                stream
-                    .reply(Value::Int(total))
-                    .await
-                    .map_err(|e| e.to_string())
-            }),
-        ))
-        .await
-        .unwrap();
+/// Sends "one", "two" and "three", then returns, ending the stream.
+async fn three_chunks(stream: Stream) -> Result<(), String> {
+    for chunk in ["one", "two", "three"] {
+        stream
+            .send(chunk.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 
-    let open = |procedure: &str, mode| StreamCall {
+/// Counts the bytes the caller sends until its end, and replies the total.
+async fn count_bytes(stream: Stream) -> Result<(), String> {
+    let mut total = 0i128;
+    while let Ok(event) = stream.recv().await {
+        match event {
+            StreamEvent::Data {
+                body: Value::Bytes(b),
+                ..
+            } => total += b.len() as i128,
+            StreamEvent::End { .. } => break,
+            _ => {}
+        }
+    }
+    stream
+        .reply(Value::Int(total))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// A clear stream of `procedure` at `target` in the test realm, in `mode`.
+fn clear_stream_call(
+    env: &TestStations,
+    procedure: &str,
+    target: [u8; 32],
+    mode: StreamMode,
+) -> StreamCall {
+    StreamCall {
         realm: env.realm_id,
         procedure: procedure.to_string(),
-        target: provider.node_id(),
+        target,
         mode,
         payload: Value::Null,
         seal: Some(Seal::Clear),
         ..StreamCall::default()
-    };
-    let stream = caller
-        .open_stream(open(&watch, StreamMode::ServerStream))
-        .await
-        .unwrap();
+    }
+}
+
+/// The raw chunks `stream` delivers until it ends on both sides.
+async fn raw_chunks_until_both_end(stream: &Stream) -> Vec<Vec<u8>> {
     let mut got = Vec::new();
     loop {
         match stream.recv().await.unwrap() {
@@ -361,6 +352,41 @@ async fn streams_deliver_their_frames_and_are_released() {
             other => panic!("{other:?}"),
         }
     }
+    got
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_deliver_their_frames_and_are_released() {
+    let env = TestStations::start(Profile::PqPure);
+    let provider = node(&env, 0).await;
+    let caller = node(&env, 0).await;
+    let watch = record::own_procedure(&provider.node_id(), "watch");
+    let count = record::own_procedure(&provider.node_id(), "count");
+    let _watch = provider
+        .serve(Offer::stream(
+            env.realm_id,
+            &watch,
+            StreamMode::ServerStream,
+            stream_handler(three_chunks),
+        ))
+        .await
+        .unwrap();
+    let _count = provider
+        .serve(Offer::stream(
+            env.realm_id,
+            &count,
+            StreamMode::ClientStream,
+            stream_handler(count_bytes),
+        ))
+        .await
+        .unwrap();
+
+    let open = |procedure: &str, mode| clear_stream_call(&env, procedure, provider.node_id(), mode);
+    let stream = caller
+        .open_stream(open(&watch, StreamMode::ServerStream))
+        .await
+        .unwrap();
+    let got = raw_chunks_until_both_end(&stream).await;
     assert_eq!(
         got,
         vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]

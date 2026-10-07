@@ -106,67 +106,186 @@ async fn drained(s: &Stream) -> LinkError {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_reports_the_key_it_was_sealed_to_and_a_clear_call_none() {
     for profile in [Profile::PqPure, Profile::PqHybrid] {
-        let lab = Lab::start(profile);
-        let (serving, callers) = (lab.station("report serving"), lab.station("report callers"));
-        lab.share(&[&serving, &callers]);
-        let keyed = connect(profile, &serving, true).await;
-        let keyless = connect(profile, &serving, false).await;
-        let sealed_echo = record::own_procedure(&keyed.node_id(), "echo");
-        let clear_echo = record::own_procedure(&keyless.node_id(), "echo");
-        keyed.serve(echo(&sealed_echo)).await.unwrap();
-        keyless.serve(echo(&clear_echo)).await.unwrap();
-        let caller = connect(profile, &callers, false).await;
-
-        let (result, report) = caller
-            .call_report(call(&sealed_echo, Value::text("kept")))
-            .await
-            .unwrap();
-        assert_eq!(result, Value::text("kept"));
-        let key_id = advertised_key_id(&caller, &sealed_echo).await;
-        assert_eq!(
-            report,
-            Report {
-                sealed: 1,
-                provider: keyed.node_id(),
-                seal_key_id: Some(key_id),
-            },
-            "{profile:?}"
-        );
-
-        let (result, report) = caller
-            .call_report(call(&clear_echo, Value::text("plain")))
-            .await
-            .unwrap();
-        assert_eq!(result, Value::text("plain"));
-        assert_eq!(
-            report,
-            Report {
-                sealed: 0,
-                provider: keyless.node_id(),
-                seal_key_id: None,
-            },
-            "{profile:?}"
-        );
-
-        let failed = caller
-            .call_report(call(&sealed_echo, Value::text("fail")))
-            .await;
-        assert!(
-            matches!(failed, Err(PoolError::Link(LinkError::Provider { .. }))),
-            "an error carries no report: {failed:?}"
-        );
-        assert_eq!(
-            caller
-                .call(call(&sealed_echo, Value::text("again")))
-                .await
-                .unwrap(),
-            Value::text("again"),
-            "call still answers the bare result"
-        );
-        for p in [caller, keyed, keyless] {
-            p.close().await;
-        }
+        call_reports_under(profile).await;
     }
+}
+
+/// One profile's pass of the call report test: a sealed call, a clear call,
+/// a failed call and a bare call, against a keyed and a keyless provider.
+async fn call_reports_under(profile: Profile) {
+    let lab = Lab::start(profile);
+    let (serving, callers) = (lab.station("report serving"), lab.station("report callers"));
+    lab.share(&[&serving, &callers]);
+    let keyed = connect(profile, &serving, true).await;
+    let keyless = connect(profile, &serving, false).await;
+    let sealed_echo = record::own_procedure(&keyed.node_id(), "echo");
+    let clear_echo = record::own_procedure(&keyless.node_id(), "echo");
+    keyed.serve(echo(&sealed_echo)).await.unwrap();
+    keyless.serve(echo(&clear_echo)).await.unwrap();
+    let caller = connect(profile, &callers, false).await;
+
+    let (result, report) = caller
+        .call_report(call(&sealed_echo, Value::text("kept")))
+        .await
+        .unwrap();
+    assert_eq!(result, Value::text("kept"));
+    let key_id = advertised_key_id(&caller, &sealed_echo).await;
+    assert_eq!(
+        report,
+        Report {
+            sealed: 1,
+            provider: keyed.node_id(),
+            seal_key_id: Some(key_id),
+        },
+        "{profile:?}"
+    );
+
+    clear_failed_and_bare_calls(profile, &caller, &keyless, &sealed_echo, &clear_echo).await;
+    for p in [caller, keyed, keyless] {
+        p.close().await;
+    }
+}
+
+/// The rest of one profile's pass: a clear call reports no key, a failed
+/// call no report, and a bare call answers the bare result.
+async fn clear_failed_and_bare_calls(
+    profile: Profile,
+    caller: &Pool,
+    keyless: &Pool,
+    sealed_echo: &str,
+    clear_echo: &str,
+) {
+    let (result, report) = caller
+        .call_report(call(clear_echo, Value::text("plain")))
+        .await
+        .unwrap();
+    assert_eq!(result, Value::text("plain"));
+    assert_eq!(
+        report,
+        Report {
+            sealed: 0,
+            provider: keyless.node_id(),
+            seal_key_id: None,
+        },
+        "{profile:?}"
+    );
+
+    let failed = caller
+        .call_report(call(sealed_echo, Value::text("fail")))
+        .await;
+    assert!(
+        matches!(failed, Err(PoolError::Link(LinkError::Provider { .. }))),
+        "an error carries no report: {failed:?}"
+    );
+    assert_eq!(
+        caller
+            .call(call(sealed_echo, Value::text("again")))
+            .await
+            .unwrap(),
+        Value::text("again"),
+        "call still answers the bare result"
+    );
+}
+
+/// `p`'s own procedure `name`.
+fn own(p: &Pool, name: &str) -> String {
+    record::own_procedure(&p.node_id(), name)
+}
+
+/// Sends one chunk once told to, then closes.
+async fn drip(told: Arc<Notify>, s: Stream) -> Result<(), String> {
+    told.notified().await;
+    s.send(b"a").await.map_err(|e| e.to_string())?;
+    s.close().await.map_err(|e| e.to_string())
+}
+
+/// Ends the stream before any data or reply.
+async fn quiet(s: Stream) -> Result<(), String> {
+    s.close().await.map_err(|e| e.to_string())
+}
+
+/// Aborts before any data or reply.
+async fn refuse(s: Stream) -> Result<(), String> {
+    s.abort("nope", "").await.map_err(|e| e.to_string())
+}
+
+/// Tells the caller what its own side's report is.
+async fn served(s: Stream) -> Result<(), String> {
+    let said = match s.report() {
+        Ok(_) => "a report".to_string(),
+        Err(e) => e.name().to_string(),
+    };
+    s.send(said.as_bytes()).await.map_err(|e| e.to_string())?;
+    s.close().await.map_err(|e| e.to_string())
+}
+
+/// Serves the stream report test's procedures, in order: drip (released by
+/// `go`) on `keyed`, quiet on both, refuse and served on `keyed`.
+async fn serve_report_streams(keyed: &Pool, keyless: &Pool, go: &Arc<Notify>) {
+    let told = go.clone();
+    keyed
+        .serve(server_stream(
+            &own(keyed, "drip"),
+            stream_handler(move |s| drip(told.clone(), s)),
+        ))
+        .await
+        .unwrap();
+    for p in [keyed, keyless] {
+        p.serve(server_stream(&own(p, "quiet"), stream_handler(quiet)))
+            .await
+            .unwrap();
+    }
+    keyed
+        .serve(server_stream(&own(keyed, "refuse"), stream_handler(refuse)))
+        .await
+        .unwrap();
+    keyed
+        .serve(server_stream(&own(keyed, "served"), stream_handler(served)))
+        .await
+        .unwrap();
+}
+
+/// A sealed stream is not settled before any data, settles on its opened
+/// data and keeps the report after its end.
+async fn drip_settles_on_opened_data(
+    caller: &Pool,
+    keyed: &Pool,
+    go: &Notify,
+    sealed_report: Report,
+) {
+    let s = open(caller, &own(keyed, "drip")).await;
+    assert!(s.sealed());
+    assert_eq!(s.report(), Err(ReportError::NotSettled), "before any data");
+    go.notify_one();
+    assert!(matches!(next(&s).await, Ok(StreamEvent::Data { .. })));
+    assert_eq!(s.report(), Ok(sealed_report), "settled on opened data");
+    assert_eq!(drained(&s).await, LinkError::EndOfStream);
+    assert_eq!(s.report(), Ok(sealed_report), "kept after the end");
+}
+
+/// A sealed stream's clear end settles nothing; a clear stream's end does.
+async fn quiet_streams_settle_only_when_clear(caller: &Pool, keyed: &Pool, keyless: &Pool) {
+    let s = open(caller, &own(keyed, "quiet")).await;
+    assert!(s.sealed());
+    assert_eq!(drained(&s).await, LinkError::EndOfStream);
+    assert_eq!(
+        s.report(),
+        Err(ReportError::NotSettled),
+        "a sealed stream's clear end settles nothing"
+    );
+
+    let s = open(caller, &own(keyless, "quiet")).await;
+    assert!(!s.sealed());
+    assert_eq!(drained(&s).await, LinkError::EndOfStream);
+    assert_eq!(
+        s.report(),
+        Ok(Report {
+            sealed: 0,
+            provider: keyless.node_id(),
+            seal_key_id: None,
+        }),
+        "a clear stream settles on its end"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -181,100 +300,20 @@ async fn a_stream_reports_once_the_provider_s_first_answer_opened() {
     let keyed = connect(profile, &serving, true).await;
     let keyless = connect(profile, &serving, false).await;
     let caller = connect(profile, &callers, false).await;
-    let own = |p: &Pool, name: &str| record::own_procedure(&p.node_id(), name);
 
-    // Sends one chunk once told to, then closes.
     let go = Arc::new(Notify::new());
-    let drip = own(&keyed, "drip");
-    let told = go.clone();
-    keyed
-        .serve(server_stream(
-            &drip,
-            stream_handler(move |s| {
-                let told = told.clone();
-                async move {
-                    told.notified().await;
-                    s.send(b"a").await.map_err(|e| e.to_string())?;
-                    s.close().await.map_err(|e| e.to_string())
-                }
-            }),
-        ))
-        .await
-        .unwrap();
-    // Ends the stream before any data or reply.
-    let quiet = |p: &Pool| own(p, "quiet");
-    for p in [&keyed, &keyless] {
-        p.serve(server_stream(
-            &quiet(p),
-            stream_handler(|s| async move { s.close().await.map_err(|e| e.to_string()) }),
-        ))
-        .await
-        .unwrap();
-    }
-    // Aborts before any data or reply.
-    let refuse = own(&keyed, "refuse");
-    keyed
-        .serve(server_stream(
-            &refuse,
-            stream_handler(|s| async move { s.abort("nope", "").await.map_err(|e| e.to_string()) }),
-        ))
-        .await
-        .unwrap();
-    // Tells the caller what its own side's report is.
-    let served = own(&keyed, "served");
-    keyed
-        .serve(server_stream(
-            &served,
-            stream_handler(|s| async move {
-                let said = match s.report() {
-                    Ok(_) => "a report".to_string(),
-                    Err(e) => e.name().to_string(),
-                };
-                s.send(said.as_bytes()).await.map_err(|e| e.to_string())?;
-                s.close().await.map_err(|e| e.to_string())
-            }),
-        ))
-        .await
-        .unwrap();
-    let key_id = advertised_key_id(&caller, &drip).await;
+    serve_report_streams(&keyed, &keyless, &go).await;
+    let key_id = advertised_key_id(&caller, &own(&keyed, "drip")).await;
     let sealed_report = Report {
         sealed: 1,
         provider: keyed.node_id(),
         seal_key_id: Some(key_id),
     };
 
-    let s = open(&caller, &drip).await;
-    assert!(s.sealed());
-    assert_eq!(s.report(), Err(ReportError::NotSettled), "before any data");
-    go.notify_one();
-    assert!(matches!(next(&s).await, Ok(StreamEvent::Data { .. })));
-    assert_eq!(s.report(), Ok(sealed_report), "settled on opened data");
-    assert_eq!(drained(&s).await, LinkError::EndOfStream);
-    assert_eq!(s.report(), Ok(sealed_report), "kept after the end");
+    drip_settles_on_opened_data(&caller, &keyed, &go, sealed_report).await;
+    quiet_streams_settle_only_when_clear(&caller, &keyed, &keyless).await;
 
-    let s = open(&caller, &quiet(&keyed)).await;
-    assert!(s.sealed());
-    assert_eq!(drained(&s).await, LinkError::EndOfStream);
-    assert_eq!(
-        s.report(),
-        Err(ReportError::NotSettled),
-        "a sealed stream's clear end settles nothing"
-    );
-
-    let s = open(&caller, &quiet(&keyless)).await;
-    assert!(!s.sealed());
-    assert_eq!(drained(&s).await, LinkError::EndOfStream);
-    assert_eq!(
-        s.report(),
-        Ok(Report {
-            sealed: 0,
-            provider: keyless.node_id(),
-            seal_key_id: None,
-        }),
-        "a clear stream settles on its end"
-    );
-
-    let s = open(&caller, &refuse).await;
+    let s = open(&caller, &own(&keyed, "refuse")).await;
     assert!(matches!(drained(&s).await, LinkError::Stream { code, .. } if code == "nope"));
     assert_eq!(
         s.report(),
@@ -282,7 +321,7 @@ async fn a_stream_reports_once_the_provider_s_first_answer_opened() {
         "an error settles nothing"
     );
 
-    let s = open(&caller, &served).await;
+    let s = open(&caller, &own(&keyed, "served")).await;
     assert_eq!(
         next(&s).await.unwrap(),
         StreamEvent::Data {

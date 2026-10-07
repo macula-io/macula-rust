@@ -683,25 +683,30 @@ fn macula_s_keyed_advertisements_verify_as_macula_rules() {
         let profile = Profile::parse(name).unwrap();
         let now_ms = p["now_ms"].as_i64().unwrap();
         for case in p["cases"].as_array().unwrap() {
-            let what = format!("{name} {}", case["name"]);
-            let wire = hex::decode(case["record"].as_str().unwrap()).unwrap();
-            let verified = verify(&wire, profile, now_ms);
-            match case["verdict"].as_str().unwrap() {
-                "accepted" => {
-                    let record = verified.unwrap_or_else(|e| panic!("{what}: {e:?}"));
-                    let read = read_procedure_advertisement(record.record()).unwrap();
-                    let key = hex::decode(case["kem_key"].as_str().unwrap()).unwrap();
-                    let id = hex::decode(case["kem_key_id"].as_str().unwrap()).unwrap();
-                    assert_eq!(read.kem_key, Some((key, id.try_into().unwrap())), "{what}");
-                }
-                "malformed" => assert!(
-                    matches!(verified, Err(RecordError::Malformed(_))),
-                    "{what}: {verified:?}"
-                ),
-                other => panic!("{what}: an unknown verdict {other}"),
-            }
+            keyed_advertisement_case(name, profile, now_ms, case);
             checked += 1;
         }
     }
     assert_eq!(checked, 10);
+}
+
+/// One keyed advertisement macula signed, held to its verdict.
+fn keyed_advertisement_case(name: &str, profile: Profile, now_ms: i64, case: &serde_json::Value) {
+    let what = format!("{name} {}", case["name"]);
+    let wire = hex::decode(case["record"].as_str().unwrap()).unwrap();
+    let verified = verify(&wire, profile, now_ms);
+    match case["verdict"].as_str().unwrap() {
+        "accepted" => {
+            let record = verified.unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let read = read_procedure_advertisement(record.record()).unwrap();
+            let key = hex::decode(case["kem_key"].as_str().unwrap()).unwrap();
+            let id = hex::decode(case["kem_key_id"].as_str().unwrap()).unwrap();
+            assert_eq!(read.kem_key, Some((key, id.try_into().unwrap())), "{what}");
+        }
+        "malformed" => assert!(
+            matches!(verified, Err(RecordError::Malformed(_))),
+            "{what}: {verified:?}"
+        ),
+        other => panic!("{what}: an unknown verdict {other}"),
+    }
 }

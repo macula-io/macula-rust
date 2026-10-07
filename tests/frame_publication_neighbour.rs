@@ -84,26 +84,31 @@ fn an_event_carries_the_publication_with_how_it_was_delivered() {
     let Value::Map(pairs) = sign_publish(&spec(), &key).unwrap() else {
         unreachable!()
     };
-    let as_event = |extra: Option<(Value, Value)>| {
-        let mut event: Vec<(Value, Value)> = pairs
-            .iter()
-            .map(|(k, v)| {
-                if *k == Value::text("frame_type") {
-                    (k.clone(), Value::text("event"))
-                } else {
-                    (k.clone(), v.clone())
-                }
-            })
-            .collect();
-        event.extend(extra);
-        Value::Map(event)
-    };
-    let direct = as_event(Some((Value::text("delivered_via"), Value::text("direct"))));
+    let direct = as_event(
+        &pairs,
+        Some((Value::text("delivered_via"), Value::text("direct"))),
+    );
     assert!(verify_publication(&direct, Profile::PqPure, NOW as i64).is_ok());
     assert_eq!(
-        verify_publication(&as_event(None), Profile::PqPure, NOW as i64).unwrap_err(),
+        verify_publication(&as_event(&pairs, None), Profile::PqPure, NOW as i64).unwrap_err(),
         FrameError::Malformed
     );
+}
+
+/// The publication's `pairs` as an EVENT, with `extra` added when given.
+fn as_event(pairs: &[(Value, Value)], extra: Option<(Value, Value)>) -> Value {
+    let mut event: Vec<(Value, Value)> = pairs.iter().map(event_entry).collect();
+    event.extend(extra);
+    Value::Map(event)
+}
+
+/// One field of a publication as an EVENT carries it: its frame_type event.
+fn event_entry((k, v): &(Value, Value)) -> (Value, Value) {
+    if *k == Value::text("frame_type") {
+        (k.clone(), Value::text("event"))
+    } else {
+        (k.clone(), v.clone())
+    }
 }
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -132,96 +137,130 @@ fn control_frames_macula_signed_open_here() {
     assert_eq!(entries.len(), 2);
     let mut opened_count = 0;
     for e in entries {
-        let profile = Profile::parse(e["profile"].as_str().unwrap()).unwrap();
-        let connection: [u8; 48] = unhex(e["connection"].as_str().unwrap()).try_into().unwrap();
-        let peer_key = unhex(e["peer_key"].as_str().unwrap());
-        for f in e["frames"].as_array().unwrap() {
-            let wire = whole(&unhex(f["bytes"].as_str().unwrap()));
-            let peer = NeighbourPeer {
-                profile,
-                peer_key: peer_key.clone(),
-                connection,
-                seq: f["seq"].as_u64().unwrap(),
-            };
-            let opened = verify_neighbour(&wire, &peer).unwrap();
-            assert_eq!(frame_type(&opened), f["frame_type"].as_str(), "{profile:?}");
-            opened_count += 1;
-            if profile != Profile::PqHybrid {
-                continue;
-            }
-            let next = NeighbourPeer {
-                seq: peer.seq + 1,
-                ..peer.clone()
-            };
-            assert_eq!(
-                verify_neighbour(&wire, &next).unwrap_err(),
-                FrameError::Malformed
-            );
-            let mut other = peer.clone();
-            other.connection[0] ^= 1;
-            assert_eq!(
-                verify_neighbour(&wire, &other).unwrap_err(),
-                FrameError::Malformed
-            );
-        }
+        opened_count += open_vector_entry(e);
     }
     assert!(opened_count >= 10);
 }
 
+/// Opens every frame of one vector entry, returning how many opened.
+fn open_vector_entry(e: &serde_json::Value) -> usize {
+    let profile = Profile::parse(e["profile"].as_str().unwrap()).unwrap();
+    let connection: [u8; 48] = unhex(e["connection"].as_str().unwrap()).try_into().unwrap();
+    let peer_key = unhex(e["peer_key"].as_str().unwrap());
+    let mut opened_count = 0;
+    for f in e["frames"].as_array().unwrap() {
+        open_vector_frame(f, profile, connection, &peer_key);
+        opened_count += 1;
+    }
+    opened_count
+}
+
+/// Opens one frame macula signed, and on pq_hybrid refuses it at the next
+/// seq and on another connection.
+fn open_vector_frame(
+    f: &serde_json::Value,
+    profile: Profile,
+    connection: [u8; 48],
+    peer_key: &[u8],
+) {
+    let wire = whole(&unhex(f["bytes"].as_str().unwrap()));
+    let peer = NeighbourPeer {
+        profile,
+        peer_key: peer_key.to_vec(),
+        connection,
+        seq: f["seq"].as_u64().unwrap(),
+    };
+    let opened = verify_neighbour(&wire, &peer).unwrap();
+    assert_eq!(frame_type(&opened), f["frame_type"].as_str(), "{profile:?}");
+    if profile != Profile::PqHybrid {
+        return;
+    }
+    let next = NeighbourPeer {
+        seq: peer.seq + 1,
+        ..peer.clone()
+    };
+    assert_eq!(
+        verify_neighbour(&wire, &next).unwrap_err(),
+        FrameError::Malformed
+    );
+    let mut other = peer.clone();
+    other.connection[0] ^= 1;
+    assert_eq!(
+        verify_neighbour(&wire, &other).unwrap_err(),
+        FrameError::Malformed
+    );
+}
+
 #[test]
 fn control_frames_built_here_open_again_and_only_pq_hybrid_signs_them() {
+    for profile in [Profile::PqHybrid, Profile::PqPure] {
+        built_frames_open_again(profile);
+    }
+}
+
+/// Builds each control frame under `profile`, signs it on a link and opens it
+/// again.
+fn built_frames_open_again(profile: Profile) {
     let realm = [3u8; 32];
     let subscriber = [1u8; 32];
     let topic = b"io.macula/mcl-news/news/wire/news_item_reported_v1";
-    for profile in [Profile::PqHybrid, Profile::PqPure] {
-        let key = NodeKey::generate(Purpose::Identity, profile).unwrap();
-        let connection = [9u8; 48];
-        let frames = [
-            ("advertise", advertise_frame(b"a signed record")),
-            ("unadvertise", unadvertise_frame(b"a signed withdrawal")),
-            (
-                "subscribe",
-                subscribe_frame(topic, &realm, &subscriber).unwrap(),
-            ),
-            (
-                "unsubscribe",
-                unsubscribe_frame(topic, &realm, &subscriber).unwrap(),
-            ),
-            (
-                "goodbye",
-                goodbye_frame("normal", Some(b"closing")).unwrap(),
-            ),
-        ];
-        for (seq, (name, frame)) in frames.into_iter().enumerate() {
-            assert_eq!(
-                neighbour_signed(profile, name),
-                profile == Profile::PqHybrid
-            );
-            let link = NeighbourLink {
-                connection,
-                seq: seq as u64,
-            };
-            let signed = sign_neighbour(&frame, &key, &link).unwrap();
-            assert_eq!(
-                signed.get("neighbour").is_some(),
-                profile == Profile::PqHybrid,
-                "{name}"
-            );
-            let peer = NeighbourPeer {
-                profile,
-                peer_key: key.public_key(),
-                connection,
-                seq: seq as u64,
-            };
-            let opened = verify_neighbour(&arrived(&signed), &peer).unwrap();
-            assert_eq!(frame_type(&opened), Some(name));
-            if profile == Profile::PqHybrid {
-                assert_eq!(
-                    sign_neighbour(&signed, &key, &link).unwrap_err(),
-                    FrameError::NeighbourSigned
-                );
-            }
-        }
+    let key = NodeKey::generate(Purpose::Identity, profile).unwrap();
+    let connection = [9u8; 48];
+    let frames = [
+        ("advertise", advertise_frame(b"a signed record")),
+        ("unadvertise", unadvertise_frame(b"a signed withdrawal")),
+        (
+            "subscribe",
+            subscribe_frame(topic, &realm, &subscriber).unwrap(),
+        ),
+        (
+            "unsubscribe",
+            unsubscribe_frame(topic, &realm, &subscriber).unwrap(),
+        ),
+        (
+            "goodbye",
+            goodbye_frame("normal", Some(b"closing")).unwrap(),
+        ),
+    ];
+    for (seq, (name, frame)) in frames.into_iter().enumerate() {
+        built_frame_opens_again(profile, &key, connection, seq as u64, name, &frame);
+    }
+}
+
+/// Signs one built frame at `seq`, neighbour-signed only on pq_hybrid, opens
+/// it again, and on pq_hybrid refuses to sign it twice.
+fn built_frame_opens_again(
+    profile: Profile,
+    key: &NodeKey,
+    connection: [u8; 48],
+    seq: u64,
+    name: &str,
+    frame: &Value,
+) {
+    assert_eq!(
+        neighbour_signed(profile, name),
+        profile == Profile::PqHybrid
+    );
+    let link = NeighbourLink { connection, seq };
+    let signed = sign_neighbour(frame, key, &link).unwrap();
+    assert_eq!(
+        signed.get("neighbour").is_some(),
+        profile == Profile::PqHybrid,
+        "{name}"
+    );
+    let peer = NeighbourPeer {
+        profile,
+        peer_key: key.public_key(),
+        connection,
+        seq,
+    };
+    let opened = verify_neighbour(&arrived(&signed), &peer).unwrap();
+    assert_eq!(frame_type(&opened), Some(name));
+    if profile == Profile::PqHybrid {
+        assert_eq!(
+            sign_neighbour(&signed, key, &link).unwrap_err(),
+            FrameError::NeighbourSigned
+        );
     }
 }
 

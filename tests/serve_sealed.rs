@@ -20,8 +20,8 @@ use macula_rust::record::{self, read_procedure_advertisement, RecordType};
 use macula_rust::seal::{self, Keyring};
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    handler, stream_handler, Call, Confidentiality, Config, Link, LinkError, Offer, Seal, Stream,
-    StreamCall, StreamEvent,
+    handler, stream_handler, Call, Confidentiality, Config, Link, LinkError, Offer, Seal, Served,
+    Stream, StreamCall, StreamEvent,
 };
 
 /// A link as a new node, with `keyring` and kem_advertise on when given.
@@ -72,73 +72,84 @@ async fn advertised_key(link: &Link, procedure: &str) -> Option<Vec<u8>> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keyed_provider_opens_sealed_calls_and_answers_them_sealed() {
     for profile in [Profile::PqPure, Profile::PqHybrid] {
-        let env = TestStations::start(profile);
-        let keyring = Arc::new(Keyring::system(profile).unwrap());
-        let provider = node(&env, Some(keyring.clone())).await.unwrap();
-        let caller = node(&env, None).await.unwrap();
-        let vault = record::own_procedure(&provider.node_id(), "vault");
-        let _served = provider
-            .serve(echo(env.realm_id, &vault, Confidentiality::Preferred))
-            .await
-            .unwrap();
-
-        let key = advertised_key(&caller, &vault).await;
-        assert_eq!(
-            key.as_deref(),
-            Some(keyring.current().public_key().carried()),
-            "{profile:?}: the advertisement names the keyring's current key"
-        );
-        let call = |payload: Value, seal: Seal| Call {
-            realm: env.realm_id,
-            procedure: vault.clone(),
-            target: provider.node_id(),
-            payload,
-            seal: Some(seal),
-            ..Call::default()
-        };
-        let to = Seal::To(key.unwrap());
-        let answered = caller
-            .call(call(Value::text("secret"), to.clone()))
-            .await
-            .unwrap();
-        assert_eq!(answered.get("asked"), Some(&Value::text("secret")));
-        assert_eq!(answered.get("sealed"), Some(&Value::Int(1)));
-
-        // A handler's refusal of a sealed request goes back sealed and
-        // opens to its code and detail.
-        match caller.call(call(Value::text("fail"), to)).await {
-            Err(LinkError::Provider { code, detail, .. }) => {
-                assert_eq!(code, "handler_error");
-                assert_eq!(detail.as_deref(), Some("refused by the handler"));
-            }
-            other => panic!("{profile:?}: {other:?}"),
-        }
-
-        // A preferred procedure still takes a clear call within its keyless
-        // window, and its handler sees it was clear.
-        let clear = caller
-            .call(call(Value::text("plain"), Seal::Clear))
-            .await
-            .unwrap();
-        assert_eq!(clear.get("sealed"), Some(&Value::Int(0)));
-
-        // Sealed to a key this provider never held: refused in the clear,
-        // naming the key it holds now, and the handler never runs.
-        let stranger = seal::PrivateKey::generate(profile).unwrap();
-        let refused = caller
-            .call(call(
-                Value::text("secret"),
-                Seal::To(stranger.public_key().carried().to_vec()),
-            ))
-            .await;
-        assert_eq!(
-            refused,
-            Err(LinkError::SealedRefused {
-                named: Some(keyring.current_id())
-            }),
-            "{profile:?}"
-        );
+        sealed_calls_under(profile).await;
     }
+}
+
+/// A handler's refusal of the sealed `call` opens to its code and detail.
+async fn a_sealed_refusal_opens_to_its_code(profile: Profile, caller: &Link, call: Call) {
+    match caller.call(call).await {
+        Err(LinkError::Provider { code, detail, .. }) => {
+            assert_eq!(code, "handler_error");
+            assert_eq!(detail.as_deref(), Some("refused by the handler"));
+        }
+        other => panic!("{profile:?}: {other:?}"),
+    }
+}
+
+/// One profile's pass of the sealed call test: a sealed call, a sealed
+/// refusal, a clear call and a call sealed to a stranger's key.
+async fn sealed_calls_under(profile: Profile) {
+    let env = TestStations::start(profile);
+    let keyring = Arc::new(Keyring::system(profile).unwrap());
+    let provider = node(&env, Some(keyring.clone())).await.unwrap();
+    let caller = node(&env, None).await.unwrap();
+    let vault = record::own_procedure(&provider.node_id(), "vault");
+    let _served = provider
+        .serve(echo(env.realm_id, &vault, Confidentiality::Preferred))
+        .await
+        .unwrap();
+
+    let key = advertised_key(&caller, &vault).await;
+    assert_eq!(
+        key.as_deref(),
+        Some(keyring.current().public_key().carried()),
+        "{profile:?}: the advertisement names the keyring's current key"
+    );
+    let call = |payload: Value, seal: Seal| Call {
+        realm: env.realm_id,
+        procedure: vault.clone(),
+        target: provider.node_id(),
+        payload,
+        seal: Some(seal),
+        ..Call::default()
+    };
+    let to = Seal::To(key.unwrap());
+    let answered = caller
+        .call(call(Value::text("secret"), to.clone()))
+        .await
+        .unwrap();
+    assert_eq!(answered.get("asked"), Some(&Value::text("secret")));
+    assert_eq!(answered.get("sealed"), Some(&Value::Int(1)));
+
+    // A handler's refusal of a sealed request goes back sealed and
+    // opens to its code and detail.
+    a_sealed_refusal_opens_to_its_code(profile, &caller, call(Value::text("fail"), to)).await;
+
+    // A preferred procedure still takes a clear call within its keyless
+    // window, and its handler sees it was clear.
+    let clear = caller
+        .call(call(Value::text("plain"), Seal::Clear))
+        .await
+        .unwrap();
+    assert_eq!(clear.get("sealed"), Some(&Value::Int(0)));
+
+    // Sealed to a key this provider never held: refused in the clear,
+    // naming the key it holds now, and the handler never runs.
+    let stranger = seal::PrivateKey::generate(profile).unwrap();
+    let refused = caller
+        .call(call(
+            Value::text("secret"),
+            Seal::To(stranger.public_key().carried().to_vec()),
+        ))
+        .await;
+    assert_eq!(
+        refused,
+        Err(LinkError::SealedRefused {
+            named: Some(keyring.current_id())
+        }),
+        "{profile:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -228,89 +239,99 @@ fn raw(b: &[u8]) -> StreamEvent {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_keyed_provider_serves_sealed_streams_both_ways() {
-    let env = TestStations::start(Profile::PqHybrid);
-    let keyring = Arc::new(Keyring::system(env.profile).unwrap());
-    let provider = node(&env, Some(keyring.clone())).await.unwrap();
-    let caller = node(&env, None).await.unwrap();
-    let watch = record::own_procedure(&provider.node_id(), "watch");
-    let count = record::own_procedure(&provider.node_id(), "count");
-    let vault = record::own_procedure(&provider.node_id(), "vault");
-    let guarded = record::own_procedure(&provider.node_id(), "guarded");
-    let _watch = provider
+/// Reads the open's opened payload, then sends it, "two" and whether the
+/// stream came sealed.
+async fn asked_two_sealed(stream: Stream) -> Result<(), String> {
+    // The handler reads the open's opened payload.
+    let Value::Bytes(asked) = stream.request().payload.clone() else {
+        return Err("the open's payload did not open".into());
+    };
+    let sealed = [u8::from(stream.sealed())];
+    for chunk in [&asked[..], b"two", &sealed[..]] {
+        stream.send(chunk).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Counts the bytes the caller sends until its end, and replies the total.
+async fn count_bytes(stream: Stream) -> Result<(), String> {
+    let mut total = 0i128;
+    while let Ok(event) = stream.recv().await {
+        match event {
+            StreamEvent::Data {
+                body: Value::Bytes(b),
+                ..
+            } => total += b.len() as i128,
+            StreamEvent::End { .. } => break,
+            _ => {}
+        }
+    }
+    stream
+        .reply(Value::Int(total))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Serves, in order, watch (answers the open's payload, "two" and whether
+/// it was sealed), count (replies the bytes it was sent), vault (the echo)
+/// and guarded (a required stream); answers their handles.
+async fn serve_streams(env: &TestStations, provider: &Link, names: [&String; 4]) -> [Served; 4] {
+    let [watch, count, vault, guarded] = names;
+    let watch = provider
         .serve(Offer::stream(
             env.realm_id,
-            &watch,
+            watch,
             StreamMode::ServerStream,
-            stream_handler(|stream| async move {
-                // The handler reads the open's opened payload.
-                let Value::Bytes(asked) = stream.request().payload.clone() else {
-                    return Err("the open's payload did not open".into());
-                };
-                let sealed = [u8::from(stream.sealed())];
-                for chunk in [&asked[..], b"two", &sealed[..]] {
-                    stream.send(chunk).await.map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            }),
+            stream_handler(asked_two_sealed),
         ))
         .await
         .unwrap();
-    let _count = provider
+    let count = provider
         .serve(Offer::stream(
             env.realm_id,
-            &count,
+            count,
             StreamMode::ClientStream,
-            stream_handler(|stream| async move {
-                let mut total = 0i128;
-                while let Ok(event) = stream.recv().await {
-                    match event {
-                        StreamEvent::Data {
-                            body: Value::Bytes(b),
-                            ..
-                        } => total += b.len() as i128,
-                        StreamEvent::End { .. } => break,
-                        _ => {}
-                    }
-                }
-                stream
-                    .reply(Value::Int(total))
-                    .await
-                    .map_err(|e| e.to_string())
-            }),
+            stream_handler(count_bytes),
         ))
         .await
         .unwrap();
-    let _vault = provider
-        .serve(echo(env.realm_id, &vault, Confidentiality::Preferred))
+    let vault = provider
+        .serve(echo(env.realm_id, vault, Confidentiality::Preferred))
         .await
         .unwrap();
     let mut required = Offer::stream(
         env.realm_id,
-        &guarded,
+        guarded,
         StreamMode::ServerStream,
         stream_handler(|_| async move { Ok(()) }),
     );
     required.confidential = Confidentiality::Required;
-    let _guarded = provider.serve(required).await.unwrap();
+    let guarded = provider.serve(required).await.unwrap();
+    [watch, count, vault, guarded]
+}
 
-    let key = advertised_key(&caller, &watch).await.unwrap();
-    let open = |procedure: &str, mode, seal: Seal| StreamCall {
+/// An open of `procedure` at `target` in `mode`, asking "one", kept by `seal`.
+fn open_call(
+    env: &TestStations,
+    procedure: &str,
+    target: [u8; 32],
+    mode: StreamMode,
+    seal: Seal,
+) -> StreamCall {
+    StreamCall {
         realm: env.realm_id,
         procedure: procedure.to_string(),
-        target: provider.node_id(),
+        target,
         mode,
         payload: Value::Bytes(b"one".to_vec()),
         seal: Some(seal),
         ..StreamCall::default()
-    };
-    let to = Seal::To(key.clone());
+    }
+}
 
-    let stream = caller
-        .open_stream(open(&watch, StreamMode::ServerStream, to.clone()))
-        .await
-        .unwrap();
+/// A sealed watch opens and delivers its chunks, then ends on both sides.
+async fn a_sealed_watch_answers_sealed(caller: &Link, call: StreamCall) {
+    let stream = caller.open_stream(call).await.unwrap();
     assert!(stream.sealed());
     let (events, ended) = drained(&stream).await;
     assert_eq!(
@@ -325,11 +346,11 @@ async fn a_keyed_provider_serves_sealed_streams_both_ways() {
         ]
     );
     assert_eq!(ended, LinkError::EndOfStream);
+}
 
-    let stream = caller
-        .open_stream(open(&count, StreamMode::ClientStream, to.clone()))
-        .await
-        .unwrap();
+/// A sealed count takes the caller's chunks and replies their total.
+async fn a_sealed_count_replies_sealed(caller: &Link, call: StreamCall) {
+    let stream = caller.open_stream(call).await.unwrap();
     for chunk in [&b"abc"[..], b"de"] {
         stream.send(chunk).await.unwrap();
     }
@@ -341,6 +362,52 @@ async fn a_keyed_provider_serves_sealed_streams_both_ways() {
             payload: Value::Int(5)
         }]
     );
+}
+
+/// An open sealed to a key the provider never held is refused in the
+/// clear, naming the key `keyring` holds now.
+async fn a_stranger_s_key_is_refused_naming_the_current(
+    caller: &Link,
+    call: StreamCall,
+    keyring: &Keyring,
+) {
+    let stream = caller.open_stream(call).await.unwrap();
+    let current: String = keyring
+        .current_id()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        drained(&stream).await.1,
+        LinkError::Stream {
+            code: "sealed_refused".into(),
+            message: current,
+            relay: false
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyed_provider_serves_sealed_streams_both_ways() {
+    let env = TestStations::start(Profile::PqHybrid);
+    let keyring = Arc::new(Keyring::system(env.profile).unwrap());
+    let provider = node(&env, Some(keyring.clone())).await.unwrap();
+    let caller = node(&env, None).await.unwrap();
+    let watch = record::own_procedure(&provider.node_id(), "watch");
+    let count = record::own_procedure(&provider.node_id(), "count");
+    let vault = record::own_procedure(&provider.node_id(), "vault");
+    let guarded = record::own_procedure(&provider.node_id(), "guarded");
+    let _served = serve_streams(&env, &provider, [&watch, &count, &vault, &guarded]).await;
+
+    let key = advertised_key(&caller, &watch).await.unwrap();
+    let target = provider.node_id();
+    let open = |procedure: &str, mode, seal: Seal| open_call(&env, procedure, target, mode, seal);
+    let to = Seal::To(key.clone());
+
+    a_sealed_watch_answers_sealed(&caller, open(&watch, StreamMode::ServerStream, to.clone()))
+        .await;
+    a_sealed_count_replies_sealed(&caller, open(&count, StreamMode::ClientStream, to.clone()))
+        .await;
 
     // A refusal after the open opened goes sealed, and opens to its code.
     let stream = caller
@@ -355,27 +422,12 @@ async fn a_keyed_provider_serves_sealed_streams_both_ways() {
     // Sealed to a key the provider never held: refused in the clear, naming
     // the key it holds now.
     let stranger = seal::PrivateKey::generate(env.profile).unwrap();
-    let stream = caller
-        .open_stream(open(
-            &watch,
-            StreamMode::ServerStream,
-            Seal::To(stranger.public_key().carried().to_vec()),
-        ))
-        .await
-        .unwrap();
-    let current: String = keyring
-        .current_id()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    assert_eq!(
-        drained(&stream).await.1,
-        LinkError::Stream {
-            code: "sealed_refused".into(),
-            message: current,
-            relay: false
-        }
+    let stranger_open = open(
+        &watch,
+        StreamMode::ServerStream,
+        Seal::To(stranger.public_key().carried().to_vec()),
     );
+    a_stranger_s_key_is_refused_naming_the_current(&caller, stranger_open, &keyring).await;
 
     // A clear open of a required procedure is refused sealed_required.
     let stream = caller

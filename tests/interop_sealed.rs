@@ -77,6 +77,36 @@ async fn until_served(pool: &Pool, c: Call) -> Result<(Value, Report), PoolError
     }
 }
 
+/// One call to macula's vault, `confidential` as given, answered sealed by
+/// `provider`; returns its report.
+async fn sealed_call(
+    pool: &Pool,
+    realm: [u8; 32],
+    vault: &str,
+    provider: [u8; 32],
+    confidential: Confidentiality,
+) -> Report {
+    let answered = until_served(
+        pool,
+        Call {
+            realm,
+            procedure: vault.to_string(),
+            payload: Value::Map(vec![(Value::text("n"), Value::Int(1))]),
+            timeout: Duration::from_secs(10),
+            confidential,
+            ..Call::default()
+        },
+    )
+    .await;
+    println!("sealed call ({confidential:?}): {answered:?}");
+    let (result, report) = answered.unwrap();
+    assert_eq!(result, Value::text("kept by erlang"));
+    println!("call report: {report:?}");
+    assert_eq!((report.sealed, report.provider), (1, provider));
+    assert!(report.seal_key_id.is_some());
+    report
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "interop: run by scripts/interop/sealed.sh"]
 async fn a_sealed_call_and_stream_reach_a_required_macula_provider() {
@@ -86,25 +116,9 @@ async fn a_sealed_call_and_stream_reach_a_required_macula_provider() {
     let watch = record::own_procedure(&provider, "watch");
     let mut call_key = None;
     for confidential in [Confidentiality::Preferred, Confidentiality::Required] {
-        let answered = until_served(
-            &pool,
-            Call {
-                realm,
-                procedure: vault.clone(),
-                payload: Value::Map(vec![(Value::text("n"), Value::Int(1))]),
-                timeout: Duration::from_secs(10),
-                confidential,
-                ..Call::default()
-            },
-        )
-        .await;
-        println!("sealed call ({confidential:?}): {answered:?}");
-        let (result, report) = answered.unwrap();
-        assert_eq!(result, Value::text("kept by erlang"));
-        println!("call report: {report:?}");
-        assert_eq!((report.sealed, report.provider), (1, provider));
-        assert!(report.seal_key_id.is_some());
-        call_key = report.seal_key_id;
+        call_key = sealed_call(&pool, realm, &vault, provider, confidential)
+            .await
+            .seal_key_id;
     }
 
     let stream = pool

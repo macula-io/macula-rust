@@ -370,16 +370,19 @@ fn rewritten(frame: &[u8], f: impl FnOnce(&mut Vec<(Value, Value)>)) -> Vec<u8> 
     cbor::encode(&Value::Map(pairs)).unwrap()
 }
 
+/// A frame's map with its version set to 3.
+fn version_3(p: &mut [(Value, Value)]) {
+    for (k, v) in p.iter_mut() {
+        if *k == Value::text("version") {
+            *v = Value::Int(3);
+        }
+    }
+}
+
 #[test]
 fn a_frame_is_read_strictly_in_macula_s_order() {
     let first = opener();
-    let v3 = rewritten(&first, |p| {
-        for (k, v) in p.iter_mut() {
-            if *k == Value::text("version") {
-                *v = Value::Int(3);
-            }
-        }
-    });
+    let v3 = rewritten(&first, |p| version_3(p));
     assert_eq!(
         read_opener(&v3).unwrap_err(),
         HandshakeError::UnsupportedVersion

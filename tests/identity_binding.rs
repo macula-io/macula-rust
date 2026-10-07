@@ -77,95 +77,111 @@ fn flipped(bytes: &[u8], at: usize) -> Vec<u8> {
 #[test]
 fn bindings_and_statements_macula_made_verify_here() {
     for e in entries() {
-        let p = e.profile;
-        assert_eq!(
-            node_id_of(&e.identity_key, p).to_vec(),
-            e.node_id,
-            "{p:?}: node_id"
-        );
-        for (name, tbs) in [
-            ("TLS binding", &e.tls_binding.tbs),
-            ("TLS status", &e.tls_status.tbs),
-            ("CONNECT binding", &e.connect_binding.tbs),
-            ("CONNECT status", &e.connect_status.tbs),
-        ] {
-            let value = cbor::decode(tbs).unwrap();
-            assert_eq!(
-                &cbor::encode(&value).unwrap(),
-                tbs,
-                "{p:?}: {name} re-encodes to macula's bytes"
-            );
-        }
+        macula_entry_verifies(&e);
+        macula_entry_refusals(&e);
+    }
+}
 
-        let info =
-            verify_tls_binding(&e.tls_binding, &e.identity_key, p, &e.leaf, e.now_ms).unwrap();
-        assert_eq!(info.use_, BindingUse::Tls);
-        assert_eq!(info.node_id.to_vec(), e.node_id);
-        assert_eq!(info.not_after, e.now_ms + 7 * DAY_MS);
-        verify_status(&e.tls_status, &e.tls_binding, &e.identity_key, p, e.now_ms).unwrap();
-        verify_connect_binding(
+/// One entry macula made: its node_id, its tbs bytes re-encoded here, and
+/// its bindings and statements verified.
+fn macula_entry_verifies(e: &Entry) {
+    let p = e.profile;
+    assert_eq!(
+        node_id_of(&e.identity_key, p).to_vec(),
+        e.node_id,
+        "{p:?}: node_id"
+    );
+    tbs_reencode_to_macula_s_bytes(e);
+
+    let info = verify_tls_binding(&e.tls_binding, &e.identity_key, p, &e.leaf, e.now_ms).unwrap();
+    assert_eq!(info.use_, BindingUse::Tls);
+    assert_eq!(info.node_id.to_vec(), e.node_id);
+    assert_eq!(info.not_after, e.now_ms + 7 * DAY_MS);
+    verify_status(&e.tls_status, &e.tls_binding, &e.identity_key, p, e.now_ms).unwrap();
+    verify_connect_binding(
+        &e.connect_binding,
+        &e.identity_key,
+        p,
+        &e.connect_key,
+        e.now_ms,
+    )
+    .unwrap();
+    verify_status(
+        &e.connect_status,
+        &e.connect_binding,
+        &e.identity_key,
+        p,
+        e.now_ms,
+    )
+    .unwrap();
+}
+
+/// Each of an entry's tbs decodes and re-encodes to macula's bytes.
+fn tbs_reencode_to_macula_s_bytes(e: &Entry) {
+    let p = e.profile;
+    for (name, tbs) in [
+        ("TLS binding", &e.tls_binding.tbs),
+        ("TLS status", &e.tls_status.tbs),
+        ("CONNECT binding", &e.connect_binding.tbs),
+        ("CONNECT status", &e.connect_status.tbs),
+    ] {
+        let value = cbor::decode(tbs).unwrap();
+        assert_eq!(
+            &cbor::encode(&value).unwrap(),
+            tbs,
+            "{p:?}: {name} re-encodes to macula's bytes"
+        );
+    }
+}
+
+/// One entry macula made, refused for another leaf, the other binding, the
+/// other profile and past its window.
+fn macula_entry_refusals(e: &Entry) {
+    let p = e.profile;
+    let mut other_leaf = e.leaf.clone();
+    other_leaf.push(0);
+    assert_eq!(
+        verify_tls_binding(&e.tls_binding, &e.identity_key, p, &other_leaf, e.now_ms).unwrap_err(),
+        BindingError::KeyMismatch
+    );
+    assert_eq!(
+        verify_tls_binding(
             &e.connect_binding,
             &e.identity_key,
             p,
             &e.connect_key,
-            e.now_ms,
+            e.now_ms
         )
-        .unwrap();
+        .unwrap_err(),
+        BindingError::BindingSignatureInvalid
+    );
+    assert_eq!(
         verify_status(
-            &e.connect_status,
+            &e.tls_status,
             &e.connect_binding,
             &e.identity_key,
             p,
-            e.now_ms,
+            e.now_ms
         )
-        .unwrap();
-
-        let mut other_leaf = e.leaf.clone();
-        other_leaf.push(0);
-        assert_eq!(
-            verify_tls_binding(&e.tls_binding, &e.identity_key, p, &other_leaf, e.now_ms)
-                .unwrap_err(),
-            BindingError::KeyMismatch
-        );
-        assert_eq!(
-            verify_tls_binding(
-                &e.connect_binding,
-                &e.identity_key,
-                p,
-                &e.connect_key,
-                e.now_ms
-            )
+        .unwrap_err(),
+        BindingError::StatusBindingMismatch
+    );
+    assert_eq!(
+        verify_tls_binding(&e.tls_binding, &e.identity_key, other(p), &e.leaf, e.now_ms)
             .unwrap_err(),
-            BindingError::BindingSignatureInvalid
-        );
-        assert_eq!(
-            verify_status(
-                &e.tls_status,
-                &e.connect_binding,
-                &e.identity_key,
-                p,
-                e.now_ms
-            )
-            .unwrap_err(),
-            BindingError::StatusBindingMismatch
-        );
-        assert_eq!(
-            verify_tls_binding(&e.tls_binding, &e.identity_key, other(p), &e.leaf, e.now_ms)
-                .unwrap_err(),
-            BindingError::BindingSignatureInvalid
-        );
-        assert_eq!(
-            verify_tls_binding(
-                &e.tls_binding,
-                &e.identity_key,
-                p,
-                &e.leaf,
-                e.now_ms + 7 * DAY_MS + 6 * MINUTE_MS
-            )
-            .unwrap_err(),
-            BindingError::Expired
-        );
-    }
+        BindingError::BindingSignatureInvalid
+    );
+    assert_eq!(
+        verify_tls_binding(
+            &e.tls_binding,
+            &e.identity_key,
+            p,
+            &e.leaf,
+            e.now_ms + 7 * DAY_MS + 6 * MINUTE_MS
+        )
+        .unwrap_err(),
+        BindingError::Expired
+    );
 }
 
 #[test]
@@ -253,10 +269,26 @@ fn bindings_and_statements_made_here_verify_and_hold_their_windows() {
         now + 60 * MINUTE_MS
     );
 
+    made_here_held_to_their_windows(&tls, &bound, &status, &carried, now);
+    windows_a_verifier_refuses_are_not_issued(&identity, &bound, now);
+
+    // A CONNECT key has no node_id to bind for.
+    assert!(tls_binding(&connect, b"a leaf", now, now + DAY_MS).is_err());
+}
+
+/// A binding and a statement made here, refused before and after their
+/// windows.
+fn made_here_held_to_their_windows(
+    tls: &SignedTbs,
+    bound: &SignedTbs,
+    status: &SignedTbs,
+    carried: &[u8],
+    now: i64,
+) {
     assert_eq!(
         verify_tls_binding(
-            &tls,
-            &carried,
+            tls,
+            carried,
             Profile::PqPure,
             b"a leaf",
             now - 6 * MINUTE_MS
@@ -266,9 +298,9 @@ fn bindings_and_statements_made_here_verify_and_hold_their_windows() {
     );
     assert_eq!(
         verify_status(
-            &status,
-            &bound,
-            &carried,
+            status,
+            bound,
+            carried,
             Profile::PqPure,
             now + 66 * MINUTE_MS
         )
@@ -276,38 +308,31 @@ fn bindings_and_statements_made_here_verify_and_hold_their_windows() {
         BindingError::StatusExpired
     );
     assert_eq!(
-        verify_status(
-            &status,
-            &bound,
-            &carried,
-            Profile::PqPure,
-            now - 6 * MINUTE_MS
-        )
-        .unwrap_err(),
+        verify_status(status, bound, carried, Profile::PqPure, now - 6 * MINUTE_MS).unwrap_err(),
         BindingError::StatusFutureDated
     );
+}
 
+/// The windows a verifier would refuse, never issued.
+fn windows_a_verifier_refuses_are_not_issued(identity: &NodeKey, bound: &SignedTbs, now: i64) {
     // A window a verifier would refuse is not issued: backwards, longer than
     // 7 days for a binding or an hour for a statement, or negative.
     assert_eq!(
-        tls_binding(&identity, b"a leaf", now, now - 1).unwrap_err(),
+        tls_binding(identity, b"a leaf", now, now - 1).unwrap_err(),
         BindingError::ValidityWindow
     );
     assert_eq!(
-        tls_binding(&identity, b"a leaf", now, now + 7 * DAY_MS + 1).unwrap_err(),
+        tls_binding(identity, b"a leaf", now, now + 7 * DAY_MS + 1).unwrap_err(),
         BindingError::ValidityWindow
     );
     assert_eq!(
-        status_statement(&identity, &bound, now, now + 60 * MINUTE_MS + 1).unwrap_err(),
+        status_statement(identity, bound, now, now + 60 * MINUTE_MS + 1).unwrap_err(),
         BindingError::ValidityWindow
     );
     assert_eq!(
-        tls_binding(&identity, b"a leaf", -1, now).unwrap_err(),
+        tls_binding(identity, b"a leaf", -1, now).unwrap_err(),
         BindingError::ValidityWindow
     );
-
-    // A CONNECT key has no node_id to bind for.
-    assert!(tls_binding(&connect, b"a leaf", now, now + DAY_MS).is_err());
 }
 
 #[test]

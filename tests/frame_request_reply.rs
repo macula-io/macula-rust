@@ -178,27 +178,14 @@ fn a_request_altered_or_from_another_caller_is_refused() {
     let k = keys(Profile::PqPure);
     let frame = arrived(&sign_call(&call_spec(&k), &k.caller).unwrap());
     // One tbs byte changed.
-    let altered = rewrite_object(&frame, "request", |object| {
-        if let Some(Value::Bytes(tbs)) = object
-            .iter_mut()
-            .find(|(k, _)| *k == Value::text("tbs"))
-            .map(|(_, v)| v)
-        {
-            let at = tbs.len() / 2;
-            tbs[at] ^= 1;
-        }
-    });
+    let altered = rewrite_object(&frame, "request", |object| flip_a_tbs_byte(object));
     assert_eq!(
         verify_request(&altered, Profile::PqPure).unwrap_err(),
         FrameError::SignatureInvalid
     );
     // Another key carried in place of the caller's.
     let swapped = rewrite_object(&frame, "request", |object| {
-        for (k2, v) in object.iter_mut() {
-            if *k2 == Value::text("key") {
-                *v = Value::Bytes(k.station.public_key());
-            }
-        }
+        carry_key(object, &k.station.public_key())
     });
     assert_eq!(
         verify_request(&swapped, Profile::PqPure).unwrap_err(),
@@ -223,13 +210,35 @@ fn rewrite_object(frame: &Value, name: &str, mut f: impl FnMut(&mut Vec<(Value, 
         unreachable!()
     };
     for (k, v) in pairs.iter_mut() {
+        let Value::Map(object) = v else {
+            continue;
+        };
         if *k == Value::text(name) {
-            if let Value::Map(object) = v {
-                f(object);
-            }
+            f(object);
         }
     }
     Value::Map(pairs)
+}
+
+/// Changes the byte in the middle of an object's tbs.
+fn flip_a_tbs_byte(object: &mut [(Value, Value)]) {
+    if let Some(Value::Bytes(tbs)) = object
+        .iter_mut()
+        .find(|(k, _)| *k == Value::text("tbs"))
+        .map(|(_, v)| v)
+    {
+        let at = tbs.len() / 2;
+        tbs[at] ^= 1;
+    }
+}
+
+/// Puts `key` in place of the key an object carries.
+fn carry_key(object: &mut [(Value, Value)], key: &[u8]) {
+    for (k, v) in object.iter_mut() {
+        if *k == Value::text("key") {
+            *v = Value::Bytes(key.to_vec());
+        }
+    }
 }
 
 #[test]

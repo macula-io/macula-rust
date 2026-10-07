@@ -128,6 +128,39 @@ async fn liar_for(
     liar
 }
 
+/// A liar's answer with another content's manifest `m` under `mcid`, then
+/// that content's chunks.
+fn another_content_answer(
+    mcid: &Mcid,
+    m: &manifest::Manifest,
+    chunks: &[Vec<u8>],
+    want: &str,
+    asked: &[u8],
+) -> Value {
+    if want == "root" {
+        return manifest_body(mcid, m);
+    }
+    block_body(asked, &chunk_of(m, chunks, asked))
+}
+
+/// A liar's answer with the right manifest `m`, then its chunks with their
+/// first byte changed, each one asked for counted.
+fn altered_chunk_answer(
+    m: &manifest::Manifest,
+    chunks: &[Vec<u8>],
+    counter: &AtomicUsize,
+    want: &str,
+    asked: &[u8],
+) -> Value {
+    if want == "root" {
+        return manifest_body(&m.mcid, m);
+    }
+    counter.fetch_add(1, Ordering::SeqCst);
+    let mut b = chunk_of(m, chunks, asked);
+    b[0] ^= 0xff;
+    block_body(asked, &b)
+}
+
 fn chunk_of(m: &manifest::Manifest, chunks: &[Vec<u8>], asked: &[u8]) -> Vec<u8> {
     (0..chunks.len())
         .find(|i| chunk_mcid(m, *i).is_some_and(|c| c.as_slice() == asked))
@@ -345,10 +378,7 @@ async fn a_manifest_and_its_chunks_are_checked_against_their_content_ids() {
     // Another content's manifest for this content id.
     let (real_mcid, other_m) = (real.mcid, other.clone());
     let _first = liar_for(&sharing, &real.mcid, move |want, asked| {
-        if want == "root" {
-            return manifest_body(&real_mcid, &other_m);
-        }
-        block_body(&asked, &chunk_of(&other_m, &other_chunks, &asked))
+        another_content_answer(&real_mcid, &other_m, &other_chunks, &want, &asked)
     })
     .await;
     let got = fetcher
@@ -364,13 +394,7 @@ async fn a_manifest_and_its_chunks_are_checked_against_their_content_ids() {
     let asked_count = Arc::new(AtomicUsize::new(0));
     let (counter, real_m) = (asked_count.clone(), real.clone());
     let _second = liar_for(&sharing, &real.mcid, move |want, asked| {
-        if want == "root" {
-            return manifest_body(&real_m.mcid, &real_m);
-        }
-        counter.fetch_add(1, Ordering::SeqCst);
-        let mut b = chunk_of(&real_m, &real_chunks, &asked);
-        b[0] ^= 0xff;
-        block_body(&asked, &b)
+        altered_chunk_answer(&real_m, &real_chunks, &counter, &want, &asked)
     })
     .await;
     let one_at_a_time = ContentOptions {

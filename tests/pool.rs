@@ -26,7 +26,11 @@ use macula_rust::record::{
 use macula_rust::record::{
     NodeRecordOptions, ProcedureAdvertisementOptions, RecordType, StationEndpointOptions,
 };
-use macula_rust::station_link::{handler, stream_handler, LinkError, Publication, StreamEvent};
+use macula_rust::station_link::{
+    handler, stream_handler, LinkError, Publication, Request, Stream, StreamEvent,
+};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 
 const ORG: &str = "mcl-echo";
 const PROCEDURE: &str = "mcl-echo/echo";
@@ -159,6 +163,33 @@ async fn a_pool_links_every_seed_and_redials_a_dropped_one() {
     .await;
 }
 
+/// Publishes `text` on TOPIC and answers how many times `sub` hears it
+/// within a second.
+async fn heard(
+    publisher: &Pool,
+    sub: &mut macula_rust::pool::Subscription,
+    realm: [u8; 32],
+    text: &str,
+) -> usize {
+    publisher
+        .publish(Publication {
+            realm,
+            topic: TOPIC.to_string(),
+            payload: Value::text(text),
+            ttl_ms: None,
+        })
+        .await
+        .unwrap();
+    let mut n = 0;
+    let until = tokio::time::Instant::now() + Duration::from_secs(1);
+    while let Ok(Some(event)) = tokio::time::timeout_at(until, sub.recv()).await {
+        if event.payload == Value::text(text) {
+            n += 1;
+        }
+    }
+    n
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subscription_hears_once_and_survives_a_redial() {
     let lab = Lab::start(Profile::PqPure);
@@ -173,31 +204,6 @@ async fn a_subscription_hears_once_and_survives_a_redial() {
         lab.subscribed(&a, &me, &realm, TOPIC) && lab.subscribed(&b, &me, &realm, TOPIC)
     })
     .await;
-
-    async fn heard(
-        publisher: &Pool,
-        sub: &mut macula_rust::pool::Subscription,
-        realm: [u8; 32],
-        text: &str,
-    ) -> usize {
-        publisher
-            .publish(Publication {
-                realm,
-                topic: TOPIC.to_string(),
-                payload: Value::text(text),
-                ttl_ms: None,
-            })
-            .await
-            .unwrap();
-        let mut n = 0;
-        let until = tokio::time::Instant::now() + Duration::from_secs(1);
-        while let Ok(Some(event)) = tokio::time::timeout_at(until, sub.recv()).await {
-            if event.payload == Value::text(text) {
-                n += 1;
-            }
-        }
-        n
-    }
 
     assert_eq!(heard(&publisher, &mut sub, realm, "first").await, 1);
     lab.drop_node(&a, &me);
@@ -434,6 +440,14 @@ async fn a_record_put_through_the_pool_is_found_by_type() {
     );
 }
 
+/// Sends "a" and "b", then closes.
+async fn two_chunks(s: Stream) -> Result<(), String> {
+    for chunk in ["a", "b"] {
+        s.send(chunk.as_bytes()).await.map_err(|e| e.to_string())?;
+    }
+    s.close().await.map_err(|e| e.to_string())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_dials_the_provider_s_station_and_is_released_promptly() {
     let lab = Lab::start(Profile::PqPure);
@@ -448,12 +462,7 @@ async fn a_stream_dials_the_provider_s_station_and_is_released_promptly() {
             realm.id,
             PROCEDURE,
             StreamMode::ServerStream,
-            stream_handler(|s| async move {
-                for chunk in ["a", "b"] {
-                    s.send(chunk.as_bytes()).await.map_err(|e| e.to_string())?;
-                }
-                s.close().await.map_err(|e| e.to_string())
-            }),
+            stream_handler(two_chunks),
         ))
         .await
         .unwrap();
@@ -581,6 +590,47 @@ async fn two_station_providers(
     (caller, realm, providers)
 }
 
+/// An echo that counts its entries, reports each on `entries` and holds its
+/// answer until `released` turns true.
+fn held_echo(
+    counted: Arc<AtomicUsize>,
+    entries: UnboundedSender<()>,
+    released: watch::Receiver<bool>,
+) -> Offer {
+    Offer::unary(
+        [0; 32],
+        PROCEDURE,
+        handler(move |r| held_answer(counted.clone(), entries.clone(), released.clone(), r)),
+    )
+}
+
+/// The body of [`held_echo`]'s handler.
+async fn held_answer(
+    counted: Arc<AtomicUsize>,
+    entries: UnboundedSender<()>,
+    mut released: watch::Receiver<bool>,
+    r: Request,
+) -> Result<Value, String> {
+    counted.fetch_add(1, Ordering::SeqCst);
+    let _ = entries.send(());
+    let _ = released.wait_for(|r| *r).await;
+    Ok(r.payload)
+}
+
+/// Releases the held handler at `release_at` once it has been entered, or
+/// at once when it was not entered within `timeout`.
+async fn release_once_entered(
+    entry: &mut UnboundedReceiver<()>,
+    timeout: Duration,
+    release_at: Instant,
+    release: &watch::Sender<bool>,
+) {
+    if tokio::time::timeout(timeout, entry.recv()).await.is_ok() {
+        tokio::time::sleep_until(release_at.into()).await;
+    }
+    let _ = release.send(true);
+}
+
 // macula-io/macula-rust#6: a CALL that has gone out is never sent again. A
 // handler slower than one candidate's share of the deadline is entered once
 // and its answer returned, for the share bounds reaching a station, not the
@@ -600,36 +650,14 @@ async fn a_call_that_went_out_is_never_sent_again() {
     let (entries, mut entry) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (release, released) = tokio::sync::watch::channel(false);
     let (caller, realm, _providers) = two_station_providers(&lab, "once", move || {
-        let counted = counted.clone();
-        let entries = entries.clone();
-        let released = released.clone();
-        Offer::unary(
-            [0; 32],
-            PROCEDURE,
-            handler(move |r| {
-                let counted = counted.clone();
-                let entries = entries.clone();
-                let mut released = released.clone();
-                async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    let _ = entries.send(());
-                    let _ = released.wait_for(|r| *r).await;
-                    Ok(r.payload)
-                }
-            }),
-        )
+        held_echo(counted.clone(), entries.clone(), released.clone())
     })
     .await;
     let mut c = call(realm.id, PROCEDURE, Value::text("hello"));
     let timeout = Duration::from_secs(12);
     c.timeout = timeout;
     let release_at = Instant::now() + timeout * 3 / 4;
-    let releasing = async {
-        if tokio::time::timeout(timeout, entry.recv()).await.is_ok() {
-            tokio::time::sleep_until(release_at.into()).await;
-        }
-        let _ = release.send(true);
-    };
+    let releasing = release_once_entered(&mut entry, timeout, release_at, &release);
     let (answered, ()) = tokio::join!(caller.call(c), releasing);
     assert!(
         matches!(&answered, Ok(v) if *v == Value::text("hello")),
@@ -643,6 +671,22 @@ async fn a_call_that_went_out_is_never_sent_again() {
     );
 }
 
+/// A server stream that counts its entries and closes at once.
+fn counted_close(counted: Arc<AtomicUsize>) -> Offer {
+    Offer::stream(
+        [0; 32],
+        PROCEDURE,
+        StreamMode::ServerStream,
+        stream_handler(move |s| count_and_close(counted.clone(), s)),
+    )
+}
+
+/// The body of [`counted_close`]'s handler.
+async fn count_and_close(counted: Arc<AtomicUsize>, s: Stream) -> Result<(), String> {
+    counted.fetch_add(1, Ordering::SeqCst);
+    s.close().await.map_err(|e| e.to_string())
+}
+
 // A stream the link refuses is not walked to the next candidate: every
 // candidate would refuse it alike, as macula scopes open_too_large to the
 // request.
@@ -651,22 +695,8 @@ async fn a_stream_the_link_refuses_is_not_walked() {
     let lab = Lab::start(Profile::PqPure);
     let entered = Arc::new(AtomicUsize::new(0));
     let counted = entered.clone();
-    let (caller, realm, _providers) = two_station_providers(&lab, "once-stream", move || {
-        let counted = counted.clone();
-        Offer::stream(
-            [0; 32],
-            PROCEDURE,
-            StreamMode::ServerStream,
-            stream_handler(move |s| {
-                let counted = counted.clone();
-                async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    s.close().await.map_err(|e| e.to_string())
-                }
-            }),
-        )
-    })
-    .await;
+    let (caller, realm, _providers) =
+        two_station_providers(&lab, "once-stream", move || counted_close(counted.clone())).await;
     let opened = caller
         .open_stream(StreamCall {
             realm: realm.id,
@@ -687,6 +717,12 @@ async fn a_stream_the_link_refuses_is_not_walked() {
     assert_eq!(entered.load(Ordering::SeqCst), 0, "no handler entered");
 }
 
+/// Signals on `tx` that it was reached, and echoes the payload.
+async fn signalled_echo(tx: UnboundedSender<()>, r: Request) -> Result<Value, String> {
+    tx.send(()).unwrap();
+    Ok(r.payload)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_required_call_reaches_no_provider_that_names_no_kem_key() {
     let lab = Lab::start(Profile::PqPure);
@@ -700,13 +736,7 @@ async fn a_required_call_reaches_no_provider_that_names_no_kem_key() {
         .serve(Offer::unary(
             realm,
             &ring,
-            handler(move |r| {
-                let tx = tx.clone();
-                async move {
-                    tx.send(()).unwrap();
-                    Ok(r.payload)
-                }
-            }),
+            handler(move |r| signalled_echo(tx.clone(), r)),
         ))
         .await
         .unwrap();

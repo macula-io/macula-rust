@@ -204,12 +204,22 @@ fn verify_mcid_checks_the_fields_macula_checks() {
 fn check_whole_refuses_chunks_that_do_not_describe_the_content_whole() {
     let m = three_chunks();
     let (empty, _) = made(&[], "unnamed", DEFAULT_CHUNK_SIZE);
-    let cases: Vec<(&str, Manifest, bool)> = vec![
+    let mut cases: Vec<(&str, Manifest, bool)> = vec![
         ("as created", m.clone(), true),
         ("empty content, as created", empty, true),
+    ];
+    cases.extend(not_whole_edits(&m));
+    for (name, manifest, whole) in cases {
+        held_whole(name, &manifest, whole);
+    }
+}
+
+/// Edits of `m` whose chunks no longer describe its content whole.
+fn not_whole_edits(m: &Manifest) -> Vec<(&'static str, Manifest, bool)> {
+    vec![
         (
             "a chunk cut short before the last, with the count still right",
-            edited(&m, |c| {
+            edited(m, |c| {
                 c.chunks[0].size -= 1;
                 c.chunks[1].offset -= 1;
                 c.chunks[2].offset -= 1;
@@ -219,12 +229,12 @@ fn check_whole_refuses_chunks_that_do_not_describe_the_content_whole() {
         ),
         (
             "a chunk counted that isn't listed",
-            edited(&m, |c| c.chunk_count += 1),
+            edited(m, |c| c.chunk_count += 1),
             false,
         ),
         (
             "chunks out of index order",
-            edited(&m, |c| {
+            edited(m, |c| {
                 c.chunks[0].index = 1;
                 c.chunks[1].index = 0;
             }),
@@ -232,39 +242,38 @@ fn check_whole_refuses_chunks_that_do_not_describe_the_content_whole() {
         ),
         (
             "a gap between chunks",
-            edited(&m, |c| c.chunks[1].offset += 1),
+            edited(m, |c| c.chunks[1].offset += 1),
             false,
         ),
-        (
-            "an empty chunk",
-            edited(&m, |c| c.chunks[2].size = 0),
-            false,
-        ),
+        ("an empty chunk", edited(m, |c| c.chunks[2].size = 0), false),
         (
             "a chunk larger than the chunk size",
-            edited(&m, |c| c.chunks[2].size = c.chunk_size + 1),
+            edited(m, |c| c.chunks[2].size = c.chunk_size + 1),
             false,
         ),
         (
             "a size the chunks don't add up to",
-            edited(&m, |c| c.size += 1),
+            edited(m, |c| c.size += 1),
             false,
         ),
         (
             "a chunk size of zero",
-            edited(&m, |c| c.chunk_size = 0),
+            edited(m, |c| c.chunk_size = 0),
             false,
         ),
-    ];
-    for (name, manifest, whole) in cases {
-        let got = check_whole(&manifest);
-        assert_eq!(got.is_ok(), whole, "{name}: {got:?}");
-        if !whole {
-            assert!(
-                matches!(got, Err(ManifestError::NotWhole(_))),
-                "{name}: {got:?}"
-            );
-        }
+    ]
+}
+
+/// check_whole on one manifest: accepted when `whole`, and refused as not
+/// whole otherwise.
+fn held_whole(name: &str, manifest: &Manifest, whole: bool) {
+    let got = check_whole(manifest);
+    assert_eq!(got.is_ok(), whole, "{name}: {got:?}");
+    if !whole {
+        assert!(
+            matches!(got, Err(ManifestError::NotWhole(_))),
+            "{name}: {got:?}"
+        );
     }
 }
 
