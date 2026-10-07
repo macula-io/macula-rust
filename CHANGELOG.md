@@ -13,7 +13,12 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [Unreleased]
+### [0.8.0] - 2026-10-07
+
+The security register's Rust gaps closed: the key exchange held to
+ML-KEM-1024, the caller a handler sees, a provider's sealed answer, resealing
+a call after a key rotation, and keys at rest on Windows. Every function is
+held to new lint limits.
 
 #### Breaking
 
@@ -50,6 +55,9 @@ usually touches both, but their version numbers don't move in lockstep.
   offer, and a station without SecP384r1MLKEM1024 fails the handshake as
   `DialError::Connection`. The negotiated group is not read back after the
   handshake: quinn 0.11 reports it only under a private test feature.
+- Clippy denies nesting past 3, cognitive complexity past 15 and functions
+  past 60 lines in both crates, as CI gates; every function was flattened
+  to them with no change in behaviour.
 
 #### Fixed
 
@@ -564,6 +572,21 @@ this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
 same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
+
+### [ffi-0.8.0] - 2026-10-07
+
+On `macula-rust` 0.8: the core's register fixes through the bindings.
+
+#### Changed
+
+- **Breaking:** `FfiNodeKey::save_to_keystore` keeps the key's private part
+  only, and `load_from_keystore` refuses a key kept by ffi-0.7.0: create the
+  identity again (core #19).
+- On Windows `FfiNodeKey::save`, `load` and `load_or_create` refuse a key
+  file and name Credential Manager (`save_to_keystore`), where the key is
+  persisted on the machine only (core #19).
+- Served handlers no longer see a sender-written `caller` key (core #13),
+  and a pool call reseals once after a key rotation (core #20).
 
 ### [ffi-0.7.0] - 2026-10-06
 
