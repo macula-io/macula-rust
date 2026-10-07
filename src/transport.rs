@@ -218,16 +218,23 @@ mod tests {
         .expect("an endpoint");
         let port = endpoint.local_addr().expect("an address").port();
         let accepting = endpoint.clone();
-        tokio::spawn(async move {
-            while let Some(incoming) = accepting.accept().await {
-                tokio::spawn(async move {
-                    if let Ok(connection) = incoming.await {
-                        connection.closed().await;
-                    }
-                });
-            }
-        });
+        tokio::spawn(hold_connections(accepting));
         (endpoint, port)
+    }
+
+    /// Accepts every connection the station's endpoint receives, holding each
+    /// until it closes.
+    async fn hold_connections(accepting: quinn::Endpoint) {
+        while let Some(incoming) = accepting.accept().await {
+            tokio::spawn(hold_until_closed(incoming));
+        }
+    }
+
+    /// Holds one incoming connection, once established, until it closes.
+    async fn hold_until_closed(incoming: quinn::Incoming) {
+        if let Ok(connection) = incoming.await {
+            connection.closed().await;
+        }
     }
 
     fn macula_station() -> (quinn::Endpoint, u16, CertificateDer<'static>) {
