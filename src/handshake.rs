@@ -374,35 +374,15 @@ pub fn answer_challenge(
     )?;
     let client_node_id = node_id_of(&s.identity_key, s.profile);
     let e = session_exported(s.version, s.export, &client_node_id, &station_node_id)?;
-    let proof = s
-        .connect_key
-        .sign(&proof_message(
-            s.version,
-            f.bytes("nonce"),
-            &station_node_id,
-            &client_node_id,
-            s.leaf,
-            challenge,
-            &e,
-            s.capabilities,
-        ))
-        .map_err(HandshakeError::Key)?;
-    let connect = encode_frame_version(
-        s.version,
-        "connect",
-        vec![
-            entry("identity_key", Value::Bytes(s.identity_key.clone())),
-            entry("connect_key", Value::Bytes(connect_key)),
-            entry("connect_binding", s.connect_binding.to_value()),
-            entry("connect_status", s.connect_status.to_value()),
-            entry("proof", Value::Bytes(proof)),
-            entry("capabilities", Value::Int(i128::from(s.capabilities))),
-            entry(
-                "member_endorsement",
-                Value::Bytes(s.member_endorsement.clone()),
-            ),
-        ],
-    );
+    let connect = signed_connect(
+        s,
+        f.bytes("nonce"),
+        &station_node_id,
+        &client_node_id,
+        challenge,
+        &e,
+        connect_key,
+    )?;
     Ok((
         connect.clone(),
         Station {
@@ -418,6 +398,50 @@ pub fn answer_challenge(
             connect,
             client_node_id,
         },
+    ))
+}
+
+/// The CONNECT to send once every check of the challenge passed: the proof
+/// over the challenge's nonce, both node_ids, the leaf, the challenge and E,
+/// signed with the CONNECT key, carried with the client's keys, binding and
+/// status statement.
+fn signed_connect(
+    s: &ClientSession<'_>,
+    nonce: &[u8],
+    station_node_id: &[u8; 32],
+    client_node_id: &[u8; 32],
+    challenge: &[u8],
+    e: &[u8],
+    connect_key: Vec<u8>,
+) -> Result<Vec<u8>, HandshakeError> {
+    let proof = s
+        .connect_key
+        .sign(&proof_message(
+            s.version,
+            nonce,
+            station_node_id,
+            client_node_id,
+            s.leaf,
+            challenge,
+            e,
+            s.capabilities,
+        ))
+        .map_err(HandshakeError::Key)?;
+    Ok(encode_frame_version(
+        s.version,
+        "connect",
+        vec![
+            entry("identity_key", Value::Bytes(s.identity_key.clone())),
+            entry("connect_key", Value::Bytes(connect_key)),
+            entry("connect_binding", s.connect_binding.to_value()),
+            entry("connect_status", s.connect_status.to_value()),
+            entry("proof", Value::Bytes(proof)),
+            entry("capabilities", Value::Int(i128::from(s.capabilities))),
+            entry(
+                "member_endorsement",
+                Value::Bytes(s.member_endorsement.clone()),
+            ),
+        ],
     ))
 }
 
@@ -552,39 +576,11 @@ fn check_connect(
         f.bytes("connect_key"),
         f.bytes("proof"),
     );
-    if !carried_key_well_formed(identity_key, s.profile)
-        || !carried_key_well_formed(connect_key, s.profile)
-        || proof.len() != signature_size(s.profile)
-    {
-        return Err(HandshakeError::Malformed);
-    }
-    if shares_a_half(identity_key, connect_key) || in_leaf(connect_key, &s.leaf) {
-        return Err(HandshakeError::KeyPurposeReuse);
-    }
+    check_carried_keys(identity_key, connect_key, proof, s)?;
     let node_id = node_id_of(identity_key, s.profile);
-    let puzzle = match s.puzzle_mode {
-        PuzzleMode::Off => PuzzleResult::NotChecked,
-        _ if puzzle_solved(&node_id, s.puzzle_difficulty) => PuzzleResult::Solved,
-        _ => PuzzleResult::Unsolved,
-    };
-    if puzzle == PuzzleResult::Unsolved && s.puzzle_mode == PuzzleMode::Enforce {
-        return Err(HandshakeError::PuzzleInvalid);
-    }
-    let connect_binding = f.signed("connect_binding");
-    let binding = verify_connect_binding(
-        &connect_binding,
-        identity_key,
-        s.profile,
-        connect_key,
-        s.now_ms,
-    )?;
-    let expires_at = verify_status(
-        &f.signed("connect_status"),
-        &connect_binding,
-        identity_key,
-        s.profile,
-        s.now_ms,
-    )?;
+    let puzzle = puzzle_verdict(&node_id, s)?;
+    let (connect_binding, binding_not_after, expires_at) =
+        verified_connect_statements(&f, identity_key, connect_key, s)?;
     // The station's own challenge decodes: it built it.
     let challenge = decode(&s.challenge, "challenge", &[CHALLENGE_KEYS])
         .map_err(|_| HandshakeError::ProofInvalid)?;
@@ -605,20 +601,8 @@ fn check_connect(
     if !verify(&message, proof, connect_key, s.profile) {
         return Err(HandshakeError::ProofInvalid);
     }
-    let session_proof = match (&s.v5, *version) {
-        (Some(v5), VERSION_5) => Some((v5.sign_session_proof)(
-            &node_id,
-            &session_proof_message(
-                &e,
-                &s.challenge,
-                connect,
-                &station_node_id,
-                &node_id,
-                s.capabilities,
-            ),
-        )?),
-        _ => None,
-    };
+    let session_proof =
+        station_session_proof(s, *version, &e, connect, &station_node_id, &node_id)?;
     Ok((
         Client {
             node_id,
@@ -627,13 +611,100 @@ fn check_connect(
             connect_binding,
             capabilities,
             status_expires_at: expires_at,
-            binding_not_after: binding.not_after,
+            binding_not_after,
             puzzle,
             member_endorsement: f.bytes("member_endorsement").to_vec(),
             version: *version,
         },
         session_proof,
     ))
+}
+
+/// The CONNECT's carried keys and proof length: each key well formed and the
+/// proof a signature's length, then each key serving one purpose.
+fn check_carried_keys(
+    identity_key: &[u8],
+    connect_key: &[u8],
+    proof: &[u8],
+    s: &StationSession,
+) -> Result<(), HandshakeError> {
+    if !carried_key_well_formed(identity_key, s.profile)
+        || !carried_key_well_formed(connect_key, s.profile)
+        || proof.len() != signature_size(s.profile)
+    {
+        return Err(HandshakeError::Malformed);
+    }
+    if shares_a_half(identity_key, connect_key) || in_leaf(connect_key, &s.leaf) {
+        return Err(HandshakeError::KeyPurposeReuse);
+    }
+    Ok(())
+}
+
+/// The puzzle on the derived `node_id` in the station's mode, refused when
+/// unsolved and the station enforces it.
+fn puzzle_verdict(node_id: &[u8; 32], s: &StationSession) -> Result<PuzzleResult, HandshakeError> {
+    let puzzle = match s.puzzle_mode {
+        PuzzleMode::Off => PuzzleResult::NotChecked,
+        _ if puzzle_solved(node_id, s.puzzle_difficulty) => PuzzleResult::Solved,
+        _ => PuzzleResult::Unsolved,
+    };
+    if puzzle == PuzzleResult::Unsolved && s.puzzle_mode == PuzzleMode::Enforce {
+        return Err(HandshakeError::PuzzleInvalid);
+    }
+    Ok(puzzle)
+}
+
+/// The CONNECT binding and its status statement, verified at the station's
+/// time: the binding, its not_after, and the statement's expiry.
+fn verified_connect_statements(
+    f: &Fields,
+    identity_key: &[u8],
+    connect_key: &[u8],
+    s: &StationSession,
+) -> Result<(SignedTbs, i64, i64), HandshakeError> {
+    let connect_binding = f.signed("connect_binding");
+    let binding = verify_connect_binding(
+        &connect_binding,
+        identity_key,
+        s.profile,
+        connect_key,
+        s.now_ms,
+    )?;
+    let expires_at = verify_status(
+        &f.signed("connect_status"),
+        &connect_binding,
+        identity_key,
+        s.profile,
+        s.now_ms,
+    )?;
+    Ok((connect_binding, binding.not_after, expires_at))
+}
+
+/// In version 5 at a station that binds v5 sessions, the session proof for
+/// the client, signed only once every check passed; otherwise none.
+fn station_session_proof(
+    s: &StationSession,
+    version: i64,
+    e: &[u8],
+    connect: &[u8],
+    station_node_id: &[u8; 32],
+    node_id: &[u8; 32],
+) -> Result<Option<Vec<u8>>, HandshakeError> {
+    let session_proof = match (&s.v5, version) {
+        (Some(v5), VERSION_5) => Some((v5.sign_session_proof)(
+            node_id,
+            &session_proof_message(
+                e,
+                &s.challenge,
+                connect,
+                station_node_id,
+                node_id,
+                s.capabilities,
+            ),
+        )?),
+        _ => None,
+    };
+    Ok(session_proof)
 }
 
 /// What the CONNECT proof signs: the label, a zero byte, the nonce, the
