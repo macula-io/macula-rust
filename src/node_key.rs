@@ -3,17 +3,23 @@
 //! (draft-ietf-lamps-pq-composite-sigs), which signs with both halves and is
 //! valid only when both verify. An identity key's node_id (D5) solves the
 //! admission puzzle; a CONNECT key is bound to it (see `crate::binding`).
-//! Keys are stored in macula's seed form, readable by their owner only (see
-//! [`NodeKey::save`] and [`NodeKey::load`]).
+//! Keys are stored in macula's seed form: on unix in a key file readable by
+//! its owner only (see [`NodeKey::save`] and [`NodeKey::load`]), on Windows in
+//! Credential Manager only (see [`crate::keystore`] and
+//! [`NodeKey::save_to_keystore`]); a key file there is refused.
 //!
 //! The ML-DSA-87 half is macula-mldsa, the implementation macula-pqc signs
 //! TLS with, kept as its 32-byte seed. The RSA-PSS-4096 half is aws-lc-rs,
 //! already linked through rustls: constant-time, with a FIPS path.
 
 mod der;
+#[cfg(unix)]
 mod key_file;
+#[cfg(not(unix))]
+mod no_key_file;
+mod seed_form;
 
-pub use key_file::KeyFileError;
+pub use seed_form::KeyFileError;
 
 use std::fmt;
 

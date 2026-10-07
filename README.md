@@ -148,7 +148,7 @@ compatibility layer.
 
 | Primitive | Caller | Provider | Notes |
 |---|---|---|---|
-| Node keys (`node_key::NodeKey`) | ✅ | ✅ | `pq_hybrid` (the fleet's) or `pq_pure`; key files readable by the owner only, or the platform's secure store (`keystore`); pq_hybrid checked against the LAMPS draft's own vector and cross-verified with macula 12.8.0 |
+| Node keys (`node_key::NodeKey`) | ✅ | ✅ | `pq_hybrid` (the fleet's) or `pq_pure`; on unix key files readable by the owner only, or a key store (`keystore`); on Windows Credential Manager only (a key file is refused); a key store keeps the private part only; pq_hybrid checked against the LAMPS draft's own vector and cross-verified with macula 12.8.0 |
 | Pool of station links (`pool::Pool`) | ✅ | ✅ | Seeds pinned by node_id; realm keys pinned; links redialed with subscriptions and served procedures replayed |
 | One station link (`station_link::Link`) | ✅ | ✅ | Handshake v5 bound to the TLS session (v4 once after `unsupported_version`, never after a node was seen on v5), status statements both ways, neighbour signatures on v4 links in pq_hybrid, a liveness probe |
 | Calls by direct dial (`call`, `providers`) | ✅ | ✅ | Candidates tried freshest first; errors arrive as `LinkError::Provider` / `LinkError::Relay` |

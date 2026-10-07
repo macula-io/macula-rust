@@ -15,6 +15,21 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Breaking
+
+- A key store keeps a node key's private part only: the ML-DSA-87 seed, and
+  in pq_hybrid the RSA-PSS key as PKCS #1, at most 2,429 bytes, so it fits
+  Windows Credential Manager's 2,560-byte secret (#19). The public keys are
+  derived again on load. A key a store kept under 0.7.0 (the key-file form)
+  no longer loads: `load_from_keystore` refuses it
+  `KeyFileError::KeptInTheKeyFileForm`, which says to create the identity
+  again.
+- On Windows a node key lives in Credential Manager only, through
+  `keystore::KeyringStore` (#19). `NodeKey::save`, `load` and
+  `load_or_create` refuse there with `KeyFileError::NoKeyFile`, naming the
+  store to use; 0.7.0 wrote a key file Windows did not restrict. A CI job
+  round-trips both profiles through the real Credential Manager.
+
 #### Added
 
 - A pool call refused `sealed_refused` after its provider's KEM key

@@ -46,6 +46,18 @@ jobs:
       - run: ./scripts/build-teststation.sh
       - run: cargo test --workspace --all-features --locked
 
+  windows-keystore:
+    # A node key on Windows lives in Credential Manager only (#19): a real
+    # round trip through it, and a key file refused.
+    name: keystore on Windows (Credential Manager)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1
+      - run: cargo test -p macula-rust --lib --locked -- keystore:: node_key::
+
   doc:
     name: docs (deny broken links)
     runs-on: ubuntu-latest

@@ -1,8 +1,26 @@
 //! Overridable, per-platform secure storage for a node key.
 //!
-//! [`NodeKey::save`](crate::node_key::NodeKey::save)/[`load`](crate::node_key::NodeKey::load)
-//! write an owner-only key file, which suits a server or a desktop. A mobile
-//! app keeps its key in the platform's secure store instead: this module is
+//! Where a node key is kept at rest:
+//!
+//! - **unix**: an owner-only key file
+//!   ([`NodeKey::save`](crate::node_key::NodeKey::save)/[`load`](crate::node_key::NodeKey::load),
+//!   0o600 in a 0o700 directory, refused on load unless the effective user
+//!   owns it and nobody else can read it), or a key store from this module:
+//!   Linux keyutils ([`LinuxKeyutilsStore`]) or the platform's secure store
+//!   ([`KeyringStore`]).
+//! - **Windows**: Credential Manager only, through [`KeyringStore`]. A key
+//!   file is refused there with
+//!   [`KeyFileError::NoKeyFile`](crate::node_key::KeyFileError::NoKeyFile)
+//!   (macula-rust#19).
+//! - **mobile**: the platform's secure store, through [`KeyringStore`].
+//!
+//! Every store keeps the key's private part only, in one write: the
+//! ML-DSA-87 seed, and in pq_hybrid the RSA-PSS key as PKCS #1, at most 2,429
+//! bytes, within Credential Manager's 2,560-byte limit on one secret. The
+//! public keys are derived again on load. A key kept by macula-rust 0.7.0, in
+//! the key-file form, no longer loads; create the identity again.
+//!
+//! This module is
 //! a small [`KeyStore`] trait plus [`KeyringStore`], a
 //! default implementation backed by the `keyring` crate, which selects the
 //! actual native secure store per target automatically —
@@ -283,6 +301,32 @@ mod tests {
         let _ = store.delete_key();
 
         assert!(matches!(store.load_key(), Err(KeyStoreError::NotFound)));
+    }
+
+    // On Windows the node key lives in Credential Manager only: a real round
+    // trip of both profiles through KeyringStore, and a key file refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_node_key_round_trips_through_credential_manager_and_a_key_file_is_refused() {
+        use crate::node_key::{KeyFileError, NodeKey, Purpose};
+        use crate::profile::Profile;
+
+        for profile in [Profile::PqPure, Profile::PqHybrid] {
+            let account = format!("keystore-round-trip-{}", profile.name());
+            let store =
+                KeyringStore::new("macula-rust-test", &account).expect("Credential Manager");
+            let key = NodeKey::generate_identity(profile, 0).expect("a key");
+            let result = key
+                .save_to_keystore(&store)
+                .and_then(|()| NodeKey::load_from_keystore(&store, Purpose::Identity, profile));
+            store.delete_key().expect("cleanup delete should succeed");
+            let loaded = result.expect("save/load round trip through Credential Manager");
+            assert_eq!(loaded.public_key(), key.public_key(), "{profile:?}");
+        }
+        let path = std::env::temp_dir().join("macula-rust-test-key");
+        let refused = NodeKey::load_or_create(&path, Profile::PqPure);
+        assert!(matches!(refused, Err(KeyFileError::NoKeyFile)));
+        assert!(!path.exists(), "no key file written");
     }
 
     #[cfg(target_os = "linux")]
