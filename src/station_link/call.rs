@@ -91,24 +91,7 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     let mut request_id = [0u8; 16];
     aws_lc_rs::rand::fill(&mut request_id).map_err(|_| LinkError::Io("no randomness".into()))?;
     let deadline = (now_ms() + timeout.as_millis() as i64) as u64;
-    let (sealed, call_seal) = match &c.seal {
-        Some(Seal::To(key)) => {
-            let (sealed, s) = sealed_request(
-                inner.profile,
-                key,
-                seal::FRAME_CALL,
-                c.realm,
-                &c.procedure,
-                inner.self_id,
-                target,
-                request_id,
-                deadline,
-                &c.payload,
-            )?;
-            (Some(sealed), Some(s))
-        }
-        _ => (None, None),
-    };
+    let (sealed, call_seal) = sealed_call(inner, &c, target, request_id, deadline)?;
     let signed = frame::sign_call(
         &RequestSpec {
             request_id,
@@ -128,20 +111,15 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     )?;
     let request = frame::verify_request(&signed, inner.profile)?;
     let (outcome_tx, outcome) = oneshot::channel();
-    {
-        let mut state = inner.lock();
-        if let Some(e) = &state.ended {
-            return Err(e.clone());
-        }
-        state.pending.insert(
-            request_id,
-            Pending {
-                request,
-                seal: call_seal,
-                outcome: outcome_tx,
-            },
-        );
-    }
+    await_reply(
+        inner,
+        request_id,
+        Pending {
+            request,
+            seal: call_seal,
+            outcome: outcome_tx,
+        },
+    )?;
     let forget = || {
         inner.lock().pending.remove(&request_id);
     };
@@ -156,6 +134,46 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
         Ok(Err(_)) => Err(inner.lock().ended.clone().unwrap_or(LinkError::Closed)),
         Err(_) => Err(LinkError::CallTimeout),
     }
+}
+
+/// The call's payload sealed to the key its seal names, with what the sealing
+/// agreed; nothing when the call goes clear.
+fn sealed_call(
+    inner: &Inner,
+    c: &Call,
+    target: [u8; 32],
+    request_id: [u8; 16],
+    deadline: u64,
+) -> Result<(Option<frame::Sealed>, Option<CallSeal>), LinkError> {
+    match &c.seal {
+        Some(Seal::To(key)) => {
+            let (sealed, s) = sealed_request(
+                inner.profile,
+                key,
+                seal::FRAME_CALL,
+                c.realm,
+                &c.procedure,
+                inner.self_id,
+                target,
+                request_id,
+                deadline,
+                &c.payload,
+            )?;
+            Ok((Some(sealed), Some(s)))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+/// Files the call as pending under its request id, unless the link has
+/// ended, in which case its end is the call's error.
+fn await_reply(inner: &Inner, request_id: [u8; 16], pending: Pending) -> Result<(), LinkError> {
+    let mut state = inner.lock();
+    if let Some(e) = &state.ended {
+        return Err(e.clone());
+    }
+    state.pending.insert(request_id, pending);
+    Ok(())
 }
 
 /// A RESULT or ERROR matched to its pending call by the ids it claims, and
@@ -253,18 +271,25 @@ async fn probe_v5(inner: &Inner) -> Result<(), LinkError> {
         .send_control(&frame::liveness_ping_frame(&nonce))
         .await?;
     let mut done = inner.done_rx.clone();
-    let answered = async {
-        while let Some(pong) = pongs.recv().await {
-            if pong == nonce {
-                return Ok(());
-            }
-        }
-        Err(LinkError::Closed)
-    };
+    let answered = pong_of(&mut pongs, nonce);
     tokio::select! {
         _ = done.wait_for(|ended| *ended) => Err(LinkError::Closed),
         outcome = tokio::time::timeout(LIVENESS_TIMEOUT, answered) => {
             outcome.unwrap_or(Err(LinkError::CallTimeout))
         }
     }
+}
+
+/// Waits for the liveness_pong of `nonce`, passing over any other;
+/// [`LinkError::Closed`] when the pongs stop.
+async fn pong_of(
+    pongs: &mut tokio::sync::mpsc::Receiver<[u8; frame::LIVENESS_NONCE_SIZE]>,
+    nonce: [u8; frame::LIVENESS_NONCE_SIZE],
+) -> Result<(), LinkError> {
+    while let Some(pong) = pongs.recv().await {
+        if pong == nonce {
+            return Ok(());
+        }
+    }
+    Err(LinkError::Closed)
 }

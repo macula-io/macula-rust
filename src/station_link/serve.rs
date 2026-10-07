@@ -219,16 +219,7 @@ impl Link {
             err: Mutex::new(None),
             done_tx,
         });
-        {
-            let mut state = self.inner.lock();
-            if let Some(e) = &state.ended {
-                return Err(e.clone());
-            }
-            if state.served.contains_key(&key) {
-                return Err(LinkError::AlreadyServed);
-            }
-            state.served.insert(key, served.clone());
-        }
+        route_calls(&self.inner, key, served.clone())?;
         if let Err(e) = self.announce(&wire).await {
             served.end(e.clone());
             return Err(e);
@@ -256,32 +247,8 @@ impl Link {
                 ttl_ms: max_ttl_ms,
             }
         } else {
-            let org = record::procedure_org(&o.procedure)?.ok_or(LinkError::NoOrg)?;
-            let directory = self
-                .find_record(&record::org_directory_key(&o.realm, org))
-                .await?;
-            let named = record::read_org_directory(directory.record())?;
-            let delegation = self
-                .find_record(&record::procedure_delegation_key(
-                    &named.org_key,
-                    &inner.self_id,
-                ))
-                .await?;
-            let now = now_ms();
-            let ttl = (max_ttl_ms as i64)
-                .min(directory.record().expires_at as i64 - now)
-                .min(delegation.record().expires_at as i64 - now);
-            if ttl <= 0 {
-                return Err(RecordError::AuthorizationOutlived.into());
-            }
-            ProcedureAdvertisementOptions {
-                authorization: Authorization::Delegation {
-                    org_directory: record::encode(directory.record())?,
-                    procedure_delegation: record::encode(delegation.record())?,
-                },
-                kem_key,
-                ttl_ms: ttl as u64,
-            }
+            self.org_advertisement_options(o, max_ttl_ms, kem_key)
+                .await?
         };
         let unsigned = record::new_procedure_advertisement(
             &inner.self_id,
@@ -307,6 +274,44 @@ impl Link {
         Ok((signed, wire))
     }
 
+    /// The options of an org procedure's advertisement: its org directory and
+    /// this node's procedure delegation, resolved from the DHT, and a lifetime
+    /// no longer than either of them nor `max_ttl_ms`.
+    async fn org_advertisement_options(
+        &self,
+        o: &Offer,
+        max_ttl_ms: u64,
+        kem_key: Option<Vec<u8>>,
+    ) -> Result<ProcedureAdvertisementOptions, LinkError> {
+        let inner = &self.inner;
+        let org = record::procedure_org(&o.procedure)?.ok_or(LinkError::NoOrg)?;
+        let directory = self
+            .find_record(&record::org_directory_key(&o.realm, org))
+            .await?;
+        let named = record::read_org_directory(directory.record())?;
+        let delegation = self
+            .find_record(&record::procedure_delegation_key(
+                &named.org_key,
+                &inner.self_id,
+            ))
+            .await?;
+        let now = now_ms();
+        let ttl = (max_ttl_ms as i64)
+            .min(directory.record().expires_at as i64 - now)
+            .min(delegation.record().expires_at as i64 - now);
+        if ttl <= 0 {
+            return Err(RecordError::AuthorizationOutlived.into());
+        }
+        Ok(ProcedureAdvertisementOptions {
+            authorization: Authorization::Delegation {
+                org_directory: record::encode(directory.record())?,
+                procedure_delegation: record::encode(delegation.record())?,
+            },
+            kem_key,
+            ttl_ms: ttl as u64,
+        })
+    }
+
     /// Sends an advertisement to the station in an ADVERTISE, which routes
     /// CALLs through it, and puts it in the DHT, where a caller resolving
     /// the procedure finds it, as macula's advertise_direct does both.
@@ -316,6 +321,24 @@ impl Link {
             .await?;
         self.put_record(wire).await
     }
+}
+
+/// Routes the procedure's CALLs on the link to `served`, unless the link has
+/// ended or already serves the procedure.
+fn route_calls(
+    inner: &Inner,
+    key: ([u8; 32], String),
+    served: Arc<ServedInner>,
+) -> Result<(), LinkError> {
+    let mut state = inner.lock();
+    if let Some(e) = &state.ended {
+        return Err(e.clone());
+    }
+    if state.served.contains_key(&key) {
+        return Err(LinkError::AlreadyServed);
+    }
+    state.served.insert(key, served);
+    Ok(())
 }
 
 impl Served {
@@ -371,24 +394,38 @@ impl ServedInner {
     /// Ends the serving once, with `err`: the link no longer routes the
     /// procedure's CALLs to its handler.
     pub(super) fn end(self: &Arc<Self>, err: LinkError) {
-        {
-            let mut held = self.err.lock().unwrap_or_else(|p| p.into_inner());
-            if held.is_some() {
-                return;
-            }
-            *held = Some(err);
+        if !self.hold_err(err) {
+            return;
         }
-        if let Some(inner) = self.link.upgrade() {
-            let mut state = inner.lock();
-            if state
-                .served
-                .get(&self.key)
-                .is_some_and(|s| Arc::ptr_eq(s, self))
-            {
-                state.served.remove(&self.key);
-            }
-        }
+        self.unroute();
         let _ = self.done_tx.send_replace(true);
+    }
+
+    /// Keeps `err` as why the serving ended, and whether it is the first;
+    /// a later one is not kept.
+    fn hold_err(&self, err: LinkError) -> bool {
+        let mut held = self.err.lock().unwrap_or_else(|p| p.into_inner());
+        if held.is_some() {
+            return false;
+        }
+        *held = Some(err);
+        true
+    }
+
+    /// Stops the link routing the procedure's CALLs here, when it still
+    /// routes them to this serving and not a later one.
+    fn unroute(self: &Arc<Self>) {
+        let Some(inner) = self.link.upgrade() else {
+            return;
+        };
+        let mut state = inner.lock();
+        if state
+            .served
+            .get(&self.key)
+            .is_some_and(|s| Arc::ptr_eq(s, self))
+        {
+            state.served.remove(&self.key);
+        }
     }
 }
 
@@ -579,6 +616,26 @@ async fn handled(
     }
 }
 
+/// An outcome as the clear signed reply to a clear `request`.
+fn clear_answer(inner: &Inner, request: &VerifiedRequest, outcome: Outcome) -> Value {
+    match outcome {
+        Outcome::Refused(code, detail) => provider_error(inner, request, code, detail.as_deref()),
+        Outcome::Result(payload) => clear_result(inner, request, &payload),
+    }
+}
+
+/// A result as the signed RESULT to a clear `request`, or payload_too_large
+/// or unknown_error when the wire cannot carry it.
+fn clear_result(inner: &Inner, request: &VerifiedRequest, payload: &Value) -> Value {
+    match frame::sign_result(request, payload, None, &inner.key) {
+        Ok(signed) => signed,
+        Err(_) if cbor::encode(payload).is_ok_and(|e| e.len() > frame::MAX_FRAME_BYTES) => {
+            provider_error(inner, request, CODE_PAYLOAD_TOO_LARGE, None)
+        }
+        Err(_) => provider_error(inner, request, CODE_UNSENDABLE, None),
+    }
+}
+
 /// An outcome as the signed reply to `request`: clear to a clear request,
 /// sealed to a sealed one. A result the wire cannot carry is answered
 /// payload_too_large or unknown_error, as macula answers it.
@@ -589,23 +646,7 @@ fn answered(
     outcome: Outcome,
 ) -> Value {
     let Some(sealing) = sealing else {
-        return match outcome {
-            Outcome::Refused(code, detail) => {
-                provider_error(inner, request, code, detail.as_deref())
-            }
-            Outcome::Result(payload) => {
-                match frame::sign_result(request, &payload, None, &inner.key) {
-                    Ok(signed) => signed,
-                    Err(_)
-                        if cbor::encode(&payload)
-                            .is_ok_and(|e| e.len() > frame::MAX_FRAME_BYTES) =>
-                    {
-                        provider_error(inner, request, CODE_PAYLOAD_TOO_LARGE, None)
-                    }
-                    Err(_) => provider_error(inner, request, CODE_UNSENDABLE, None),
-                }
-            }
-        };
+        return clear_answer(inner, request, outcome);
     };
     let payload = match outcome {
         Outcome::Refused(code, detail) => {

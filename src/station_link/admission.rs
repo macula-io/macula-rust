@@ -103,6 +103,21 @@ struct Entry {
     reply: Option<Vec<u8>>,
 }
 
+impl Entry {
+    /// Judges a copy of the request this entry admitted, by its request hash:
+    /// another hash is refused, an answer not kept is refused, and otherwise
+    /// the copy gets the stored reply, `None` while the first still runs.
+    fn judge_copy(&self, request_hash: &[u8; 48]) -> Verdict {
+        if self.hash != *request_hash {
+            return Verdict::Refused("request_id_reused");
+        }
+        if self.answered && self.reply.is_none() {
+            return Verdict::Refused("reply_not_kept");
+        }
+        Verdict::Copy(self.reply.clone())
+    }
+}
+
 #[derive(Default)]
 struct Held {
     entries: HashMap<([u8; 32], [u8; 16]), Entry>,
@@ -155,13 +170,7 @@ impl Admission {
         held.sweep(now_ms);
         let key = (request.caller, request.request_id);
         if let Some(entry) = held.entries.get(&key) {
-            if entry.hash != request.request_hash {
-                return Verdict::Refused("request_id_reused");
-            }
-            if entry.answered && entry.reply.is_none() {
-                return Verdict::Refused("reply_not_kept");
-            }
-            return Verdict::Copy(entry.reply.clone());
+            return entry.judge_copy(&request.request_hash);
         }
         if held.callers.get(&request.caller).copied().unwrap_or(0) >= self.limits.caller_quota {
             return Verdict::Refused("caller_quota");
@@ -274,15 +283,21 @@ impl Held {
             .map(|(k, _)| *k)
             .collect();
         for key in expired {
-            let Some(entry) = self.entries.remove(&key) else {
-                continue;
-            };
-            decrement(&mut self.callers, key.0, 1);
-            decrement(&mut self.shares, entry.share, 1);
-            if let Some(reply) = entry.reply {
-                decrement(&mut self.reply_bytes, key.0, reply.len());
-                self.reply_total = self.reply_total.saturating_sub(reply.len());
-            }
+            self.remove_entry(key);
+        }
+    }
+
+    /// Removes one entry, giving back its caller's and share's places and
+    /// the bytes of its stored reply.
+    fn remove_entry(&mut self, key: ([u8; 32], [u8; 16])) {
+        let Some(entry) = self.entries.remove(&key) else {
+            return;
+        };
+        decrement(&mut self.callers, key.0, 1);
+        decrement(&mut self.shares, entry.share, 1);
+        if let Some(reply) = entry.reply {
+            decrement(&mut self.reply_bytes, key.0, reply.len());
+            self.reply_total = self.reply_total.saturating_sub(reply.len());
         }
     }
 }

@@ -172,14 +172,42 @@ impl Drop for Subscription {
         }
         let key = self.key.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                if let Ok(frame) =
-                    frame::unsubscribe_frame(key.1.as_bytes(), &key.0, &inner.self_id)
-                {
-                    let _ = inner.send_control(&frame).await;
-                }
-            });
+            runtime.spawn(unsubscribe_dropped(inner, key));
         }
+    }
+}
+
+/// Sends the UNSUBSCRIBE of a subscription dropped without unsubscribing,
+/// for whatever it is worth now.
+async fn unsubscribe_dropped(inner: Arc<Inner>, key: ([u8; 32], String)) {
+    if let Ok(frame) = frame::unsubscribe_frame(key.1.as_bytes(), &key.0, &inner.self_id) {
+        let _ = inner.send_control(&frame).await;
+    }
+}
+
+/// Adds a subscriber, and whether it is the first on its realm and topic;
+/// the link's end when it has ended.
+fn add_subscriber(
+    inner: &Inner,
+    key: &([u8; 32], String),
+    id: u64,
+    events: mpsc::Sender<Event>,
+) -> Result<bool, LinkError> {
+    let mut state = inner.lock();
+    if let Some(e) = &state.ended {
+        return Err(e.clone());
+    }
+    let slots = state.subs.entry(key.clone()).or_default();
+    slots.push(SubscriberSlot { id, events });
+    Ok(slots.len() == 1)
+}
+
+/// Sends the SUBSCRIBE for `topic` in `realm`.
+async fn send_subscribe(inner: &Inner, realm: &[u8; 32], topic: &str) -> Result<(), LinkError> {
+    let frame = frame::subscribe_frame(topic.as_bytes(), realm, &inner.self_id);
+    match frame {
+        Ok(frame) => inner.send_control(&frame).await,
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -219,18 +247,7 @@ impl Link {
         let key = (*realm, topic.to_string());
         let (events_tx, events) = mpsc::channel(EVENT_BUFFER);
         let id = NEXT_SUBSCRIBER.fetch_add(1, Ordering::Relaxed);
-        let first = {
-            let mut state = self.inner.lock();
-            if let Some(e) = &state.ended {
-                return Err(e.clone());
-            }
-            let slots = state.subs.entry(key.clone()).or_default();
-            slots.push(SubscriberSlot {
-                id,
-                events: events_tx,
-            });
-            slots.len() == 1
-        };
+        let first = add_subscriber(&self.inner, &key, id, events_tx)?;
         let subscription = Subscription {
             link: Arc::downgrade(&self.inner),
             key: key.clone(),
@@ -238,18 +255,16 @@ impl Link {
             events,
             unsubscribed: false,
         };
-        if first {
-            let frame = frame::subscribe_frame(topic.as_bytes(), realm, &self.inner.self_id);
-            let sent = match frame {
-                Ok(frame) => self.inner.send_control(&frame).await,
-                Err(e) => Err(e.into()),
-            };
-            if let Err(e) = sent {
-                drop_subscriber(&self.inner, &key, id);
-                let mut subscription = subscription;
-                subscription.unsubscribed = true;
-                return Err(e);
-            }
+        let sent = if first {
+            send_subscribe(&self.inner, realm, topic).await
+        } else {
+            Ok(())
+        };
+        if let Err(e) = sent {
+            drop_subscriber(&self.inner, &key, id);
+            let mut subscription = subscription;
+            subscription.unsubscribed = true;
+            return Err(e);
         }
         Ok(subscription)
     }

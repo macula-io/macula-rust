@@ -57,7 +57,9 @@ use crate::node_key::NodeKey;
 use crate::profile::Profile;
 use crate::record::RecordError;
 use crate::seal::Keyring;
-use crate::statement_issuer::{IssuerError, StatementIssuer, StatementSubscription};
+use crate::statement_issuer::{
+    ConnectMaterial, IssuerError, StatementIssuer, StatementSubscription,
+};
 use crate::transport::{self, DialError, Target};
 
 use framing::{read_frame, FrameWriter, HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES};
@@ -364,17 +366,19 @@ impl Link {
         let node_id = cfg.target.expected_node_id;
         let version = versions::dial_version(&node_id, std::time::Instant::now());
         let linked = dial_once(&cfg, version).await;
-        match linked {
-            Err(LinkError::Handshake(HandshakeError::Refused(RefusalCode::UnsupportedVersion)))
-                if version == VERSION_5 =>
-            {
-                if !versions::unsupported_version(&node_id, std::time::Instant::now()) {
-                    return Err(LinkError::V5DowngradeRefused);
-                }
-                dial_once(&cfg, VERSION).await
-            }
-            other => other,
+        let v5_refused = matches!(
+            linked,
+            Err(LinkError::Handshake(HandshakeError::Refused(
+                RefusalCode::UnsupportedVersion
+            )))
+        ) && version == VERSION_5;
+        if !v5_refused {
+            return linked;
         }
+        if !versions::unsupported_version(&node_id, std::time::Instant::now()) {
+            return Err(LinkError::V5DowngradeRefused);
+        }
+        dial_once(&cfg, VERSION).await
     }
 
     /// The handshake version the link completed: 4 or 5.
@@ -429,12 +433,8 @@ impl Link {
     /// side, waits up to a second for the station to close the connection,
     /// and ends the link. Closing an ended link does nothing.
     pub async fn close(&self, reason: &str) -> Result<(), LinkError> {
-        {
-            let mut state = self.inner.lock();
-            if state.ended.is_some() {
-                return Ok(());
-            }
-            state.closing = true;
+        if !self.inner.mark_closing() {
+            return Ok(());
         }
         let goodbye = frame::goodbye_frame(reason, None)?;
         let sent = self.inner.send_control(&goodbye).await;
@@ -472,14 +472,7 @@ async fn handshaken(
     dialed: transport::Dialed,
     version: i64,
 ) -> Result<Link, LinkError> {
-    let exporter_connection = dialed.connection.clone();
-    let export = move |label: &str, context: &[u8], length: usize| {
-        let mut out = vec![0; length];
-        exporter_connection
-            .export_keying_material(&mut out, label.as_bytes(), context)
-            .ok()?;
-        Some(out)
-    };
+    let export = keying_exporter(dialed.connection.clone());
     let export: &Exporter = &export;
     let (send, mut recv) = dialed
         .connection
@@ -494,20 +487,7 @@ async fn handshaken(
     let material = cfg.issuer.connect_material().map_err(LinkError::Issuer)?;
     let (connect, station) = handshake::answer_challenge(
         &challenge,
-        &ClientSession {
-            profile: cfg.target.profile,
-            expected_node_id: cfg.target.expected_node_id,
-            leaf: &dialed.leaf,
-            identity_key: cfg.identity.public_key(),
-            connect_key: &material.key,
-            connect_binding: &material.binding,
-            connect_status: &material.status,
-            capabilities: 0,
-            now_ms: now_ms(),
-            member_endorsement: cfg.member_endorsement.clone(),
-            version,
-            export: Some(export),
-        },
+        &client_session(cfg, &dialed.leaf, &material, version, export),
     )?;
     control.write(&connect, HANDSHAKE_FRAME_BYTES).await?;
     let hello = read_frame(&mut recv, HANDSHAKE_FRAME_BYTES).await?;
@@ -520,6 +500,72 @@ async fn handshaken(
         .issuer
         .subscribe(&material.binding)
         .map_err(LinkError::Issuer)?;
+    let inner = new_inner(
+        cfg,
+        dialed,
+        control,
+        station,
+        capabilities,
+        &challenge,
+        self_id,
+    );
+    let station_node_id = inner.station.node_id;
+    versions::completed(&station_node_id, &inner)?;
+    spawn_link_tasks(&inner, statements, recv);
+    Ok(Link { inner })
+}
+
+/// The TLS exporter of `connection`, as the v5 handshake asks for keying
+/// material.
+fn keying_exporter(
+    connection: quinn::Connection,
+) -> impl Fn(&str, &[u8], usize) -> Option<Vec<u8>> + Send + Sync {
+    move |label: &str, context: &[u8], length: usize| {
+        let mut out = vec![0; length];
+        connection
+            .export_keying_material(&mut out, label.as_bytes(), context)
+            .ok()?;
+        Some(out)
+    }
+}
+
+/// What the client brings to the handshake in `version`: the configured
+/// identity and target, the leaf it received, and the issuer's CONNECT
+/// material, at the time now.
+fn client_session<'a>(
+    cfg: &Config,
+    leaf: &'a [u8],
+    material: &'a ConnectMaterial,
+    version: i64,
+    export: &'a Exporter,
+) -> ClientSession<'a> {
+    ClientSession {
+        profile: cfg.target.profile,
+        expected_node_id: cfg.target.expected_node_id,
+        leaf,
+        identity_key: cfg.identity.public_key(),
+        connect_key: &material.key,
+        connect_binding: &material.binding,
+        connect_status: &material.status,
+        capabilities: 0,
+        now_ms: now_ms(),
+        member_endorsement: cfg.member_endorsement.clone(),
+        version,
+        export: Some(export),
+    }
+}
+
+/// The state of a link whose handshake completed with `station` on the
+/// control stream `control` of `dialed`, numbered with the next serial.
+fn new_inner(
+    cfg: &Config,
+    dialed: transport::Dialed,
+    control: FrameWriter,
+    station: Station,
+    capabilities: u64,
+    challenge: &[u8],
+    self_id: [u8; 32],
+) -> Arc<Inner> {
     let (done_tx, done_rx) = watch::channel(false);
     let share = cfg
         .share
@@ -527,7 +573,7 @@ async fn handshaken(
         .unwrap_or_else(|| format!("{}:{}", cfg.target.host, cfg.target.port));
     let (pongs, pongs_rx) = tokio::sync::mpsc::channel(1);
     static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let inner = Arc::new(Inner {
+    Arc::new(Inner {
         serial: SERIALS.fetch_add(1, Ordering::Relaxed),
         connection: dialed.connection,
         _endpoint: dialed.endpoint,
@@ -537,7 +583,7 @@ async fn handshaken(
         self_id,
         status_deadline: AtomicI64::new(station.status_expires_at + STATUS_GRACE_MS),
         station_capabilities: capabilities,
-        connection_hash: Sha384::digest(&challenge).into(),
+        connection_hash: Sha384::digest(challenge).into(),
         version: station.version,
         pongs,
         pong_in_flight: AtomicBool::new(false),
@@ -564,16 +610,23 @@ async fn handshaken(
         }),
         done_tx,
         done_rx,
-    });
-    let station_node_id = inner.station.node_id;
-    versions::completed(&station_node_id, &inner)?;
-    tokio::spawn(send_statements(Arc::downgrade(&inner), statements));
+    })
+}
+
+/// Starts the tasks a linked link runs: its statements, its control
+/// stream's reader, the streams it accepts, its liveness probe, and the
+/// watches on its expiries and its connection.
+fn spawn_link_tasks(
+    inner: &Arc<Inner>,
+    statements: StatementSubscription,
+    recv: quinn::RecvStream,
+) {
+    tokio::spawn(send_statements(Arc::downgrade(inner), statements));
     tokio::spawn(read_control(inner.clone(), recv));
-    tokio::spawn(stream::accept_streams(Arc::downgrade(&inner)));
-    tokio::spawn(call::probe(Arc::downgrade(&inner)));
-    tokio::spawn(watch_expiries(Arc::downgrade(&inner)));
-    tokio::spawn(watch_connection(Arc::downgrade(&inner)));
-    Ok(Link { inner })
+    tokio::spawn(stream::accept_streams(Arc::downgrade(inner)));
+    tokio::spawn(call::probe(Arc::downgrade(inner)));
+    tokio::spawn(watch_expiries(Arc::downgrade(inner)));
+    tokio::spawn(watch_connection(Arc::downgrade(inner)));
 }
 
 impl Inner {
@@ -585,6 +638,17 @@ impl Inner {
 
     fn count(&self, what: &str) {
         *self.lock().unrouted.entry(what.to_string()).or_default() += 1;
+    }
+
+    /// Marks the link closing, so it ends as closed: false when it has
+    /// already ended.
+    fn mark_closing(&self) -> bool {
+        let mut state = self.lock();
+        if state.ended.is_some() {
+            return false;
+        }
+        state.closing = true;
+        true
     }
 
     /// A version-2 frame on the control stream: on v5 as it is, on v4
@@ -619,25 +683,15 @@ impl Inner {
     /// Ends the link once, with `err`: pending calls, subscriptions, served
     /// procedures and streams end with it, and the connection closes.
     fn end(&self, err: LinkError) {
-        let (err, pending, subs, served, streams) = {
-            let mut state = self.lock();
-            if state.ended.is_some() {
-                return;
-            }
-            let err = if state.closing {
-                LinkError::Closed
-            } else {
-                err
-            };
-            state.ended = Some(err.clone());
-            (
-                err,
-                std::mem::take(&mut state.pending),
-                std::mem::take(&mut state.subs),
-                std::mem::take(&mut state.served),
-                std::mem::take(&mut state.streams),
-            )
+        let mut state = self.lock();
+        let Some(err) = state.mark_ended(err) else {
+            return;
         };
+        let pending = std::mem::take(&mut state.pending);
+        let subs = std::mem::take(&mut state.subs);
+        let served = std::mem::take(&mut state.served);
+        let streams = std::mem::take(&mut state.streams);
+        drop(state);
         for (_, p) in pending {
             let _ = p.outcome.send(Err(err.clone()));
         }
@@ -653,6 +707,20 @@ impl Inner {
             versions::v4_ended(&self.station.node_id, self.serial);
         }
         let _ = self.done_tx.send_replace(true);
+    }
+}
+
+impl State {
+    /// Marks the link ended once, with `err`, or as closed when its owner was
+    /// closing it: the error it ended with, or `None` when it had already
+    /// ended.
+    fn mark_ended(&mut self, err: LinkError) -> Option<LinkError> {
+        if self.ended.is_some() {
+            return None;
+        }
+        let err = if self.closing { LinkError::Closed } else { err };
+        self.ended = Some(err.clone());
+        Some(err)
     }
 }
 
@@ -801,22 +869,25 @@ fn liveness(
         // ping, and a burst of pings starts one task, not one each.
         Liveness::Ping if !pong_slot(&inner.pong_in_flight) => {}
         Liveness::Ping => {
-            let inner = inner.clone();
-            tokio::spawn(async move {
-                let sent = inner
-                    .send_control(&frame::liveness_pong_frame(&nonce))
-                    .await;
-                inner.pong_in_flight.store(false, Ordering::Release);
-                if let Err(e) = sent {
-                    inner.end(e);
-                }
-            });
+            tokio::spawn(send_pong(inner.clone(), nonce));
         }
         Liveness::Pong => {
             let _ = inner.pongs.try_send(nonce);
         }
     }
     Ok(())
+}
+
+/// Writes the liveness_pong of `nonce`, gives back the pong slot, and ends
+/// the link when the write failed.
+async fn send_pong(inner: Arc<Inner>, nonce: [u8; frame::LIVENESS_NONCE_SIZE]) {
+    let sent = inner
+        .send_control(&frame::liveness_pong_frame(&nonce))
+        .await;
+    inner.pong_in_flight.store(false, Ordering::Release);
+    if let Err(e) = sent {
+        inner.end(e);
+    }
 }
 
 /// Takes the one pong slot: true when no pong was in flight, and it is now.

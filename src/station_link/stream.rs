@@ -33,7 +33,7 @@ use super::confidential::{
     CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
 };
 use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
-use super::serve::{bounded_detail, BoxFuture, StreamOffer, CODE_REQUEST_COPY};
+use super::serve::{bounded_detail, BoxFuture, Offer, StreamOffer, CODE_REQUEST_COPY};
 use super::{frame_type_of, now_ms, Inner, Link, LinkError};
 
 const STREAM_OPEN_BYTES: usize = 1024 * 1024;
@@ -258,19 +258,10 @@ impl Stream {
     pub async fn recv(&self) -> Result<StreamEvent, LinkError> {
         loop {
             let notified = self.inner.notify.notified();
-            {
-                let mut side = self.inner.side();
-                if let Some((event, size)) = side.inbox.pop_front() {
-                    side.held -= size;
-                    drop(side);
-                    self.inner.release_inbox(size);
-                    return Ok(event);
-                }
-                if side.ended {
-                    return Err(side.err.clone().unwrap_or(LinkError::EndOfStream));
-                }
+            match self.inner.next_event() {
+                Some(outcome) => return outcome,
+                None => notified.await,
             }
-            notified.await;
         }
     }
 
@@ -313,6 +304,23 @@ impl StreamInner {
         self.budget.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// The inbox's next event, its room given back; once the stream has
+    /// ended and nothing is queued, why it ended ([`LinkError::EndOfStream`]
+    /// for a normal end); `None` while there is nothing yet.
+    fn next_event(&self) -> Option<Result<StreamEvent, LinkError>> {
+        let mut side = self.side();
+        if let Some((event, size)) = side.inbox.pop_front() {
+            side.held -= size;
+            drop(side);
+            self.release_inbox(size);
+            return Some(Ok(event));
+        }
+        if side.ended {
+            return Some(Err(side.err.clone().unwrap_or(LinkError::EndOfStream)));
+        }
+        None
+    }
+
     /// Signs the fields `at(seq)` builds at this side's next seq and writes
     /// them; `last` marks this side's last frame, after which its QUIC
     /// direction is finished. On a sealed stream the seq is spent before
@@ -342,15 +350,9 @@ impl StreamInner {
             }
             _ => fields,
         };
-        let encoded = match self.signed(&fields) {
-            Ok(encoded) => encoded,
-            Err(e) => {
-                if spent {
-                    self.side().sent_end = true;
-                }
-                return Err(e);
-            }
-        };
+        let encoded = self
+            .signed(&fields)
+            .inspect_err(|_| self.unsent_after_spending(spent))?;
         if let Err(e) = self.writer.write(&encoded, MAX_FRAME_BYTES).await {
             self.side().sent_end = true;
             return Err(e);
@@ -359,17 +361,31 @@ impl StreamInner {
             *seq += 1;
         }
         if last {
-            let peer_ended = {
-                let mut side = self.side();
-                side.sent_end = true;
-                side.peer_ended
-            };
-            self.writer.finish().await;
-            if peer_ended {
-                StreamInner::end(self, None);
-            }
+            self.sent_last().await;
         }
         Ok(())
+    }
+
+    /// Ends this side's sending when a frame that spent its seq did not go
+    /// out, so nothing is ever sealed twice under one (key, seq).
+    fn unsent_after_spending(&self, spent: bool) {
+        if spent {
+            self.side().sent_end = true;
+        }
+    }
+
+    /// After this side's last frame: its QUIC direction finished, and the
+    /// stream ended when the peer had ended too.
+    async fn sent_last(self: &Arc<Self>) {
+        let peer_ended = {
+            let mut side = self.side();
+            side.sent_end = true;
+            side.peer_ended
+        };
+        self.writer.finish().await;
+        if peer_ended {
+            StreamInner::end(self, None);
+        }
     }
 
     /// `fields` signed by this side's key and encoded.
@@ -408,21 +424,36 @@ impl StreamInner {
     /// Queues `event` for recv, refusing it when it would take the inbox, or
     /// the node's budget for served streams, past its bound.
     fn deliver(&self, event: StreamEvent, size: usize) -> bool {
-        {
-            let mut side = self.side();
-            if side.held + size > STREAM_INBOX {
-                return false;
-            }
-            if let Some(budget) = &*self.budget() {
-                if !budget.admission.charge_inbox(budget.caller, size) {
-                    return false;
-                }
-            }
-            side.inbox.push_back((event, size));
-            side.held += size;
+        if !self.queue(event, size) {
+            return false;
         }
         self.notify.notify_one();
         true
+    }
+
+    /// Puts `event` in the inbox, unless it would take the inbox, or the
+    /// node's budget for served streams, past its bound.
+    fn queue(&self, event: StreamEvent, size: usize) -> bool {
+        let mut side = self.side();
+        if side.held + size > STREAM_INBOX {
+            return false;
+        }
+        if !self.charge_inbox(size) {
+            return false;
+        }
+        side.inbox.push_back((event, size));
+        side.held += size;
+        true
+    }
+
+    /// Charges `size` to a served stream's caller's inbox budget, and
+    /// whether it fits; a stream with no budget always fits.
+    fn charge_inbox(&self, size: usize) -> bool {
+        let budget = self.budget();
+        let Some(budget) = &*budget else {
+            return true;
+        };
+        budget.admission.charge_inbox(budget.caller, size)
     }
 
     fn release_inbox(&self, size: usize) {
@@ -454,24 +485,11 @@ impl StreamInner {
     /// last frame and reset otherwise, its reader stopped, what its inbox
     /// held and its session's place given back.
     pub(super) fn end(this: &Arc<StreamInner>, err: Option<LinkError>) {
-        let graceful = {
-            let mut side = this.side();
-            if side.ended {
-                return;
-            }
-            side.ended = true;
-            if side.err.is_none() {
-                side.err = err;
-            }
-            let graceful = side.sent_end;
-            side.sent_end = true;
-            graceful
+        let Some(graceful) = this.mark_ended(err) else {
+            return;
         };
         if !graceful {
-            let released = this.clone();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move { released.writer.reset().await });
-            }
+            StreamInner::reset_sending(this);
         }
         if let Some(budget) = this.budget().take() {
             let held = std::mem::take(&mut this.side().held);
@@ -485,6 +503,35 @@ impl StreamInner {
         let _ = this.done_tx.send_replace(true);
         this.notify.notify_waiters();
         this.notify.notify_one();
+    }
+}
+
+impl StreamInner {
+    /// Marks the stream ended, keeping `err` unless an error is kept
+    /// already, and this side's sending with it; whether this side had sent
+    /// its last frame, or `None` when the stream had ended before.
+    fn mark_ended(&self, err: Option<LinkError>) -> Option<bool> {
+        let mut side = self.side();
+        if side.ended {
+            return None;
+        }
+        side.ended = true;
+        if side.err.is_none() {
+            side.err = err;
+        }
+        let graceful = side.sent_end;
+        side.sent_end = true;
+        Some(graceful)
+    }
+
+    /// Resets this side's sending direction, on the runtime when there is
+    /// one.
+    fn reset_sending(this: &Arc<StreamInner>) {
+        let released = this.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move { released.writer.reset().await });
     }
 }
 
@@ -521,24 +568,7 @@ impl Link {
         aws_lc_rs::rand::fill(&mut request_id)
             .map_err(|_| LinkError::Io("no randomness".into()))?;
         let deadline = (now_ms() + deadline.as_millis() as i64) as u64;
-        let (sealed, sealing) = match &c.seal {
-            Some(Seal::To(key)) => {
-                let (sealed, s) = sealed_request(
-                    inner.profile,
-                    key,
-                    crate::seal::FRAME_STREAM_OPEN,
-                    c.realm,
-                    &c.procedure,
-                    inner.self_id,
-                    c.target,
-                    request_id,
-                    deadline,
-                    &c.payload,
-                )?;
-                (Some(sealed), Some(StreamSeal::caller(&s)))
-            }
-            _ => (None, None),
-        };
+        let (sealed, sealing) = sealed_open(inner, &c, request_id, deadline)?;
         let signed = frame::sign_stream_open(
             &RequestSpec {
                 request_id,
@@ -585,6 +615,34 @@ impl Link {
     }
 }
 
+/// The open's payload sealed to the key its seal names, with the caller's
+/// keys for the stream; nothing when the stream goes clear.
+fn sealed_open(
+    inner: &Inner,
+    c: &StreamCall,
+    request_id: [u8; 16],
+    deadline: u64,
+) -> Result<(Option<frame::Sealed>, Option<StreamSeal>), LinkError> {
+    match &c.seal {
+        Some(Seal::To(key)) => {
+            let (sealed, s) = sealed_request(
+                inner.profile,
+                key,
+                crate::seal::FRAME_STREAM_OPEN,
+                c.realm,
+                &c.procedure,
+                inner.self_id,
+                c.target,
+                request_id,
+                deadline,
+                &c.payload,
+            )?;
+            Ok((Some(sealed), Some(StreamSeal::caller(&s))))
+        }
+        _ => Ok((None, None)),
+    }
+}
+
 /// Takes each stream the station opens to this link, until the link ends.
 pub(super) async fn accept_streams(link: Weak<Inner>) {
     let Some(connection) = link.upgrade().map(|l| l.connection.clone()) else {
@@ -602,38 +660,7 @@ pub(super) async fn accept_streams(link: Weak<Inner>) {
 /// without a word, and one the provider refuses is told why at seq 0.
 async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::RecvStream) {
     let Some(inner) = link.upgrade() else { return };
-    let payload = match tokio::time::timeout(
-        STREAM_OPEN_WAIT,
-        read_frame(&mut recv, STREAM_OPEN_BYTES),
-    )
-    .await
-    {
-        Ok(Ok(payload)) => payload,
-        _ => {
-            inner.count("stream_open_unread");
-            abandon(send, recv);
-            return;
-        }
-    };
-    let v = match cbor::decode(&payload) {
-        Ok(v) if frame_type_of(&v) == "stream_open" => v,
-        _ => {
-            inner.count("stream_open_malformed");
-            abandon(send, recv);
-            return;
-        }
-    };
-    let Ok(open) = frame::verify_request(&v, inner.profile) else {
-        inner.count("stream_open_unverified");
-        abandon(send, recv);
-        return;
-    };
-    if open.target != inner.self_id {
-        inner.count("stream_for_another_node");
-        abandon(send, recv);
-        return;
-    }
-    let Ok(state) = frame::open_stream(&open) else {
+    let Some((open, state)) = read_open(&inner, &mut recv).await else {
         abandon(send, recv);
         return;
     };
@@ -653,25 +680,9 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
         Ok(place) => place,
         Err(code) => return refuse_clear(code, "", send, recv).await,
     };
-    let (session_open, sealing) = match &open.sealed {
-        Some(_) => match opened_request(inner.keyring.as_deref(), &open) {
-            Ok((payload, sealed)) => (
-                VerifiedRequest {
-                    payload,
-                    ..open.clone()
-                },
-                Some(StreamSeal::provider(&sealed)),
-            ),
-            Err(detail) => return refuse_clear(CODE_SEALED_REFUSED, &detail, send, recv).await,
-        },
-        None if offer
-            .as_ref()
-            .is_some_and(|o| !clear_allowed(o.confidential, inner.keyed_since(o), now_ms())) =>
-        {
-            let message = "this procedure takes sealed opens only";
-            return refuse_clear(CODE_SEALED_REQUIRED, message, send, recv).await;
-        }
-        None => (open.clone(), None),
+    let (session_open, sealing) = match session_open(&inner, &open, offer.as_ref()) {
+        Ok(opened) => opened,
+        Err((code, message)) => return refuse_clear(code, &message, send, recv).await,
     };
     // From here a refusal of a sealed open goes sealed.
     let s = StreamInner::new(inner.clone(), send, session_open, false, sealing);
@@ -693,6 +704,71 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     }
     tokio::spawn(read(s.clone(), recv, state));
     tokio::spawn(serve(s, offer));
+}
+
+/// Reads a stream's first frame within 10 seconds: its verified STREAM_OPEN
+/// for this node and the verifier state it starts, or `None`, counted, when
+/// the stream does not deliver one.
+async fn read_open(
+    inner: &Inner,
+    recv: &mut quinn::RecvStream,
+) -> Option<(VerifiedRequest, StreamState)> {
+    let payload =
+        match tokio::time::timeout(STREAM_OPEN_WAIT, read_frame(recv, STREAM_OPEN_BYTES)).await {
+            Ok(Ok(payload)) => payload,
+            _ => {
+                inner.count("stream_open_unread");
+                return None;
+            }
+        };
+    let v = match cbor::decode(&payload) {
+        Ok(v) if frame_type_of(&v) == "stream_open" => v,
+        _ => {
+            inner.count("stream_open_malformed");
+            return None;
+        }
+    };
+    let Ok(open) = frame::verify_request(&v, inner.profile) else {
+        inner.count("stream_open_unverified");
+        return None;
+    };
+    if open.target != inner.self_id {
+        inner.count("stream_for_another_node");
+        return None;
+    }
+    let state = frame::open_stream(&open).ok()?;
+    Some((open, state))
+}
+
+/// The open as its session sees it, opened when it came sealed, with the
+/// provider's keys for the stream; or the code and message to refuse it with
+/// in the clear: a sealed open that does not open, or a clear one to a
+/// procedure past its keyless window.
+fn session_open(
+    inner: &Inner,
+    open: &VerifiedRequest,
+    offer: Option<&Offer>,
+) -> Result<(VerifiedRequest, Option<StreamSeal>), (&'static str, String)> {
+    match &open.sealed {
+        Some(_) => opened_request(inner.keyring.as_deref(), open)
+            .map(|(payload, sealed)| {
+                (
+                    VerifiedRequest {
+                        payload,
+                        ..open.clone()
+                    },
+                    Some(StreamSeal::provider(&sealed)),
+                )
+            })
+            .map_err(|detail| (CODE_SEALED_REFUSED, detail)),
+        None if offer
+            .is_some_and(|o| !clear_allowed(o.confidential, inner.keyed_since(o), now_ms())) =>
+        {
+            let message = "this procedure takes sealed opens only";
+            Err((CODE_SEALED_REQUIRED, message.to_string()))
+        }
+        None => Ok((open.clone(), None)),
+    }
 }
 
 /// Admits an open as macula's link does, before anything of it is opened:
@@ -798,14 +874,7 @@ async fn received(
         }
     };
     if s.caller && v.get("relay_error").is_some() {
-        match frame::verify_relay_error(&v, &s.open, s.link.profile, &s.link.station.node_id) {
-            Ok(relayed) => s.peer_finished(Some(LinkError::Stream {
-                code: relayed.code,
-                message: String::new(),
-                relay: true,
-            })),
-            Err(e) => s.fail("malformed_frame", Some(e.to_string())).await,
-        }
+        relay_failed(s, &v).await;
         return None;
     }
     let verified = if s.caller {
@@ -833,6 +902,30 @@ async fn received(
     if s.caller && settles(&fields, s.sealing.is_some()) {
         s.side().settled = true;
     }
+    taken(s, fields, size, next).await
+}
+
+/// Ends a caller's stream on the station's relay error once it verifies, or
+/// fails the stream on one that does not.
+async fn relay_failed(s: &Arc<StreamInner>, v: &Value) {
+    match frame::verify_relay_error(v, &s.open, s.link.profile, &s.link.station.node_id) {
+        Ok(relayed) => s.peer_finished(Some(LinkError::Stream {
+            code: relayed.code,
+            message: String::new(),
+            relay: true,
+        })),
+        Err(e) => s.fail("malformed_frame", Some(e.to_string())).await,
+    }
+}
+
+/// Acts on one verified, unsealed frame of `size` bytes from the peer; the
+/// next verifier state, or `None` when reading stops.
+async fn taken(
+    s: &Arc<StreamInner>,
+    fields: StreamFields,
+    size: usize,
+    next: StreamState,
+) -> Option<StreamState> {
     match fields {
         StreamFields::Error { code, message, .. } => {
             s.peer_finished(Some(LinkError::Stream {
