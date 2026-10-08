@@ -10,7 +10,9 @@ pub mod lab;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use macula_rust::profile::Profile;
 use macula_rust::transport::Target;
@@ -23,7 +25,8 @@ pub struct TestStation {
     pub node_id: [u8; 32],
 }
 
-/// The running stations, their realm and org, and the helper's stdin.
+/// The running stations, their realm and org, the helper's stdin, and the
+/// test's [`Deadline`].
 pub struct TestStations {
     pub profile: Profile,
     pub stations: Vec<TestStation>,
@@ -32,6 +35,7 @@ pub struct TestStations {
     pub org: String,
     child: Child,
     io: Mutex<(ChildStdin, BufReader<ChildStdout>)>,
+    _deadline: Deadline,
 }
 
 impl TestStations {
@@ -70,6 +74,7 @@ impl TestStations {
             org: info["org"].as_str().unwrap().to_string(),
             child,
             io: Mutex::new((stdin, stdout)),
+            _deadline: Deadline::arm(),
         }
     }
 
@@ -151,5 +156,50 @@ impl Drop for TestStations {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// The longest a test may hold its stations, unless
+/// MACULA_TEST_DEADLINE_SECS names another. A thread watches it, not an
+/// async timeout: a test also blocks on the teststation's stdout, which no
+/// async timeout can interrupt.
+pub const TEST_DEADLINE: Duration = Duration::from_secs(300);
+
+fn test_deadline() -> Duration {
+    std::env::var("MACULA_TEST_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(TEST_DEADLINE, Duration::from_secs)
+}
+
+/// Ends the test binary, naming the test, when the test that armed it still
+/// holds its stations past its limit, so one stuck test fails its
+/// binary instead of holding the gate without bound (#17). Dropped with the
+/// stations, it is disarmed.
+pub struct Deadline {
+    _disarm: Sender<()>,
+}
+
+impl Deadline {
+    /// Armed for the current test, named by its thread as libtest names it.
+    pub fn arm() -> Deadline {
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("a test")
+            .to_string();
+        let limit = test_deadline();
+        let (disarm, armed) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if armed.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
+                // Past libtest's capture, which inherits into this thread and
+                // would be lost with the process.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "{test} did not finish within {limit:?}: ending its test binary"
+                );
+                std::process::exit(101);
+            }
+        });
+        Deadline { _disarm: disarm }
     }
 }

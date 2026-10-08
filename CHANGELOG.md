@@ -13,6 +13,15 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [Unreleased]
+
+#### Tests
+
+- A test that holds its teststation past five minutes
+  (`MACULA_TEST_DEADLINE_SECS` sets another limit) ends its test binary,
+  naming itself, so one stuck test fails instead of holding the gate without
+  bound; CI's test job stops after an hour (#17).
+
 ### [0.8.0] - 2026-10-07
 
 The security register's Rust gaps closed: the key exchange held to

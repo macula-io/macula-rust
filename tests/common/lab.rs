@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use macula_rust::pool::Seed;
 use macula_rust::profile::Profile;
 
-use super::{ask, spawn};
+use super::{ask, spawn, Deadline};
 
 /// A station the lab started: its index, where it listens, the node_id it
 /// proves.
@@ -40,11 +40,13 @@ pub struct LabRealm {
     pub key: Vec<u8>,
 }
 
-/// A teststation in lab mode, killed when dropped.
+/// A teststation in lab mode, killed when dropped, and the test's
+/// [`Deadline`].
 pub struct Lab {
     pub profile: Profile,
     child: Child,
     io: Mutex<(ChildStdin, BufReader<ChildStdout>)>,
+    _deadline: Deadline,
 }
 
 impl Lab {
@@ -55,6 +57,7 @@ impl Lab {
             profile,
             child,
             io: Mutex::new((stdin, stdout)),
+            _deadline: Deadline::arm(),
         }
     }
 
