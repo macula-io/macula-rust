@@ -618,11 +618,24 @@ async fn resealed_stream(
     let pool = pool.upgrade().ok_or(LinkError::Closed)?;
     let deadline = Instant::now() + DEFAULT_CALL_TIMEOUT;
     let fresh = bounded(deadline, pool.resolve(&r.own, r.realm_key)).await;
-    let next = reseal_to(fresh, named).map_err(as_link_error)?;
-    let reopened = bounded(deadline, pool.open_at(&r.link, &next, &r.c, None)).await;
-    let stream = reopened.map_err(as_link_error)?;
-    pool.remember(r.key, next);
-    Ok(stream)
+    let reopened = match reseal_to(fresh, named) {
+        Ok(next) => bounded(deadline, pool.open_at(&r.link, &next, &r.c, None))
+            .await
+            .map(|stream| (stream, next)),
+        Err(e) => Err(e),
+    };
+    // As a call settles: the provider's new key is remembered, and a stale
+    // one is forgotten, so the next open looks it up afresh.
+    match reopened {
+        Ok((stream, next)) => {
+            pool.remember(r.key, next);
+            Ok(stream)
+        }
+        Err(e) => {
+            pool.forget(&r.key);
+            Err(as_link_error(e))
+        }
+    }
 }
 
 /// A pool error as the stream it ends carries it.

@@ -564,6 +564,9 @@ impl StreamInner {
             Ok(()) => StreamInner::end(self, None),
             Err(e) => self.peer_finished(Some(e)),
         }
+        // Whatever waits on the reseal goes on, even when this session had
+        // ended before (its link ended meanwhile), when end wakes nobody.
+        self.notify.notify_waiters();
     }
 
     /// Queues `event` for recv, refusing it when it would take the inbox, or
