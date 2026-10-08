@@ -13,7 +13,7 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [Unreleased]
+### [0.9.0] - 2026-10-08
 
 macula 12's post-quantum UCAN (D7), minted, presented and enforced, at
 parity with macula, macula-go, Python, .NET and PHP (#12); a sealed stream
@@ -646,7 +646,7 @@ same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
 
-### [Unreleased]
+### [ffi-0.9.0] - 2026-10-08
 
 On `macula-rust` 0.9: UCAN through the bindings (core #12).
 
