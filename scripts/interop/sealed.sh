@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sealed calls and streams between macula-rust and macula 13, end to end, both
+# Sealed calls and streams between macula-rust and macula 14, end to end, both
 # ways, through the lab station (tests/teststation). First an Erlang provider
 # with kem_advertise on serves ~<node>/vault and ~<node>/watch, confidential
 # => required, and tests/interop_sealed.rs calls and streams to them sealed.
@@ -9,9 +9,11 @@
 # A required provider refuses every clear request, so an answer proves the
 # seal. Runs where podman is, the Erlang side and cargo in the pinned CI image.
 #
-#   MACULA_BUILD=<a compiled macula 13.x checkout> scripts/interop/sealed.sh [pq_hybrid|pq_pure]
+#   MACULA_BUILD=<a compiled macula 14.x checkout> scripts/interop/sealed.sh [pq_hybrid|pq_pure]
 #
-# erlang_sealed.escript is macula-go's (scripts/interop at 303dc6f), unchanged;
+# erlang_sealed.escript is macula-go's (scripts/interop at 303dc6f), moved onto
+# identity layout v1 (macula#76: identity_dir and stored_identity/2), which
+# macula 14 requires: it refuses node_identity_path;
 # MACULA_SEALED_PEER=rust names the texts it expects from a Rust provider.
 # The Rust caller always checks its seal reports (DESIGN_E2E_SEAL_REPORT): the
 # call's and the stream's, sealed 1, addressed to the Erlang provider, naming
@@ -24,7 +26,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 image="${MACULA_CI_IMAGE:-ghcr.io/macula-io/macula-ci-otp:20260923-1347@sha256:b2260d084a3d3c5e0b74932c4ee052a0cadfddddb6587d5d2214873e6bb06330}"
 profile="${1:-pq_hybrid}"
-: "${MACULA_BUILD:?a compiled macula checkout at v13.x}"
+: "${MACULA_BUILD:?a compiled macula checkout at v14.x}"
 slice=${CGROUP_PARENT:+--cgroup-parent=$CGROUP_PARENT}
 work="$(mktemp -d)"
 erl_name="macula-rust-sealed-$$"
@@ -70,7 +72,7 @@ podman run --rm --init --network host $slice \
   -v "$root:/w:Z" -w /w "$image" \
   cargo test --locked --test interop_sealed -- --ignored --nocapture --exact \
   a_sealed_call_and_stream_reach_a_required_macula_provider
-echo "== $profile: sealed to a macula 13 provider"
+echo "== $profile: sealed to a macula 14 provider"
 podman rm -f "$erl_name" > /dev/null 2>&1 || true
 
 echo "== $profile: a Rust provider, an Erlang caller"
@@ -89,4 +91,4 @@ podman run --rm --network host $slice -e MACULA_SEALED_PEER=rust \
   -v "$MACULA_BUILD:/macula:ro" -v "$root/scripts/interop:/interop:ro" \
   "$image" escript /interop/erlang_sealed.escript /macula/_build/default/lib/macula \
   "$host" "$port" "$station" "$realm" "$profile" call "$provider"
-echo "== $profile: a macula 13 caller sealed to a Rust provider"
+echo "== $profile: a macula 14 caller sealed to a Rust provider"

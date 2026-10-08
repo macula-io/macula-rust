@@ -62,20 +62,24 @@ tokio = { version = "1", features = ["full"] }
 
 A node needs a station to link to, **pinned by its node_id**, and the key of
 each realm it trusts, which the realm publishes. Its own key is created on
-first use and kept in a file its owner alone can read.
+first use and kept in a file its owner alone can read, one per name and profile
+under the account's identity directory, as every Macula SDK keeps it.
 
 ```rust
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use macula_rust::cbor::Value;
-use macula_rust::node_key::NodeKey;
+use macula_rust::node_key::{self, NodeKey};
 use macula_rust::pool::{Call, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
 use macula_rust::station_link::Publication;
 
-let key = NodeKey::load_or_create(Path::new("node.key"), Profile::PqHybrid)?;
+// This program's identity under the account's identity directory
+// (~/.local/share/macula/identity/default.pq_hybrid.key on Linux), made the
+// first time. Log the path and node_id: another name or profile is another node.
+let dir = node_key::default_identity_dir().expect("HOME is set");
+let (key, path) = NodeKey::stored_identity(&dir, node_key::DEFAULT_IDENTITY_NAME, Profile::PqHybrid)?;
 let mut opts = Opts::new(Arc::new(key));
 opts.realm_trust = HashMap::from([(realm, realm_key)]);
 let pool = Pool::connect(
@@ -148,7 +152,7 @@ compatibility layer.
 
 | Primitive | Caller | Provider | Notes |
 |---|---|---|---|
-| Node keys (`node_key::NodeKey`) | ✅ | ✅ | `pq_hybrid` (the fleet's) or `pq_pure`; on unix key files readable by the owner only, or a key store (`keystore`); on Windows Credential Manager only (a key file is refused); a key store keeps the private part only; pq_hybrid checked against the LAMPS draft's own vector and cross-verified with macula 12.8.0 |
+| Node keys (`node_key::NodeKey`) | ✅ | ✅ | `pq_hybrid` (the fleet's) or `pq_pure`; on unix key files readable by the owner only, stored by name and profile under the account's identity directory (identity layout v1, checked against macula's vectors), or a key store (`keystore`); on Windows Credential Manager only (a key file is refused); a key store keeps the private part only; pq_hybrid checked against the LAMPS draft's own vector and cross-verified with macula 12.8.0 |
 | Pool of station links (`pool::Pool`) | ✅ | ✅ | Seeds pinned by node_id; realm keys pinned; links redialed with subscriptions and served procedures replayed |
 | One station link (`station_link::Link`) | ✅ | ✅ | Handshake v5 bound to the TLS session (v4 once after `unsupported_version`, never after a node was seen on v5), status statements both ways, neighbour signatures on v4 links in pq_hybrid, a liveness probe |
 | Calls by direct dial (`call`, `providers`) | ✅ | ✅ | Candidates tried freshest first; errors arrive as `LinkError::Provider` / `LinkError::Relay` |

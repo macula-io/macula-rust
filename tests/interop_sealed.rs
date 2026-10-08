@@ -1,4 +1,4 @@
-//! Sealed calls and streams between this SDK and macula 13, end to end, both
+//! Sealed calls and streams between this SDK and macula 14, end to end, both
 //! ways. scripts/interop/sealed.sh starts a station, then:
 //!
 //! - an Erlang provider that switches kem_advertise on and serves

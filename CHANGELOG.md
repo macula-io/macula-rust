@@ -15,7 +15,35 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Breaking
+
+- `KeyFileError` gains `IdentityName`, `OldKey`, `OldKeyPlaceTaken` and
+  `StoredKey`, for stored identities (#16).
+
+#### Added
+
+- Identity layout v1 (macula#76, #16), on unix: `NodeKey::stored_identity`
+  loads, or generates and stores, the identity a program keeps for a name and
+  profile at `<identity_dir>/<name>.<profile>.key`, and answers the path; a
+  stored key that does not load is refused and never replaced.
+  `node_key::default_identity_dir` is where macula puts it
+  (`~/.local/share/macula/identity` on Linux), `identity_path` refuses any
+  name but 1 to 64 lowercase letters, digits, `-` and `_`, and the old
+  `identity.key` beside the directory is moved into the layout, never over
+  another key. Checked against macula's shared vectors
+  (`tests/vectors/identity/identity_layout_v1.json`).
+
+#### Fixed
+
+- `NodeKey::load_or_create`: two first starts at once end with one key. The
+  new key is linked into place only where nothing is, and the later start
+  loads the earlier one's, where before the later replaced it (#16).
+
 #### Tests
+
+- The Erlang interop escript keeps its throwaway identity under
+  `identity_dir` with `macula_node_keys:stored_identity/2`, as macula 14
+  requires (#16).
 
 - A test that holds its teststation past five minutes
   (`MACULA_TEST_DEADLINE_SECS` sets another limit) ends its test binary,

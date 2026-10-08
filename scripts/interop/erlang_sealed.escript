@@ -1,5 +1,5 @@
 #!/usr/bin/env escript
-%% Sealed calls and streams across macula 13 and macula-go (E2E seal scheme 1,
+%% Sealed calls and streams across macula 14 and macula-go (E2E seal scheme 1,
 %% design §5, amendment A1), through one station, for scripts/interop/gosealed
 %% and scripts/interop/tssealed. MACULA_SEALED_PEER names the peer whose texts
 %% a call expects ("kept by <peer>", ...): "go" when unset, "ts" for tssealed.
@@ -14,14 +14,15 @@
 %% does by direct dial, sealed to the key the provider's advertisement names,
 %% then calls vault at its station with confidential => off (call_station/8),
 %% which a required provider must refuse sealed_required. It prints each outcome and exits 1 on any other.
-%% The node identity is a fresh throwaway in a temporary directory.
+%% The node identity is a fresh throwaway: identity_dir is a temporary directory
+%% (identity layout v1, macula#76, macula 14 on).
 main([Lib, Host, Port, Station, Realm, Profile, Mode | Args]) ->
     [true = code:add_patha(Dir) || Dir <- filelib:wildcard(filename:join([Lib, "..", "*", "ebin"]))],
     Tmp = string:trim(os:cmd("mktemp -d")),
     P = list_to_atom(Profile),
     ok = application:load(macula),
     ok = application:set_env(macula, crypto_profile, P),
-    ok = application:set_env(macula, node_identity_path, filename:join(Tmp, "node_identity")),
+    ok = application:set_env(macula, identity_dir, filename:join(Tmp, "identity")),
     ok = application:set_env(macula, kem_advertise, enabled),
     {ok, _} = application:ensure_all_started(macula),
     Seed = #{host => list_to_binary(Host), port => list_to_integer(Port),
@@ -47,7 +48,7 @@ own(Node, Name) ->
     <<"~", (binary:encode_hex(Node, lowercase))/binary, "/", Name/binary>>.
 
 run("serve", {Pool, _Seed}, Realm, Profile, Self, [Hold]) ->
-    {ok, Key} = macula_node_keys:node_identity(Profile),
+    {ok, Key, _Path} = macula_node_keys:stored_identity(<<"default">>, Profile),
     Vault = own(Self, <<"vault">>),
     Watch = own(Self, <<"watch">>),
     Required = #{confidential => required},

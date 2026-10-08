@@ -6,6 +6,7 @@
 //! store ([`crate::keystore`]), which is where a Windows node keeps its key.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::rsa::KeyPair as RsaKeyPair;
@@ -83,6 +84,24 @@ pub enum KeyFileError {
     /// A key store holds a key in the key-file form, as macula-rust 0.7.0
     /// kept it: refused (macula-rust#19).
     KeptInTheKeyFileForm,
+    /// An identity name that is not 1 to 64 lowercase ASCII letters, digits,
+    /// `-` and `_`, starting with a letter or digit (identity layout v1).
+    IdentityName(String),
+    /// The old single key file `from` was not moved into the identity
+    /// layout, for `reason`; it is left as it is.
+    OldKey {
+        from: PathBuf,
+        reason: Box<KeyFileError>,
+    },
+    /// The old single key file `from` was not moved to `to`, which holds
+    /// another key; both are left as they are.
+    OldKeyPlaceTaken { from: PathBuf, to: PathBuf },
+    /// The identity stored at `path` does not load, for `reason`; it is
+    /// never replaced.
+    StoredKey {
+        path: PathBuf,
+        reason: Box<KeyFileError>,
+    },
 }
 
 impl fmt::Display for KeyFileError {
@@ -116,6 +135,31 @@ impl fmt::Display for KeyFileError {
                  it no longer loads: create the identity again \
                  (NodeKey::generate_identity, then save_to_keystore)",
             ),
+            KeyFileError::IdentityName(name) => write!(
+                f,
+                "not an identity name: {name:?} (1 to 64 lowercase letters, digits, - and _, \
+                 starting with a letter or digit)"
+            ),
+            KeyFileError::OldKey { from, reason } => {
+                write!(
+                    f,
+                    "the old identity key {} was not moved: {reason}",
+                    from.display()
+                )
+            }
+            KeyFileError::OldKeyPlaceTaken { from, to } => write!(
+                f,
+                "the old identity key {} was not moved: {} holds another key; both are kept",
+                from.display(),
+                to.display()
+            ),
+            KeyFileError::StoredKey { path, reason } => {
+                write!(
+                    f,
+                    "the identity stored at {} does not load: {reason}",
+                    path.display()
+                )
+            }
             KeyFileError::NoKeyFile => f.write_str(
                 "no key file on this platform: keep the key in Credential Manager \
                  through keystore::KeyringStore (NodeKey::save_to_keystore)",

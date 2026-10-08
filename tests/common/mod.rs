@@ -189,17 +189,21 @@ impl Deadline {
             .to_string();
         let limit = test_deadline();
         let (disarm, armed) = mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            if armed.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
-                // Past libtest's capture, which inherits into this thread and
-                // would be lost with the process.
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "{test} did not finish within {limit:?}: ending its test binary"
-                );
-                std::process::exit(101);
-            }
-        });
+        std::thread::spawn(move || watch(armed, limit, test));
         Deadline { _disarm: disarm }
     }
+}
+
+/// Ends the process, naming `test`, unless `armed` is disarmed within `limit`.
+fn watch(armed: mpsc::Receiver<()>, limit: Duration, test: String) {
+    if armed.recv_timeout(limit) != Err(RecvTimeoutError::Timeout) {
+        return;
+    }
+    // Past libtest's capture, which inherits into this thread and would be
+    // lost with the process.
+    let _ = writeln!(
+        std::io::stderr(),
+        "{test} did not finish within {limit:?}: ending its test binary"
+    );
+    std::process::exit(101);
 }

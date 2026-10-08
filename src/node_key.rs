@@ -6,7 +6,9 @@
 //! Keys are stored in macula's seed form: on unix in a key file readable by
 //! its owner only (see [`NodeKey::save`] and [`NodeKey::load`]), on Windows in
 //! Credential Manager only (see [`crate::keystore`] and
-//! [`NodeKey::save_to_keystore`]); a key file there is refused.
+//! [`NodeKey::save_to_keystore`]); a key file there is refused. On unix a
+//! program's own identity is stored by name and profile under the user's
+//! identity directory ([`NodeKey::stored_identity`], identity layout v1).
 //!
 //! The ML-DSA-87 half is macula-mldsa, the implementation macula-pqc signs
 //! TLS with, kept as its 32-byte seed. The RSA-PSS-4096 half is aws-lc-rs,
@@ -18,8 +20,12 @@ mod key_file;
 #[cfg(not(unix))]
 mod no_key_file;
 mod seed_form;
+#[cfg(unix)]
+mod stored_identity;
 
 pub use seed_form::KeyFileError;
+#[cfg(unix)]
+pub use stored_identity::{default_identity_dir, identity_path, DEFAULT_IDENTITY_NAME};
 
 use std::fmt;
 

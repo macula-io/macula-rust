@@ -21,6 +21,17 @@ impl NodeKey {
     /// directory is synced and the new one removed. Nothing else in the
     /// directory is read, written or removed.
     pub fn save(&self, path: &Path) -> Result<(), KeyFileError> {
+        self.place(path, Place::Replace)
+    }
+
+    /// Writes the key to `path` as [`NodeKey::save`] does, but only where
+    /// nothing is: the staged file is linked into place, which refuses an
+    /// existing file with `AlreadyExists` instead of replacing it.
+    fn save_new(&self, path: &Path) -> Result<(), KeyFileError> {
+        self.place(path, Place::CreateNew)
+    }
+
+    fn place(&self, path: &Path, place: Place) -> Result<(), KeyFileError> {
         let dir = match path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
@@ -32,7 +43,8 @@ impl NodeKey {
             .to_string_lossy();
         let staging = dir.join(format!(".{base}.saving-{}", random_suffix()?));
         create_dir_owner_only(&staging, false)?;
-        let result = write_staged(&staging, path, &self.file_bytes()?).and_then(|()| sync_dir(dir));
+        let result =
+            write_staged(&staging, path, &self.file_bytes()?, place).and_then(|()| sync_dir(dir));
         let removed = std::fs::remove_dir_all(&staging);
         result?;
         removed.map_err(KeyFileError::from)
@@ -56,17 +68,29 @@ impl NodeKey {
     /// The identity key at `path` in `profile`, or, when nothing is there, a
     /// new one with the admission puzzle solved, saved there first. Anything
     /// at `path` that does not load as such a key is refused and left as it
-    /// is, never replaced.
+    /// is, never replaced. Two first starts at once end with one key: the
+    /// later one finds the file the earlier stored and loads it.
     pub fn load_or_create(path: &Path, profile: Profile) -> Result<NodeKey, KeyFileError> {
         match std::fs::symlink_metadata(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = NodeKey::generate_identity(profile, super::PUZZLE_DIFFICULTY)
                     .map_err(KeyFileError::Generate)?;
-                key.save(path)?;
-                Ok(key)
+                stored_first(key, path, profile)
             }
             _ => NodeKey::load(path, Purpose::Identity, profile),
         }
+    }
+}
+
+/// `key`, stored at `path` where nothing is; or, when another first start
+/// stored one there meanwhile, that one.
+fn stored_first(key: NodeKey, path: &Path, profile: Profile) -> Result<NodeKey, KeyFileError> {
+    match key.save_new(path) {
+        Ok(()) => Ok(key),
+        Err(KeyFileError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            NodeKey::load(path, Purpose::Identity, profile)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -77,7 +101,20 @@ fn random_suffix() -> Result<String, KeyFileError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn write_staged(staging: &Path, path: &Path, contents: &[u8]) -> Result<(), KeyFileError> {
+/// How a staged key file takes its place: renamed over whatever is there, or
+/// linked where nothing is.
+#[derive(Clone, Copy)]
+enum Place {
+    Replace,
+    CreateNew,
+}
+
+fn write_staged(
+    staging: &Path,
+    path: &Path,
+    contents: &[u8],
+    place: Place,
+) -> Result<(), KeyFileError> {
     let staged = staging.join("key");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -86,11 +123,14 @@ fn write_staged(staging: &Path, path: &Path, contents: &[u8]) -> Result<(), KeyF
     file.write_all(contents)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&staged, path)?;
+    match place {
+        Place::Replace => std::fs::rename(&staged, path)?,
+        Place::CreateNew => std::fs::hard_link(&staged, path)?,
+    }
     Ok(())
 }
 
-fn create_dir_owner_only(dir: &Path, recursive: bool) -> Result<(), KeyFileError> {
+pub(super) fn create_dir_owner_only(dir: &Path, recursive: bool) -> Result<(), KeyFileError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(recursive);
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
