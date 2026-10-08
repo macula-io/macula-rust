@@ -26,84 +26,89 @@ fn tokens_for_macula_to_authorize() {
         .as_secs() as i64;
     assert!(clock >= NOW, "the clock is before the cases' now");
     let realm = hex::encode(Sha256::digest(b"io.macula"));
-    let mut cases = Vec::new();
-    for (name, profile) in [
-        ("pq_pure", Profile::PqPure),
-        ("pq_hybrid", Profile::PqHybrid),
-    ] {
-        let key = || NodeKey::generate_identity(profile, PUZZLE_DIFFICULTY).unwrap();
-        let node = |k: &NodeKey| k.node_id().unwrap();
-        let (root, alice, bob) = (key(), key(), key());
-        let mint = |issuer: &NodeKey, audience: &NodeKey, with: &str, o: Options| {
-            let caps = [Capability {
-                with: with.into(),
-                can: "invoke".into(),
-            }];
-            String::from_utf8(create(issuer, &node(audience), &caps, &o).unwrap()).unwrap()
-        };
-        let until = |exp| Options {
-            exp,
-            ..Options::default()
-        };
-        let to_alice = mint(&root, &alice, "mri:org:io.macula/acme", until(NOW + 3600));
-        let to_bob = mint(
-            &alice,
-            &bob,
-            "mri:proc:io.macula/acme/count_v1",
-            Options {
-                exp: NOW + 60,
-                nbf: Some(NOW - 60),
-                nnc: Some("n1".into()),
-                prf: Some(vec![proof_id(to_alice.as_bytes())]),
-                ..Options::default()
-            },
-        );
-        let mut add =
-            |case: &str, token: &str, proofs: &[&str], caller: &NodeKey, verdict: &str| {
-                cases.push(json!({
-                    "name": case,
-                    "profile": name,
-                    "token": token,
-                    "proofs": proofs,
-                    "issuer": hex::encode(node(&root)),
-                    "caller": hex::encode(node(caller)),
-                    "now": NOW,
-                    "realm": realm,
-                    "procedure": "acme/count_v1",
-                    "verdict": verdict,
-                }));
-            };
-        add("root token", &to_alice, &[], &alice, "ok");
-        add("delegated chain", &to_bob, &[&to_alice], &bob, "ok");
-        add(
-            "presented by another node",
-            &to_alice,
-            &[],
-            &bob,
-            "not_the_audience",
-        );
-        add(
-            "chain without its proof",
-            &to_bob,
-            &[],
-            &bob,
-            "missing_proof",
-        );
-        let expired = mint(&root, &alice, "mri:realm:io.macula", until(NOW));
-        add("expired", &expired, &[], &alice, "expired");
-        // The furthest exp this side mints, at NOW: macula refuses a second
-        // more, which this side would not mint.
-        let furthest = mint(
-            &root,
-            &alice,
-            "mri:realm:io.macula",
-            until(NOW + MAX_LIFETIME),
-        );
-        add("exp at the max lifetime", &furthest, &[], &alice, "ok");
-    }
+    let mut cases = cases_for("pq_pure", Profile::PqPure, &realm);
+    cases.extend(cases_for("pq_hybrid", Profile::PqHybrid, &realm));
     std::fs::write(
         &out,
         serde_json::to_string_pretty(&Value::Array(cases)).unwrap(),
     )
     .unwrap();
+}
+
+fn node(k: &NodeKey) -> [u8; 32] {
+    k.node_id().unwrap()
+}
+
+/// A token from `issuer` for `audience`, invoking `with`, as text.
+fn mint(issuer: &NodeKey, audience: &NodeKey, with: &str, o: Options) -> String {
+    let caps = [Capability {
+        with: with.into(),
+        can: "invoke".into(),
+    }];
+    String::from_utf8(create(issuer, &node(audience), &caps, &o).unwrap()).unwrap()
+}
+
+fn until(exp: i64) -> Options {
+    Options {
+        exp,
+        ..Options::default()
+    }
+}
+
+/// The cases of one profile, each with the verdict macula must reach.
+fn cases_for(name: &str, profile: Profile, realm: &str) -> Vec<Value> {
+    let key = || NodeKey::generate_identity(profile, PUZZLE_DIFFICULTY).unwrap();
+    let (root, alice, bob) = (key(), key(), key());
+    let to_alice = mint(&root, &alice, "mri:org:io.macula/acme", until(NOW + 3600));
+    let chained = Options {
+        exp: NOW + 60,
+        nbf: Some(NOW - 60),
+        nnc: Some("n1".into()),
+        prf: Some(vec![proof_id(to_alice.as_bytes())]),
+        ..Options::default()
+    };
+    let to_bob = mint(&alice, &bob, "mri:proc:io.macula/acme/count_v1", chained);
+    let expired = mint(&root, &alice, "mri:realm:io.macula", until(NOW));
+    // The furthest exp this side mints, at NOW: macula refuses a second
+    // more, which this side would not mint.
+    let furthest = mint(
+        &root,
+        &alice,
+        "mri:realm:io.macula",
+        until(NOW + MAX_LIFETIME),
+    );
+    let case = |case: &str, token: &str, proofs: &[&str], caller: &NodeKey, verdict: &str| {
+        json!({
+            "name": case,
+            "profile": name,
+            "token": token,
+            "proofs": proofs,
+            "issuer": hex::encode(node(&root)),
+            "caller": hex::encode(node(caller)),
+            "now": NOW,
+            "realm": realm,
+            "procedure": "acme/count_v1",
+            "verdict": verdict,
+        })
+    };
+    vec![
+        case("root token", &to_alice, &[], &alice, "ok"),
+        case("delegated chain", &to_bob, &[&to_alice], &bob, "ok"),
+        case(
+            "presented by another node",
+            &to_alice,
+            &[],
+            &bob,
+            "not_the_audience",
+        ),
+        case(
+            "chain without its proof",
+            &to_bob,
+            &[],
+            &bob,
+            "missing_proof",
+        ),
+        case("expired", &expired, &[], &alice, "expired"),
+        case("exp at the max lifetime", &furthest, &[], &alice, "ok"),
+    ]
 }

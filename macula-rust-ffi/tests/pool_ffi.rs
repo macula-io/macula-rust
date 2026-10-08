@@ -639,18 +639,7 @@ async fn a_gated_procedure_answers_a_minted_ucan_and_refuses_none() {
     let provider_key = FfiNodeKey::generate(FfiProfile::PqPure).unwrap();
     let provider = pool(&provider_key, &station, options()).await;
     let count = own_procedure(provider.node_id(), "count".into()).unwrap();
-    let _served = provider
-        .serve(
-            realm.clone(),
-            count.clone(),
-            Arc::new(Echo),
-            FfiConfidentiality::Preferred,
-            Some(FfiPolicy::UcanRequired {
-                issuer: provider_key.node_id(),
-            }),
-        )
-        .await
-        .unwrap();
+    let _served = serve_gated(&provider, &provider_key, &realm, &count).await;
     let caller_key = FfiNodeKey::generate(FfiProfile::PqPure).unwrap();
     let caller = pool(&caller_key, &station, options()).await;
     let grant = vec![FfiCapability {
@@ -690,6 +679,41 @@ async fn a_gated_procedure_answers_a_minted_ucan_and_refuses_none() {
         Err(FfiError::Provider { code, .. }) => assert_eq!(code, "unauthorized"),
         other => panic!("{other:?}"),
     }
+    a_window_in_milliseconds_is_refused(&provider_key, &caller_key, grant, window);
+    caller.close().await;
+    provider.close().await;
+}
+
+/// `count` served by `provider`, only to a token rooted at its own key; the
+/// handle keeps it served.
+async fn serve_gated(
+    provider: &FfiPool,
+    provider_key: &FfiNodeKey,
+    realm: &[u8],
+    count: &str,
+) -> Arc<dyn std::any::Any + Send + Sync> {
+    provider
+        .serve(
+            realm.to_vec(),
+            count.to_string(),
+            Arc::new(Echo),
+            FfiConfidentiality::Preferred,
+            Some(FfiPolicy::UcanRequired {
+                issuer: provider_key.node_id(),
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+/// An exp written in milliseconds is past the max lifetime: refused, naming
+/// why.
+fn a_window_in_milliseconds_is_refused(
+    provider_key: &FfiNodeKey,
+    caller_key: &FfiNodeKey,
+    grant: Vec<FfiCapability>,
+    window: FfiUcanOptions,
+) {
     let in_ms = provider_key.mint_ucan(
         caller_key.node_id(),
         grant,
@@ -702,8 +726,6 @@ async fn a_gated_procedure_answers_a_minted_ucan_and_refuses_none() {
         matches!(&in_ms, Err(FfiError::InvalidArgument { message }) if message.contains("exp_beyond_max_lifetime")),
         "{in_ms:?}"
     );
-    caller.close().await;
-    provider.close().await;
 }
 
 fn realm_id_of(name: &str) -> Vec<u8> {

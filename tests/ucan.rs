@@ -117,6 +117,16 @@ fn proof_ids_are_macula_s() {
     }
 }
 
+/// The key's node_id, when the vector names one, is the one its carried key
+/// derives.
+fn assert_node_id(key: &Value, carried: &[u8], profile: Profile, label: &str) {
+    let Some(node_id) = key.get("node_id") else {
+        return;
+    };
+    let ours = macula_rust::node_key::node_id_of(carried, profile);
+    assert_eq!(hex::encode(ours), *node_id, "{label}");
+}
+
 #[test]
 fn every_did_key_decodes_to_macula_s_key() {
     let v = vectors();
@@ -128,10 +138,7 @@ fn every_did_key_decodes_to_macula_s_key() {
             assert_eq!(ucan::did_key(&carried, profile), did, "{name} {who}");
             let key_id = macula_rust::node_key::key_id_of(&carried, profile);
             assert_eq!(hex::encode(key_id), key["key_id"], "{name} {who}");
-            if let Some(node_id) = key.get("node_id") {
-                let ours = macula_rust::node_key::node_id_of(&carried, profile);
-                assert_eq!(hex::encode(ours), *node_id, "{name} {who}");
-            }
+            assert_node_id(key, &carried, profile, &format!("{name} {who}"));
             let other = match profile {
                 Profile::PqPure => Profile::PqHybrid,
                 Profile::PqHybrid => Profile::PqPure,
