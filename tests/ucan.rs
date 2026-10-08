@@ -357,3 +357,20 @@ fn a_minted_token_carries_its_optional_claims() {
     };
     assert!(authorize(&token, &issuer, &alone).is_ok());
 }
+
+/// A did:key longer than any key's is refused before it is decoded: base58
+/// decodes in time quadratic in its length, ahead of the signature check,
+/// so an unbounded `iss` would hold a provider's worker for minutes.
+#[test]
+fn an_overlong_did_key_is_refused_at_once() {
+    let did = format!("did:key:z{}", "2".repeat(200_000));
+    for profile in [Profile::PqPure, Profile::PqHybrid] {
+        let started = std::time::Instant::now();
+        assert_eq!(carried_key(&did, profile), Err(Refusal::Malformed));
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(100),
+            "{profile:?}: {took:?}"
+        );
+    }
+}

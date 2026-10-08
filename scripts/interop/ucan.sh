@@ -6,14 +6,14 @@
 # exits non-zero on any verdict that differs. Runs where podman is, cargo and
 # the Erlang side in the pinned CI image.
 #
-#   MACULA_BUILD=<a compiled macula 13.x checkout> scripts/interop/ucan.sh
+#   MACULA_BUILD=<a compiled macula checkout, 13.6 or later> scripts/interop/ucan.sh
 #
 # erlang_ucan.escript is macula-go's (scripts/interop at c635e30), unchanged.
 # CGROUP_PARENT puts the containers in a CI host's cgroup slice.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 image="${MACULA_CI_IMAGE:-ghcr.io/macula-io/macula-ci-otp:20260923-1347@sha256:b2260d084a3d3c5e0b74932c4ee052a0cadfddddb6587d5d2214873e6bb06330}"
-: "${MACULA_BUILD:?a compiled macula checkout at v13.x}"
+: "${MACULA_BUILD:?a compiled macula checkout, 13.6 or later}"
 slice=${CGROUP_PARENT:+--cgroup-parent=$CGROUP_PARENT}
 cases="target/interop-ucan/rust_ucans.json"
 

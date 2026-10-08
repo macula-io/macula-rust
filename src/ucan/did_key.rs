@@ -11,6 +11,13 @@ const CODEC_MLDSA87: u64 = 0x1212;
 const CODEC_MLDSA87_RSA4096: u64 = 0x30_0087;
 
 const PREFIX: &str = "did:key:z";
+
+/// The longest base58btc text a did:key for a node key can have: a pq_hybrid
+/// key, the longest, is a 3-byte codec varint, the 2,592-byte ML-DSA-87 key
+/// and a DER RSA-4096 public key of about 526 bytes, some 4,270 characters.
+/// Anything longer is malformed, refused before it is decoded: base58 decodes
+/// in time quadratic in its length, ahead of the signature check.
+const MAX_ENCODED_CHARS: usize = 4_400;
 const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// The did:key for a key as carried in `profile`.
@@ -24,6 +31,9 @@ pub fn did_key(carried: &[u8], profile: Profile) -> String {
 /// `profile` (D13); [`Refusal::Malformed`] otherwise.
 pub fn carried_key(did: &str, profile: Profile) -> Result<Vec<u8>, Refusal> {
     let encoded = did.strip_prefix(PREFIX).ok_or(Refusal::Malformed)?;
+    if encoded.len() > MAX_ENCODED_CHARS {
+        return Err(Refusal::Malformed);
+    }
     let prefix = varint(codec(profile));
     let decoded = base58btc_decode(encoded).ok_or(Refusal::Malformed)?;
     match decoded.strip_prefix(prefix.as_slice()) {

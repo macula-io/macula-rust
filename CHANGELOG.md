@@ -43,7 +43,9 @@ reseals after a key rotation (#21); identity layout v1 (#16).
   whose token the policy does not authorize `unauthorized`, and one carrying
   a proof no link names `malformed_frame`, before its handler runs. An open
   procedure ignores any token. A realm member policy without a `can` is
-  `InvalidOffer`.
+  `InvalidOffer`. A did:key longer than any node key's (4,400 base58
+  characters) is malformed before it is decoded, so a token's `iss` cannot
+  hold a provider's worker for minutes.
 - `scripts/interop/ucan.sh`: tokens this crate mints, authorized by macula's
   own `macula_ucan` (with macula-go's `erlang_ucan.escript`).
 - Identity layout v1 (macula#76, #16), on unix: `NodeKey::stored_identity`
