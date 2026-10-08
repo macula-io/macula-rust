@@ -13,9 +13,16 @@
 //! 12.3.0's: an open of at most 1 MiB, read within 10 seconds of a stream
 //! being opened to the provider, and at most 16 MiB of a stream's frames
 //! received and not yet read.
+//!
+//! A caller's sealed stream a pool opened reopens itself once when the
+//! provider refuses its open sealed_refused before this side has sent
+//! anything, after the provider's KEM key rotated: sealed to the key the
+//! refusal names, on a new session, behind the same handle; never in the
+//! clear (macula's stream reseal, E2E design Amendment A1, macula-rust#21).
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -26,10 +33,11 @@ use crate::frame::{
     self, RequestSpec, StreamEncoding, StreamFields, StreamMode, StreamRole, StreamState,
     VerifiedRequest,
 };
+use crate::seal::KEY_ID_SIZE;
 
 use super::admission::{Admission, SessionPlace, Verdict};
 use super::confidential::{
-    clear_allowed, opened_request, sealed_request, stated, unsealed, Seal, StreamSeal,
+    clear_allowed, opened_request, refused_key, sealed_request, stated, unsealed, Seal, StreamSeal,
     CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
 };
 use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
@@ -125,6 +133,17 @@ pub struct Stream {
     pub(super) inner: Arc<StreamInner>,
 }
 
+/// What a caller's sealed stream runs, once, when its open is refused
+/// sealed_refused before it has sent anything: given the key id the refusal
+/// names (`None` for none), the stream reopened sealed to that key, or why
+/// there is none. It never opens in the clear.
+pub(crate) type Reseal = Box<
+    dyn FnOnce(
+            Option<[u8; KEY_ID_SIZE]>,
+        ) -> Pin<Box<dyn Future<Output = Result<Stream, LinkError>> + Send>>
+        + Send,
+>;
+
 /// What a served stream's inbox holds is charged to its caller's budget in
 /// the node's admission, and the session holds its place there.
 struct Budget {
@@ -146,10 +165,16 @@ pub(super) struct StreamInner {
     budget: Mutex<Option<Budget>>,
     notify: Notify,
     done_tx: watch::Sender<bool>,
+    /// A caller's sealed stream's one reseal, until it is spent.
+    reseal: Mutex<Option<Reseal>>,
 }
 
 #[derive(Default)]
 pub(super) struct StreamSide {
+    /// The reseal is running: this session reads and writes no more.
+    reopening: bool,
+    /// The session the stream reopened on, which carries it from now on.
+    successor: Option<Arc<StreamInner>>,
     /// This side sent its last frame, or will send no more.
     sent_end: bool,
     /// The peer sent its last frame.
@@ -179,80 +204,65 @@ impl Stream {
 
     /// Sends a raw chunk.
     pub async fn send(&self, body: &[u8]) -> Result<(), LinkError> {
-        self.inner
-            .send(
-                |seq| StreamFields::Data {
-                    seq,
-                    encoding: StreamEncoding::Raw,
-                    body: Value::Bytes(body.to_vec()),
-                },
-                false,
-            )
-            .await
+        let at = |seq| StreamFields::Data {
+            seq,
+            encoding: StreamEncoding::Raw,
+            body: Value::Bytes(body.to_vec()),
+        };
+        self.sent(at, false).await.1
     }
 
     /// Sends a structured chunk.
     pub async fn send_value(&self, v: Value) -> Result<(), LinkError> {
-        self.inner
-            .send(
-                |seq| StreamFields::Data {
-                    seq,
-                    encoding: StreamEncoding::Msgpack,
-                    body: v.clone(),
-                },
-                false,
-            )
-            .await
+        let at = |seq| StreamFields::Data {
+            seq,
+            encoding: StreamEncoding::Msgpack,
+            body: v.clone(),
+        };
+        self.sent(at, false).await.1
     }
 
     /// Ends this side's sending; the peer may still send.
     pub async fn close_send(&self) -> Result<(), LinkError> {
-        self.inner
-            .send(
-                |seq| StreamFields::End {
-                    seq,
-                    role: StreamRole::Send,
-                },
-                true,
-            )
-            .await
+        let at = |seq| StreamFields::End {
+            seq,
+            role: StreamRole::Send,
+        };
+        self.sent(at, true).await.1
     }
 
     /// Ends the stream on both sides.
     pub async fn close(&self) -> Result<(), LinkError> {
-        let sent = self
-            .inner
-            .send(
-                |seq| StreamFields::End {
-                    seq,
-                    role: StreamRole::Both,
-                },
-                true,
-            )
-            .await;
-        StreamInner::end(&self.inner, None);
+        let at = |seq| StreamFields::End {
+            seq,
+            role: StreamRole::Both,
+        };
+        let (inner, sent) = self.sent(at, true).await;
+        StreamInner::end(&inner, None);
         sent
     }
 
     /// Sends the provider's terminal value and ends the stream.
     pub async fn reply(&self, payload: Value) -> Result<(), LinkError> {
-        let sent = self
-            .inner
-            .send(
-                |seq| StreamFields::Reply {
-                    seq,
-                    payload: payload.clone(),
-                },
-                true,
-            )
-            .await;
-        StreamInner::end(&self.inner, None);
+        let at = |seq| StreamFields::Reply {
+            seq,
+            payload: payload.clone(),
+        };
+        let (inner, sent) = self.sent(at, true).await;
+        StreamInner::end(&inner, None);
         sent
     }
 
     /// Ends the stream with a STREAM_ERROR of `code` and `message`.
     pub async fn abort(&self, code: &str, message: &str) -> Result<(), LinkError> {
-        self.inner.abort(code, message).await
+        let at = |seq| StreamFields::Error {
+            seq,
+            code: code.to_string(),
+            message: message.to_string(),
+        };
+        let (inner, sent) = self.sent(at, true).await;
+        StreamInner::end(&inner, Some(aborted(code, message)));
+        sent
     }
 
     /// The next frame the peer sent. After the stream ends, once every event
@@ -260,8 +270,9 @@ impl Stream {
     /// end and the error that ended it otherwise.
     pub async fn recv(&self) -> Result<StreamEvent, LinkError> {
         loop {
-            let notified = self.inner.notify.notified();
-            match self.inner.next_event() {
+            let inner = self.live().await;
+            let notified = inner.notify.notified();
+            match inner.next_event() {
                 Some(outcome) => return outcome,
                 None => notified.await,
             }
@@ -271,9 +282,60 @@ impl Stream {
     /// Waits until the stream has ended and been released, and says why:
     /// `None` for a normal end.
     pub async fn done(&self) -> Option<LinkError> {
-        let mut done = self.inner.done_tx.subscribe();
-        let _ = done.wait_for(|ended| *ended).await;
-        self.inner.side().err.clone()
+        let mut inner = self.live().await;
+        while !inner.released().await {
+            inner = self.live().await;
+        }
+        let err = inner.side().err.clone();
+        err
+    }
+
+    /// The fields `at` builds, sent on the session that carries the stream
+    /// now, and that session.
+    async fn sent(
+        &self,
+        at: impl Fn(u64) -> StreamFields,
+        last: bool,
+    ) -> (Arc<StreamInner>, Result<(), LinkError>) {
+        let mut inner = self.live().await;
+        let mut sent = inner.send_here(&at, last).await;
+        while sent.is_none() {
+            inner = self.live().await;
+            sent = inner.send_here(&at, last).await;
+        }
+        (inner, sent.unwrap_or(Err(LinkError::StreamClosed)))
+    }
+
+    /// The session that carries the stream: the one it opened on, or the
+    /// one it reopened on after a reseal, waited for while the reseal runs.
+    async fn live(&self) -> Arc<StreamInner> {
+        let mut at = self.current();
+        while at.side().reopening {
+            at.reopen_awaited().await;
+            at = self.current();
+        }
+        at
+    }
+
+    /// The session that carries the stream now, without waiting.
+    pub(super) fn current(&self) -> Arc<StreamInner> {
+        let mut at = self.inner.clone();
+        loop {
+            let next = at.side().successor.clone();
+            match next {
+                Some(next) => at = next,
+                None => return at,
+            }
+        }
+    }
+}
+
+/// The error a stream this side aborted ends with.
+fn aborted(code: &str, message: &str) -> LinkError {
+    LinkError::Stream {
+        code: code.to_string(),
+        message: message.to_string(),
+        relay: false,
     }
 }
 
@@ -296,6 +358,7 @@ impl StreamInner {
             budget: Mutex::new(None),
             notify: Notify::new(),
             done_tx: watch::channel(false).0,
+            reseal: Mutex::new(None),
         })
     }
 
@@ -335,7 +398,31 @@ impl StreamInner {
         at: impl FnOnce(u64) -> StreamFields,
         last: bool,
     ) -> Result<(), LinkError> {
-        let mut seq = self.send_seq.lock().await;
+        let seq = self.send_seq.lock().await;
+        self.send_at(seq, at, last).await
+    }
+
+    /// [`StreamInner::send`], unless a reseal has taken the stream off this
+    /// session: then `None`, nothing sent, and the frame goes on the
+    /// session it reopens on.
+    async fn send_here(
+        self: &Arc<Self>,
+        at: &impl Fn(u64) -> StreamFields,
+        last: bool,
+    ) -> Option<Result<(), LinkError>> {
+        let seq = self.send_seq.lock().await;
+        if self.side().reopening || self.side().successor.is_some() {
+            return None;
+        }
+        Some(self.send_at(seq, at, last).await)
+    }
+
+    async fn send_at(
+        self: &Arc<Self>,
+        mut seq: tokio::sync::MutexGuard<'_, u64>,
+        at: impl FnOnce(u64) -> StreamFields,
+        last: bool,
+    ) -> Result<(), LinkError> {
         if self.side().sent_end {
             return Err(LinkError::StreamClosed);
         }
@@ -413,15 +500,69 @@ impl StreamInner {
                 true,
             )
             .await;
-        StreamInner::end(
-            self,
-            Some(LinkError::Stream {
-                code: code.to_string(),
-                message: message.to_string(),
-                relay: false,
-            }),
-        );
+        StreamInner::end(self, Some(aborted(code, message)));
         sent
+    }
+
+    /// Waits until this session has ended and been released: true when the
+    /// stream ended with it, false when it went on on a reopened session.
+    async fn released(&self) -> bool {
+        let mut done = self.done_tx.subscribe();
+        let _ = done.wait_for(|ended| *ended).await;
+        self.side().successor.is_none()
+    }
+
+    /// Returns once this session's reseal has ended, either way.
+    async fn reopen_awaited(&self) {
+        let notified = self.notify.notified();
+        // Checked again once registered, so the reseal's end is not missed
+        // between the two.
+        if self.side().reopening {
+            notified.await;
+        }
+    }
+
+    fn reseal_slot(&self) -> MutexGuard<'_, Option<Reseal>> {
+        self.reseal.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The provider refused the open sealed_refused, naming `detail`'s key:
+    /// a caller's sealed stream holding its reseal, and that has sent
+    /// nothing, starts it and reads no more on this session (true).
+    /// Checked and marked under the send lock, so no frame goes out on this
+    /// session after it. Otherwise the refusal ends the stream (false).
+    async fn reopened(self: &Arc<Self>, detail: &str) -> bool {
+        let Some(reseal) = self.reseal_slot().take() else {
+            return false;
+        };
+        let seq = self.send_seq.lock().await;
+        if *seq != 0 || self.side().sent_end {
+            return false;
+        }
+        self.side().reopening = true;
+        drop(seq);
+        self.notify.notify_waiters();
+        let s = self.clone();
+        let named = refused_key(Some(detail));
+        tokio::spawn(async move {
+            let outcome = reseal(named).await;
+            s.adopt(outcome);
+        });
+        true
+    }
+
+    /// Carries the stream on the session its reseal reopened, this one
+    /// released; or ends it with why there is none.
+    fn adopt(self: &Arc<Self>, outcome: Result<Stream, LinkError>) {
+        let reopened = {
+            let mut side = self.side();
+            side.reopening = false;
+            outcome.map(|next| side.successor = Some(next.inner))
+        };
+        match reopened {
+            Ok(()) => StreamInner::end(self, None),
+            Err(e) => self.peer_finished(Some(e)),
+        }
     }
 
     /// Queues `event` for recv, refusing it when it would take the inbox, or
@@ -560,6 +701,16 @@ impl Link {
     /// writes the signed STREAM_OPEN. A stream it opens but cannot write the
     /// open on is released before the error returns.
     pub async fn open_stream(&self, c: StreamCall) -> Result<Stream, LinkError> {
+        self.open_stream_resealing(c, None).await
+    }
+
+    /// [`Link::open_stream`], the stream holding `reseal` for a
+    /// sealed_refused of its open (see the module's docs).
+    pub(crate) async fn open_stream_resealing(
+        &self,
+        c: StreamCall,
+        reseal: Option<Reseal>,
+    ) -> Result<Stream, LinkError> {
         let inner = &self.inner;
         stated(&c.target, &inner.station.node_id, &c.seal)?;
         let deadline = if c.deadline.is_zero() {
@@ -613,6 +764,7 @@ impl Link {
             let _ = recv.stop(0u32.into());
             return Err(e);
         }
+        *s.reseal_slot() = reseal;
         tokio::spawn(read(s.clone(), recv, state));
         Ok(Stream { inner: s })
     }
@@ -937,6 +1089,11 @@ async fn taken(
     next: StreamState,
 ) -> Option<StreamState> {
     match fields {
+        StreamFields::Error {
+            seq: 0,
+            ref code,
+            ref message,
+        } if s.caller && code == CODE_SEALED_REFUSED && s.reopened(message).await => None,
         StreamFields::Error { code, message, .. } => {
             s.peer_finished(Some(LinkError::Stream {
                 code,

@@ -33,6 +33,16 @@ usually touches both, but their version numbers don't move in lockstep.
   another key. Checked against macula's shared vectors
   (`tests/vectors/identity/identity_layout_v1.json`).
 
+- A pool stream reseals once after its provider's KEM key rotated (#21), as
+  a call does (#20) and as macula's `stream_resealed/6` does: refused
+  sealed_refused before this side has sent anything, it reopens behind the
+  handle the caller holds, sealed only to the key the provider names, found
+  in one fresh lookup of the provider's own trusted advertisements, and
+  delivers the provider's frames; its seal report names the new key. A
+  refusal naming a key no advertisement names ends the stream key_mismatch,
+  naming both; a second refusal, or one after anything was sent, ends it
+  sealed_refused. Never the clear.
+
 #### Fixed
 
 - `NodeKey::load_or_create`: two first starts at once end with one key. The

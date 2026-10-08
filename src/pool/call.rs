@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -26,7 +26,7 @@ use crate::record::{self, RecordType, Trust, Verified};
 use crate::seal::KEY_ID_SIZE;
 use crate::station_link::{
     self, Confidentiality, ConfidentialityError, ConfidentialityReason, Link, LinkError, Report,
-    Seal, Stream, DEFAULT_CALL_TIMEOUT,
+    Reseal, Seal, Stream, DEFAULT_CALL_TIMEOUT,
 };
 use crate::transport::Target;
 
@@ -204,7 +204,10 @@ impl Pool {
     /// [`Pool::call`] reaches one: the next candidate only when a station
     /// cannot be reached, and the link's own outcome is final. The stream is
     /// open once its STREAM_OPEN is sent; a provider's or station's refusal
-    /// arrives on its first recv.
+    /// arrives on its first recv. A sealed stream refused sealed_refused
+    /// after its provider's key rotated, before it has sent anything,
+    /// reopens once behind the same handle, sealed to the key the provider
+    /// names, as a call reseals ([`Pool::call`]); never in the clear.
     pub async fn open_stream(&self, c: StreamCall) -> Result<Stream, PoolError> {
         let inner = &self.inner;
         let realm_key = inner.realm_key_for(&c.realm, &c.procedure)?;
@@ -214,10 +217,11 @@ impl Pool {
             procedure: c.procedure.clone(),
             provider: c.provider,
         };
-        let candidates = bounded(deadline, inner.candidates(&key, realm_key)).await?;
+        let candidates = bounded(deadline, inner.candidates(&key, realm_key.clone())).await?;
         let candidates = callable(candidates, c.confidential)?;
         let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
-        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c)).await;
+        let reseal = inner.stream_reseal(&key, &cand, &c, realm_key, &link);
+        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c, reseal)).await;
         inner.settled(key, cand, outcome)
     }
 
@@ -409,26 +413,63 @@ impl PoolInner {
         (next, outcome)
     }
 
-    /// Opens the stream at the candidate's provider on `link`.
+    /// Opens the stream at the candidate's provider on `link`, holding
+    /// `reseal` for a sealed_refused of its open.
     async fn open_at(
         &self,
         link: &Link,
         cand: &Candidate,
         c: &StreamCall,
+        reseal: Option<Reseal>,
     ) -> Result<Stream, PoolError> {
         Ok(link
-            .open_stream(station_link::StreamCall {
-                realm: c.realm,
-                procedure: c.procedure.clone(),
-                target: cand.provider.node,
-                mode: c.mode,
-                payload: c.payload.clone(),
-                deadline: c.deadline,
-                token: c.token.clone(),
-                proofs: c.proofs.clone(),
-                seal: Some(cand.seal()),
-            })
+            .open_stream_resealing(
+                station_link::StreamCall {
+                    realm: c.realm,
+                    procedure: c.procedure.clone(),
+                    target: cand.provider.node,
+                    mode: c.mode,
+                    payload: c.payload.clone(),
+                    deadline: c.deadline,
+                    token: c.token.clone(),
+                    proofs: c.proofs.clone(),
+                    seal: Some(cand.seal()),
+                },
+                reseal,
+            )
             .await?)
+    }
+
+    /// A sealed stream's one reseal, on a call's terms (see
+    /// [`PoolInner::resealed`]): one fresh lookup of the provider's own
+    /// trusted advertisements, then the stream reopened on `link` sealed
+    /// only to the key the refusal named (another fails naming both, none
+    /// fails closed), or, after a keyless refusal, to the first key the
+    /// provider now names. The reopened stream holds no reseal: a second
+    /// refusal ends it. None for a clear candidate.
+    fn stream_reseal(
+        self: &Arc<Self>,
+        key: &ResolvedKey,
+        cand: &Candidate,
+        c: &StreamCall,
+        realm_key: Option<Vec<u8>>,
+        link: &Link,
+    ) -> Option<Reseal> {
+        cand.kem_key.as_ref()?;
+        let pool = Arc::downgrade(self);
+        let r = Resealing {
+            own: ResolvedKey {
+                provider: cand.provider.node,
+                ..key.clone()
+            },
+            key: key.clone(),
+            c: c.clone(),
+            link: link.clone(),
+            realm_key,
+        };
+        Some(Box::new(move |named| {
+            Box::pin(resealed_stream(pool, r, named))
+        }))
     }
 
     /// The link up now to `station`, if any.
@@ -558,6 +599,41 @@ struct Sent<'a> {
 /// one, or, when the refusal named none, the first that names a key. When
 /// the named key is not among them, key_mismatch naming both; when none
 /// names a key, no_kem_key.
+/// What a stream's reseal reopens: the provider's own key, the key the pool
+/// remembers it under, the open, and its link and realm key.
+struct Resealing {
+    own: ResolvedKey,
+    key: ResolvedKey,
+    c: StreamCall,
+    link: Link,
+    realm_key: Option<Vec<u8>>,
+}
+
+/// The stream reopened as [`PoolInner::stream_reseal`] says.
+async fn resealed_stream(
+    pool: Weak<PoolInner>,
+    r: Resealing,
+    named: Option<[u8; KEY_ID_SIZE]>,
+) -> Result<Stream, LinkError> {
+    let pool = pool.upgrade().ok_or(LinkError::Closed)?;
+    let deadline = Instant::now() + DEFAULT_CALL_TIMEOUT;
+    let fresh = bounded(deadline, pool.resolve(&r.own, r.realm_key)).await;
+    let next = reseal_to(fresh, named).map_err(as_link_error)?;
+    let reopened = bounded(deadline, pool.open_at(&r.link, &next, &r.c, None)).await;
+    let stream = reopened.map_err(as_link_error)?;
+    pool.remember(r.key, next);
+    Ok(stream)
+}
+
+/// A pool error as the stream it ends carries it.
+fn as_link_error(e: PoolError) -> LinkError {
+    match e {
+        PoolError::Link(e) => e,
+        PoolError::Confidentiality(e) => LinkError::Confidentiality(e),
+        other => LinkError::Io(other.to_string()),
+    }
+}
+
 fn reseal_to(
     found: Result<Vec<Candidate>, PoolError>,
     named: Option<[u8; KEY_ID_SIZE]>,

@@ -73,15 +73,17 @@ impl Stream {
     /// settles a stream. Before it settles, and on a stream that ended
     /// first, it is [`ReportError::NotSettled`]; on a served stream,
     /// [`ReportError::NotACaller`]. A stream that settled and then ended, an
-    /// error included, keeps its report.
+    /// error included, keeps its report. A stream resealed after its
+    /// provider's key rotated reports the key it reopened under.
     pub fn report(&self) -> Result<Report, ReportError> {
-        if !self.inner.caller {
+        let inner = self.current();
+        if !inner.caller {
             return Err(ReportError::NotACaller);
         }
-        if !self.inner.side().settled {
+        if !inner.side().settled {
             return Err(ReportError::NotSettled);
         }
-        let key_id = self.inner.sealing.as_ref().map(|s| s.key_id());
-        Ok(Report::of(self.inner.open.target, key_id))
+        let key_id = inner.sealing.as_ref().map(|s| s.key_id());
+        Ok(Report::of(inner.open.target, key_id))
     }
 }
