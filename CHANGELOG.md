@@ -13,7 +13,7 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
-### [Unreleased]
+### [0.9.1] - 2026-10-09
 
 #### Added
 

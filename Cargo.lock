@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "macula-rust"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "apple-native-keyring-store",
  "aws-lc-rs",
