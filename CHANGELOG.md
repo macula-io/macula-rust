@@ -22,6 +22,23 @@ usually touches both, but their version numbers don't move in lockstep.
   pins the bound and a did:key one past it (`did_key_length`, macula#87), and
   `tests/ucan.rs` holds this crate to both (#23).
 
+#### Fixed
+
+- **`cbor::encode` wrote values `cbor::decode` refuses**: a NaN or infinite
+  float, a map key that is not text or an integer, two equal keys in one map,
+  an integer outside -2^63..=2^63-1, more than 64 levels of nesting or more
+  than 131,072 items. A caller that stored such bytes could not read them back
+  (macula-passport's event log, for one). `encode` now refuses exactly what
+  decoding rule v1 refuses, and `tests/cbor_encoding_rule.rs` runs the shared
+  vectors through it (#24).
+
+#### Changed
+
+- `cbor::encode` returns `EncodeError`, one variant per reason, in place of
+  `IntOutOfRange`, which is gone. Code that only formats or propagates the
+  error compiles unchanged; code that named `IntOutOfRange` must name
+  `EncodeError::IntegerOutOfRange` (#24).
+
 ### [0.9.0] - 2026-10-08
 
 macula 12's post-quantum UCAN (D7), minted, presented and enforced, at

@@ -644,7 +644,7 @@ fn bytes(b: &[u8]) -> Value {
 /// byte strings, text and unsigned integers is RFC 8949's core
 /// deterministic one.
 fn encode(items: Vec<Value>) -> Vec<u8> {
-    cbor::encode(&Value::List(items)).expect("seal arrays hold no integer outside u64")
+    cbor::encode(&Value::List(items)).expect("seal arrays hold no integer outside i64")
 }
 
 fn hex(b: &[u8]) -> String {

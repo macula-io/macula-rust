@@ -15,8 +15,8 @@
 //! - Integers: minimal-length encoding (inline for 0..=23, else the
 //!   smallest of 1/2/4/8 extra bytes that fits). Non-negative → major 0.
 //!   Negative → major 1, encoded value is `-1 - n`. Range:
-//!   `-(2^64)..=u64::MAX` — anything outside that is a hard encode error,
-//!   not silent truncation.
+//!   `-(2^63)..=2^63-1`, the decoding rule's — anything outside that is a
+//!   hard encode error, not silent truncation.
 //! - Byte strings → major 2, raw bytes.
 //! - Text → major 3. Used both for real text payloads and for macula's
 //!   fixed field-name/enum-value vocabulary (what the Erlang side encodes
@@ -56,8 +56,8 @@ use std::fmt;
 /// wire format supports. There is no generic "any CBOR" here on purpose.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
-    /// Signed, but the encodable range is asymmetric: `-(2^64)..=u64::MAX`,
-    /// matching the reference codec's own u64/i128 split.
+    /// Held in an i128, but only `-(2^63)..=2^63-1` encodes or decodes: the
+    /// decoding rule's range.
     Int(i128),
     Bytes(Vec<u8>),
     /// Also what an Erlang atom (frame-type names, field names, enum
@@ -124,20 +124,39 @@ impl Value {
     }
 }
 
+/// Why [`encode`] refused a value: one variant for each way a [`Value`] can
+/// break macula 12's decoding rule, so nothing is written that [`decode`],
+/// or any other stack, would refuse to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IntOutOfRange(pub i128);
+pub enum EncodeError {
+    /// A map key that is neither text nor an integer.
+    BadKey,
+    /// Two keys of one map that are equal: the same text, or the same integer.
+    DuplicateKey,
+    /// Arrays and maps nested more than [`MAX_NESTING_DEPTH`] levels.
+    NestingTooDeep,
+    /// An integer below -2^63 or above 2^63-1.
+    IntegerOutOfRange,
+    /// A value that holds more than [`MAX_ELEMENTS`] items.
+    TooManyElements,
+    /// A float that is NaN or infinite.
+    NonFiniteFloat,
+}
 
-impl fmt::Display for IntOutOfRange {
+impl fmt::Display for EncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "integer {} is outside the encodable range -(2^64)..=u64::MAX",
-            self.0
-        )
+        f.write_str(match self {
+            EncodeError::BadKey => "a map key that is neither text nor an integer",
+            EncodeError::DuplicateKey => "a duplicate map key",
+            EncodeError::NestingTooDeep => "arrays and maps nested more than 64 levels",
+            EncodeError::IntegerOutOfRange => "an integer below -2^63 or above 2^63-1",
+            EncodeError::TooManyElements => "more than 131072 items",
+            EncodeError::NonFiniteFloat => "a float that is NaN or infinite",
+        })
     }
 }
 
-impl std::error::Error for IntOutOfRange {}
+impl std::error::Error for EncodeError {}
 
 /// Why [`decode`] refused an input: one variant for each reason macula's
 /// reference decoder (`macula_record_cbor:decode_strict/1`) gives, so an input
@@ -184,86 +203,132 @@ impl std::error::Error for DecodeError {}
 
 /// Encode `value` as deterministic CBOR. See the module doc for the exact
 /// rules; every one of them is verified against the real reference in
-/// this module's tests.
-pub fn encode(value: &Value) -> Result<Vec<u8>, IntOutOfRange> {
-    let mut out = Vec::with_capacity(64);
-    encode_value(value, &mut out)?;
-    Ok(out)
+/// this module's tests. A value macula 12's decoding rule refuses is refused
+/// here too, with the reason, so what this writes [`decode`] reads back.
+pub fn encode(value: &Value) -> Result<Vec<u8>, EncodeError> {
+    let mut encoder = Encoder {
+        out: Vec::with_capacity(64),
+        budget: MAX_ELEMENTS,
+    };
+    encoder.value(value, 0)?;
+    Ok(encoder.out)
 }
 
-fn encode_value(value: &Value, out: &mut Vec<u8>) -> Result<(), IntOutOfRange> {
-    match value {
-        Value::Int(n) => encode_int(*n, out),
-        Value::Bytes(b) => {
-            encode_head(2, b.len() as u64, out);
-            out.extend_from_slice(b);
-            Ok(())
+/// Writes one value into `out`, with `budget` the items it may still write,
+/// held to the limits [`decode`] reads under.
+struct Encoder {
+    out: Vec<u8>,
+    budget: usize,
+}
+
+impl Encoder {
+    /// The value, which sits inside `depth` arrays and maps, counted once.
+    fn value(&mut self, value: &Value, depth: usize) -> Result<(), EncodeError> {
+        if self.budget == 0 {
+            return Err(EncodeError::TooManyElements);
         }
-        Value::Text(s) => {
-            let bytes = s.as_bytes();
-            encode_head(3, bytes.len() as u64, out);
-            out.extend_from_slice(bytes);
-            Ok(())
-        }
-        Value::List(items) => {
-            encode_head(4, items.len() as u64, out);
-            for item in items {
-                encode_value(item, out)?;
+        self.budget -= 1;
+        match value {
+            Value::Int(n) => encode_int(*n, &mut self.out),
+            Value::Bytes(b) => {
+                encode_head(2, b.len() as u64, &mut self.out);
+                self.out.extend_from_slice(b);
+                Ok(())
             }
-            Ok(())
+            Value::Text(s) => {
+                let bytes = s.as_bytes();
+                encode_head(3, bytes.len() as u64, &mut self.out);
+                self.out.extend_from_slice(bytes);
+                Ok(())
+            }
+            Value::List(items) => self.list(items, depth),
+            Value::Map(pairs) => self.map(pairs, depth),
+            Value::Null => {
+                self.out.push(0xF6); // major 7, additional info 22
+                Ok(())
+            }
+            Value::Float(v) if v.is_finite() => {
+                self.out.push(0xFB); // major 7, additional info 27 (binary64)
+                self.out.extend_from_slice(&v.to_be_bytes());
+                Ok(())
+            }
+            Value::Float(_) => Err(EncodeError::NonFiniteFloat),
         }
-        Value::Map(pairs) => encode_map(pairs, out),
-        Value::Null => {
-            out.push(0xF6); // major 7, additional info 22
-            Ok(())
+    }
+
+    fn list(&mut self, items: &[Value], depth: usize) -> Result<(), EncodeError> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(EncodeError::NestingTooDeep);
         }
-        Value::Float(v) => {
-            out.push(0xFB); // major 7, additional info 27 (binary64)
-            out.extend_from_slice(&v.to_be_bytes());
-            Ok(())
+        encode_head(4, items.len() as u64, &mut self.out);
+        for item in items {
+            self.value(item, depth + 1)?;
         }
+        Ok(())
+    }
+
+    /// Encode each key/value independently, then sort the resulting pairs by
+    /// the key's OWN ENCODED BYTES (plain lexicographic `Ord` on `Vec<u8>`,
+    /// which already implements "shorter is smaller when a prefix" — no
+    /// special-casing needed). This is the one rule a naive implementation is
+    /// most likely to get wrong; see the module doc. Keys are text or
+    /// integers, each with one encoding, so two equal keys encode alike and
+    /// sort next to each other.
+    fn map(&mut self, pairs: &[(Value, Value)], depth: usize) -> Result<(), EncodeError> {
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(EncodeError::NestingTooDeep);
+        }
+        let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            encoded.push(self.entry(k, v, depth + 1)?);
+        }
+        encoded.sort_by(|a, b| a.0.cmp(&b.0));
+        if encoded.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(EncodeError::DuplicateKey);
+        }
+        encode_head(5, encoded.len() as u64, &mut self.out);
+        for (k, v) in &encoded {
+            self.out.extend_from_slice(k);
+            self.out.extend_from_slice(v);
+        }
+        Ok(())
+    }
+
+    /// One map entry's key and value, each encoded on its own, as the decoder
+    /// reads them: the key, then the value, then the key judged.
+    fn entry(
+        &mut self,
+        key: &Value,
+        value: &Value,
+        depth: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>), EncodeError> {
+        let key_bytes = self.piece(key, depth)?;
+        let value_bytes = self.piece(value, depth)?;
+        match key {
+            Value::Text(_) | Value::Int(_) => Ok((key_bytes, value_bytes)),
+            _ => Err(EncodeError::BadKey),
+        }
+    }
+
+    /// `value` encoded on its own, against the same budget.
+    fn piece(&mut self, value: &Value, depth: usize) -> Result<Vec<u8>, EncodeError> {
+        let outer = std::mem::replace(&mut self.out, Vec::with_capacity(16));
+        let written = self.value(value, depth);
+        let piece = std::mem::replace(&mut self.out, outer);
+        written.map(|()| piece)
     }
 }
 
-fn encode_int(n: i128, out: &mut Vec<u8>) -> Result<(), IntOutOfRange> {
+/// An integer within -2^63..=2^63-1, the decoding rule's range, in its
+/// minimal length.
+fn encode_int(n: i128, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    if !(i128::from(i64::MIN)..=i128::from(i64::MAX)).contains(&n) {
+        return Err(EncodeError::IntegerOutOfRange);
+    }
     if n >= 0 {
-        if n <= u64::MAX as i128 {
-            encode_head(0, n as u64, out);
-            Ok(())
-        } else {
-            Err(IntOutOfRange(n))
-        }
+        encode_head(0, n as u64, out);
     } else {
-        // n in -(2^64)..=-1 => count in 0..=2^64-1
-        let count = -1i128 - n;
-        if (0..=u64::MAX as i128).contains(&count) {
-            encode_head(1, count as u64, out);
-            Ok(())
-        } else {
-            Err(IntOutOfRange(n))
-        }
-    }
-}
-
-/// Encode each key/value independently, then sort the resulting pairs by
-/// the key's OWN ENCODED BYTES (plain lexicographic `Ord` on `Vec<u8>`,
-/// which already implements "shorter is smaller when a prefix" — no
-/// special-casing needed). This is the one rule a naive implementation is
-/// most likely to get wrong; see the module doc.
-fn encode_map(pairs: &[(Value, Value)], out: &mut Vec<u8>) -> Result<(), IntOutOfRange> {
-    let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(pairs.len());
-    for (k, v) in pairs {
-        let mut kbuf = Vec::with_capacity(16);
-        encode_value(k, &mut kbuf)?;
-        let mut vbuf = Vec::with_capacity(16);
-        encode_value(v, &mut vbuf)?;
-        encoded.push((kbuf, vbuf));
-    }
-    encoded.sort_by(|a, b| a.0.cmp(&b.0));
-    encode_head(5, encoded.len() as u64, out);
-    for (k, v) in &encoded {
-        out.extend_from_slice(k);
-        out.extend_from_slice(v);
+        encode_head(1, (-1 - n) as u64, out);
     }
     Ok(())
 }
@@ -594,15 +659,18 @@ mod tests {
 
     #[test]
     fn integer_out_of_range_is_rejected() {
-        // One past the documented positive bound.
-        assert_eq!(
-            encode(&Value::Int(u64::MAX as i128 + 1)),
-            Err(IntOutOfRange(u64::MAX as i128 + 1))
-        );
-        // One past the documented negative bound (-(2^64)).
-        let floor = -(1i128 << 64);
+        // The decoding rule's bounds, -2^63 and 2^63-1, and one past each.
+        let (floor, ceiling) = (i128::from(i64::MIN), i128::from(i64::MAX));
         assert!(encode(&Value::Int(floor)).is_ok());
-        assert!(encode(&Value::Int(floor - 1)).is_err());
+        assert!(encode(&Value::Int(ceiling)).is_ok());
+        assert_eq!(
+            encode(&Value::Int(floor - 1)),
+            Err(EncodeError::IntegerOutOfRange)
+        );
+        assert_eq!(
+            encode(&Value::Int(ceiling + 1)),
+            Err(EncodeError::IntegerOutOfRange)
+        );
     }
 
     #[test]
