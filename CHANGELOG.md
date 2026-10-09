@@ -13,6 +13,15 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [Unreleased]
+
+#### Added
+
+- `ucan::MAX_DID_KEY_ENCODED` (4,400): the did:key length bound, public, so a
+  caller can name it. The UCAN vectors are copied from macula v14.5.0, which
+  pins the bound and a did:key one past it (`did_key_length`, macula#87), and
+  `tests/ucan.rs` holds this crate to both (#23).
+
 ### [0.9.0] - 2026-10-08
 
 macula 12's post-quantum UCAN (D7), minted, presented and enforced, at

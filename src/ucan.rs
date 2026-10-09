@@ -38,7 +38,7 @@ use crate::node_key::{KeyError, NodeKey, Purpose};
 use crate::profile::Profile;
 
 pub use capability::covers;
-pub use did_key::{carried_key, did_key};
+pub use did_key::{carried_key, did_key, MAX_DID_KEY_ENCODED};
 
 /// The furthest past now, in seconds, that a token's `exp` may lie: ten
 /// years of 365.25 days, as `macula_ucan:max_lifetime/0`. UCAN_V1 has no

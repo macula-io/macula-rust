@@ -1,5 +1,5 @@
 //! UCAN against macula's own vectors (tests/vectors/ucan, copied unchanged
-//! from macula v13.6.0): every verdict, proof id, did:key key and narrowing
+//! from macula v14.5.0): every verdict, proof id, did:key key and narrowing
 //! is macula's. Then tokens this crate mints, by round trip: authorized
 //! alone and through a chain, and refused where macula refuses them.
 
@@ -371,6 +371,27 @@ fn an_overlong_did_key_is_refused_at_once() {
         assert!(
             took < std::time::Duration::from_millis(100),
             "{profile:?}: {took:?}"
+        );
+    }
+}
+
+/// macula#87: the did:key length bound is macula's, and the did:key one past
+/// it is malformed in both profiles.
+#[test]
+fn the_did_key_length_bound_is_macula_s() {
+    let bound = &vectors()["did_key_length"];
+    assert_eq!(bound["max_encoded_chars"], ucan::MAX_DID_KEY_ENCODED);
+    assert_eq!(bound["verdict"], "malformed");
+    let over = bound["over_bound"].as_str().expect("over_bound");
+    assert_eq!(
+        over.len(),
+        "did:key:z".len() + ucan::MAX_DID_KEY_ENCODED + 1
+    );
+    for profile in [Profile::PqPure, Profile::PqHybrid] {
+        assert_eq!(
+            carried_key(over, profile),
+            Err(Refusal::Malformed),
+            "{profile:?}"
         );
     }
 }

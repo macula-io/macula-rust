@@ -15,4 +15,4 @@ draft's vector for id-MLDSA87-RSA4096-PSS-SHA512 as macula v12.7.0 carries it.
 | `record/` | own-namespace procedure advertisements and their verdicts |
 | `manifest/` | content manifests and their ids |
 | `seal/` | E2E seal scheme 1's recipient keys and ids, and keyed procedure advertisements signed by macula with their verdicts, copied unchanged from macula v13.3.0's `test/vectors/e2e_seal_v1.json` and `e2e_seal_v1_advertisements.json` |
-| `ucan/` | UCAN_V1: tokens, policies and contexts with their verdicts, proof ids, did:key keys and the narrowing table, copied unchanged from macula v13.6.0's `test/vectors/ucan_v1.json` and its contract `UCAN_V1.md` |
+| `ucan/` | UCAN_V1: tokens, policies and contexts with their verdicts, proof ids, did:key keys and the narrowing table, copied unchanged from macula v14.5.0's `test/vectors/ucan_v1.json` and its contract `UCAN_V1.md`, among them the did:key length bound (`did_key_length`, macula#87) |
