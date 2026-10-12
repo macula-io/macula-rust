@@ -13,6 +13,15 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [0.9.2] - 2026-10-12
+
+#### Fixed
+
+- Builds for Android (`aarch64-linux-android`, `x86_64-linux-android`).
+  `KeyringStore` names `keyring_core` types on every target, but `keyring-core`
+  was only a dependency on Linux and Windows. It is now a dependency
+  everywhere, and CI cross-builds both Android ABIs with cargo-ndk (#26).
+
 ### [0.9.1] - 2026-10-09
 
 #### Added
