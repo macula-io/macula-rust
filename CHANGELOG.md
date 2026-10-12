@@ -13,6 +13,17 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [0.9.3] - 2026-10-12
+
+#### Fixed
+
+- An Android app can create its identity key. A new key file, and the old
+  single key file's move, were placed with link(2), which Android's SELinux
+  refuses in an app's own storage, so every first start on a phone failed with
+  "Permission denied". They are now placed with a rename that never replaces
+  (`RENAME_NOREPLACE`, `RENAME_EXCL` on Apple): just as atomic, and an existing
+  file is still refused and left as it is (#28).
+
 ### [0.9.2] - 2026-10-12
 
 #### Fixed
