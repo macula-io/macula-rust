@@ -74,6 +74,25 @@ jobs:
       # The runner's NDK path is a shell variable, not in the env context.
       - run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk --platform 26 -t arm64-v8a -t x86_64 build -p macula-rust --locked
 
+  key-files-without-hard-links:
+    # Android refuses link(2) in an app's own storage (#28): the key-file
+    # suites run where link and linkat fail with EACCES, as on a phone.
+    name: key files without hard links (as on Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo test -p macula-rust --locked --no-run --message-format=json \
+            --test identity_layout --test identity_key_file \
+            | jq -r 'select(.profile.test == true) | .executable' > suites.txt
+      - run: |
+          while read -r suite; do
+            docker run --rm --security-opt seccomp=.github/seccomp/no-hard-links.json \
+              -v "$PWD:$PWD" -w "$PWD" ubuntu:24.04 "$suite" </dev/null
+          done < suites.txt
+
   doc:
     name: docs (deny broken links)
     runs-on: ubuntu-latest
