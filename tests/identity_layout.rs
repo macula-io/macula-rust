@@ -94,7 +94,9 @@ fn set_up(case: &Value, base: &Path, dir: &Path, old: &Path) -> (Vec<u8>, std::p
     match text(case, "in_place") {
         "same_file" => {
             std::fs::create_dir_all(dir).unwrap();
-            std::fs::hard_link(old, &to).unwrap();
+            // A move cut short: the old key's bytes already in place. A copy,
+            // not a link: Android refuses link(2) in app storage (#28).
+            std::fs::copy(old, &to).unwrap();
         }
         "another_key" => {
             saved(&to, profile);

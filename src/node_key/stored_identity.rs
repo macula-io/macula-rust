@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::key_file::create_dir_owner_only;
+use super::key_file::{create_dir_owner_only, move_new};
 use super::{KeyFileError, NodeKey, Purpose};
 use crate::profile::Profile;
 
@@ -97,7 +97,7 @@ impl NodeKey {
 }
 
 /// Moves the old single key file beside `dir`, when there is one, to
-/// `default.<its profile>.key` in `dir`: linked, then the old name removed.
+/// `default.<its profile>.key` in `dir`, never over another file.
 /// The same file already in place is a move cut short, and is finished.
 fn move_old_key(dir: &Path) -> Result<(), KeyFileError> {
     let old = dir.parent().unwrap_or(Path::new("")).join(OLD_KEY_FILE);
@@ -109,12 +109,14 @@ fn move_old_key(dir: &Path) -> Result<(), KeyFileError> {
     let profile = old_key_profile(&old).map_err(|e| old_key(&old, e))?;
     let to = identity_path(dir, DEFAULT_IDENTITY_NAME, profile)?;
     create_dir_owner_only(dir, true).map_err(|e| old_key(&old, e))?;
-    match std::fs::hard_link(&old, &to) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => same_key(&old, &to)?,
-        Err(e) => return Err(old_key(&old, e.into())),
+    match move_new(&old, &to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            same_key(&old, &to)?;
+            std::fs::remove_file(&old).map_err(|e| old_key(&old, e.into()))
+        }
+        Err(e) => Err(old_key(&old, e.into())),
     }
-    std::fs::remove_file(&old).map_err(|e| old_key(&old, e.into()))
 }
 
 /// The profile the old key loads in, as an identity key.

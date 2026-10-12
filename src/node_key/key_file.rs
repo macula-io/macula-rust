@@ -25,8 +25,8 @@ impl NodeKey {
     }
 
     /// Writes the key to `path` as [`NodeKey::save`] does, but only where
-    /// nothing is: the staged file is linked into place, which refuses an
-    /// existing file with `AlreadyExists` instead of replacing it.
+    /// nothing is: the staged file is moved into place by [`move_new`], which
+    /// refuses an existing file with `AlreadyExists` instead of replacing it.
     fn save_new(&self, path: &Path) -> Result<(), KeyFileError> {
         self.place(path, Place::CreateNew)
     }
@@ -102,7 +102,7 @@ fn random_suffix() -> Result<String, KeyFileError> {
 }
 
 /// How a staged key file takes its place: renamed over whatever is there, or
-/// linked where nothing is.
+/// moved where nothing is.
 #[derive(Clone, Copy)]
 enum Place {
     Replace,
@@ -125,9 +125,43 @@ fn write_staged(
     drop(file);
     match place {
         Place::Replace => std::fs::rename(&staged, path)?,
-        Place::CreateNew => std::fs::hard_link(&staged, path)?,
+        Place::CreateNew => move_new(&staged, path)?,
     }
     Ok(())
+}
+
+/// Moves `from` to `to` only where nothing is at `to`; an existing file is
+/// refused with `AlreadyExists` and left as it is. A rename that never
+/// replaces (RENAME_NOREPLACE, RENAME_EXCL on Apple), since Android refuses
+/// link(2) in an app's own storage (#28). Linked and then unlinked only on a
+/// platform or file system without that rename.
+pub(super) fn move_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    match rename_no_replace(from, to) {
+        Err(e) if no_such_rename(&e) => {
+            std::fs::hard_link(from, to)?;
+            std::fs::remove_file(from)
+        }
+        moved => moved,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(rustix::io::Errno::NOSYS.into())
+}
+
+/// The kernel or the file system has no rename that never replaces.
+fn no_such_rename(e: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    [Errno::INVAL, Errno::NOSYS, Errno::OPNOTSUPP]
+        .iter()
+        .any(|errno| e.raw_os_error() == Some(errno.raw_os_error()))
 }
 
 pub(super) fn create_dir_owner_only(dir: &Path, recursive: bool) -> Result<(), KeyFileError> {

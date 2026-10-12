@@ -71,9 +71,8 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-ndk --locked
-      - run: cargo ndk --platform 26 -t arm64-v8a -t x86_64 build -p macula-rust --locked
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      # The runner's NDK path is a shell variable, not in the env context.
+      - run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk --platform 26 -t arm64-v8a -t x86_64 build -p macula-rust --locked
 
   doc:
     name: docs (deny broken links)
