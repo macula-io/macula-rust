@@ -65,6 +65,11 @@ tokio = { version = "1", features = ["full"] }
 # `android-native-keyring-store` is added explicitly since it is NOT part
 # of `v1`'s default set either.
 keyring = { version = "4", features = ["android-native-keyring-store"] }
+# KeyringStore names keyring_core's Entry and Error on every target, so the
+# crate is a dependency on every target (#26: Android is target_os
+# "android", not "linux", and failed to build). "1" matches keyring 4's own
+# constraint, so both resolve to one crate instance.
+keyring-core = "1"
 # keystore.rs's LinuxKeyutilsStore: a second, independently-selectable
 # KeyStore backend demonstrating the trait is genuinely overridable, not
 # just declared to be — uses the kernel's own keyutils facility directly
@@ -76,7 +81,6 @@ keyring = { version = "4", features = ["android-native-keyring-store"] }
 # would collide with KeyringStore's own default-store selection if both
 # were used in one process).
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring-core = "1"
 linux-keyutils-keyring-store = "1"
 
 # Windows: KeyringStore builds its Credential Manager credential directly
@@ -85,7 +89,6 @@ linux-keyutils-keyring-store = "1"
 # Enterprise, which roams with a domain profile (#19). Same "1" constraints
 # keyring 4.2.0 uses, so both resolve to one crate instance.
 [target.'cfg(windows)'.dependencies]
-keyring-core = "1"
 windows-native-keyring-store = "1"
 
 # Unifies apple-native-keyring-store's `protected` feature into the same
