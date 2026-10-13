@@ -267,7 +267,7 @@ impl Link {
             &inner.self_id,
             &o.realm,
             &o.procedure,
-            &inner.station.node_id,
+            &[inner.station.node_id],
             &opts,
         )?;
         // Signed, then checked as a caller will check it before it is sent

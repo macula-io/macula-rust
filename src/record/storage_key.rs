@@ -8,7 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::cbor::Value;
 
-use super::{malformed, payload::is_content_id, Record, RecordError, RecordType};
+use super::payload::{is_content_id, is_content_id_shaped};
+use super::{malformed, Record, RecordError, RecordType};
 
 const STORAGE_KEY_LABEL: &[u8] = b"MACULA-PQ-STORAGE-KEY-V1";
 
@@ -50,6 +51,33 @@ pub fn content_key(mcid: &[u8]) -> Result<[u8; 32], RecordError> {
 /// The storage key of a station's endpoint record.
 pub fn station_endpoint_key(node_id: &[u8; 32]) -> [u8; 32] {
     derived(0x12, &[node_id])
+}
+
+/// The storage key of a station's authorization by a realm, from the realm
+/// id and the station's node_id.
+pub fn station_authorization_key(realm_id: &[u8; 32], station_node: &[u8; 32]) -> [u8; 32] {
+    derived(0x13, &[realm_id, station_node])
+}
+
+/// The storage key of an app record, from the parts of the app's MRI,
+/// `mri:app:<realm>/<org>/<app>`: the realm id, the org name and the app
+/// name.
+pub fn app_record_key(realm_id: &[u8; 32], org_name: &str, app_name: &str) -> [u8; 32] {
+    derived(
+        0x17,
+        &[
+            realm_id,
+            &length_prefixed(org_name.as_bytes()),
+            &length_prefixed(app_name.as_bytes()),
+        ],
+    )
+}
+
+/// The slot of a record of a type this crate does not know (WIRE_1_0.md
+/// section 5.3): H(type | signer key id | subject), the key id the
+/// MACULA-KEY-ID-V1 one of the record's key as carried, whatever its purpose.
+pub(super) fn unknown_type_key(t: u8, key_id: &[u8; 32], subject: &[u8]) -> [u8; 32] {
+    derived(t, &[key_id, &length_prefixed(subject)])
 }
 
 /// The storage key of an org directory record.
@@ -100,14 +128,19 @@ fn slot_key(
         0x0E => derived(t as u8, &[&signer()?, &text("param_name")?]),
         0x10 => derived(t as u8, &[&id("station_id")?]),
         0x11 => match payload.get("mcid") {
-            Some(Value::Bytes(m)) if is_content_id(Some(&Value::Bytes(m.clone()))) => {
+            Some(Value::Bytes(m)) if is_content_id_shaped(Some(&Value::Bytes(m.clone()))) => {
                 derived(0x11, &[&length_prefixed(m)])
             }
             _ => return Err(RecordError::NotAContentId),
         },
         0x12 => derived(t as u8, &[&signer()?]),
+        0x13 => derived(t as u8, &[&id("realm_id")?, &id("station_node")?]),
         0x15 => derived(t as u8, &[&id("realm_id")?, &text("org_name")?]),
         0x16 => derived(t as u8, &[&signer()?, &id("advertiser")?]),
+        0x17 => derived(
+            t as u8,
+            &[&id("realm_id")?, &text("org_name")?, &text("app_name")?],
+        ),
         0x20..=0xFF => match subject {
             Some(s) => derived(t as u8, &[&signer()?, &length_prefixed(s)]),
             None => derived(t as u8, &[&signer()?]),

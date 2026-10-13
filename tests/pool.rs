@@ -526,7 +526,7 @@ async fn a_procedure_in_the_node_s_own_namespace_needs_no_realm_key() {
         &id(&mallory),
         &realm,
         &ring,
-        &callers.node_id,
+        &[callers.node_id],
         &ProcedureAdvertisementOptions::default(),
     )
     .unwrap();

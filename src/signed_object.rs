@@ -27,6 +27,9 @@ pub enum ObjectError {
     SignatureInvalid,
     /// An alg that names another profile's algorithm than the verifier's.
     AlgMismatch,
+    /// An alg the verifier's allowlist does not hold (`alg_unsupported`,
+    /// WIRE_1_0.md section 7), refused before any signature work.
+    AlgUnsupported(String),
     /// A field to sign whose key is not text.
     FieldKeyNotText,
     /// Two fields to sign with one key, named here.
@@ -44,6 +47,9 @@ impl fmt::Display for ObjectError {
             }
             ObjectError::AlgMismatch => {
                 f.write_str("the signed object names another profile's algorithm")
+            }
+            ObjectError::AlgUnsupported(alg) => {
+                write!(f, "an alg the verifier does not take: {alg:?}")
             }
             ObjectError::FieldKeyNotText => f.write_str("a field key that is not text"),
             ObjectError::DuplicateField(name) => write!(f, "two fields named {name:?}"),
@@ -172,6 +178,42 @@ pub fn verify_object(
     verified(label, object.key, object.tbs, &object.signature, profile)
 }
 
+/// Verifies an object that carries its key, under `label`, with the verifier
+/// its alg selects from `profile`'s allowlist (WIRE_1_0.md sections 5.2 and
+/// 7), in this order: exactly key, tbs and signature, each a byte string; tbs
+/// under the decoding rule, a map holding alg as text, nothing else in it
+/// acted on before the signature; alg on the allowlist, which is the
+/// profile's own algorithm alone, so the other profile's is refused before
+/// any crypto ([`ObjectError::AlgUnsupported`]); key in that algorithm's
+/// carried form; the signature over tbs as received.
+pub fn verify_object_by_alg(
+    label: &str,
+    value: &Value,
+    profile: Profile,
+) -> Result<VerifiedObject, ObjectError> {
+    let object = Object::from_value(value)?;
+    let fields = cbor::decode(&object.tbs).map_err(|_| ObjectError::Malformed)?;
+    let alg = match (&fields, fields.get("alg")) {
+        (Value::Map(_), Some(Value::Text(alg))) => alg.clone(),
+        _ => return Err(ObjectError::Malformed),
+    };
+    if alg != profile.sig_alg() {
+        return Err(ObjectError::AlgUnsupported(alg));
+    }
+    if !carried_key_well_formed(&object.key, profile) {
+        return Err(ObjectError::Malformed);
+    }
+    let signed = object_signed_bytes(label, &object.key, &object.tbs);
+    if !verify(&signed, &object.signature, &object.key, profile) {
+        return Err(ObjectError::SignatureInvalid);
+    }
+    Ok(VerifiedObject {
+        key: object.key,
+        tbs: object.tbs,
+        fields,
+    })
+}
+
 /// Verifies an object whose key the verifier holds, as carried, under `label`
 /// and the verifier's `profile`.
 pub fn verify_held_object(
@@ -262,4 +304,44 @@ fn exact_byte_fields<const N: usize>(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod wire_1_0_tests {
+    //! The wire 1.0 tbs vectors (macula#97, tbs.json): every signed structure's
+    //! fields encode to exactly its canonical tbs, its signing input is the
+    //! label, a zero byte, the SHA-384 of the signer's key as carried when the
+    //! form is keyed, and the tbs, and its signature verifies under the
+    //! signer's key.
+
+    use super::*;
+    use crate::wire_vectors::{self, hex_of, typed};
+
+    #[test]
+    fn the_wire_1_0_tbs_vectors() {
+        let file = wire_vectors::load("tbs");
+        for c in &file.cases {
+            let profile = Profile::parse(&c.profile).unwrap();
+            let key = wire_vectors::key(&c.profile, c.text("signer"));
+            let tbs = cbor::encode(&typed(&c.input["fields"])).unwrap();
+            assert_eq!(hex::encode(&tbs), c.expect_text("tbs"), "{}: the tbs", c.id);
+            let input = match c.text("form") {
+                "keyed" => object_signed_bytes(c.text("label"), &key, &tbs),
+                _ => crate::binding::labelled(c.text("label"), &tbs),
+            };
+            assert_eq!(
+                hex::encode(&input),
+                c.expect_text("signing_input"),
+                "{}",
+                c.id
+            );
+            let signature = hex_of(&c.expect["signature"]);
+            assert!(
+                verify(&input, &signature, &key, profile),
+                "{}: the signature",
+                c.id
+            );
+        }
+        assert_eq!(file.cases.len(), 28);
+    }
 }

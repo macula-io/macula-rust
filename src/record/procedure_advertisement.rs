@@ -1,5 +1,6 @@
 //! Procedure advertisements: a node's statement that it serves a procedure in
-//! a realm, through a station, signed by the node. A procedure with an org
+//! a realm, through 1 to 8 stations (K > 1, WIRE_1_0.md section 5.3), signed
+//! by the node. A procedure with an org
 //! namespace carries its provider authorization inside the payload: the
 //! realm's org directory and the org's procedure delegation, as their wire
 //! forms (see `authorization`).
@@ -7,6 +8,7 @@
 use crate::cbor::Value;
 use crate::seal::{self, KEY_ID_SIZE};
 
+use super::payload::MAX_SERVING_STATIONS;
 use super::{entry, id_field, malformed, text_field, unsigned, Record, RecordError, RecordType};
 
 /// A procedure advertisement's provider authorization, as macula_record's
@@ -41,20 +43,30 @@ pub struct ProcedureAdvertisementOptions {
 }
 
 /// An unsigned advertisement, by `advertiser_node`, which signs it, of
-/// `procedure` in `realm_id`, served through `serving_station`. It builds no
-/// authorization but an org directory and a procedure delegation.
+/// `procedure` in `realm_id`, served through `serving_stations`: 1 to 8
+/// stations, carried in ascending order of their node_ids, each once. It
+/// builds no authorization but an org directory and a procedure delegation.
 pub fn new_procedure_advertisement(
     advertiser_node: &[u8; 32],
     realm_id: &[u8; 32],
     procedure: &str,
-    serving_station: &[u8; 32],
+    serving_stations: &[[u8; 32]],
     opts: &ProcedureAdvertisementOptions,
 ) -> Result<Record, RecordError> {
+    let mut stations = serving_stations.to_vec();
+    stations.sort_unstable();
+    stations.dedup();
+    if stations.is_empty() || stations.len() > MAX_SERVING_STATIONS {
+        return Err(malformed("an advertisement names 1 to 8 serving stations"));
+    }
     let mut entries = vec![
         entry("realm_id", Value::Bytes(realm_id.to_vec())),
         entry("procedure", Value::text(procedure)),
         entry("advertiser_node", Value::Bytes(advertiser_node.to_vec())),
-        entry("serving_station", Value::Bytes(serving_station.to_vec())),
+        entry(
+            "serving_stations",
+            Value::List(stations.iter().map(|s| Value::Bytes(s.to_vec())).collect()),
+        ),
     ];
     match &opts.authorization {
         Authorization::None => {}
@@ -99,7 +111,7 @@ pub struct ProcedureAdvertisement {
     pub realm_id: [u8; 32],
     pub procedure: String,
     pub advertiser_node: [u8; 32],
-    pub serving_station: [u8; 32],
+    pub serving_stations: Vec<[u8; 32]>,
     pub authorization: Authorization,
     pub kem_key: Option<(Vec<u8>, [u8; KEY_ID_SIZE])>,
 }
@@ -114,7 +126,16 @@ pub fn read_procedure_advertisement(r: &Record) -> Result<ProcedureAdvertisement
         realm_id: id_field(p, "realm_id"),
         procedure: text_field(p, "procedure"),
         advertiser_node: id_field(p, "advertiser_node"),
-        serving_station: id_field(p, "serving_station"),
+        serving_stations: match p.get("serving_stations") {
+            Some(Value::List(items)) => items
+                .iter()
+                .filter_map(|s| match s {
+                    Value::Bytes(b) => b.as_slice().try_into().ok(),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
         authorization: read_authorization(p),
         kem_key: read_kem_key(p),
     })

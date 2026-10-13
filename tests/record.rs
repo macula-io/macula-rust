@@ -89,7 +89,7 @@ fn a_procedure_advertisement_lives_five_minutes_under_its_procedure_key() {
         &node_id,
         &[3; 32],
         "acme/echo",
-        &[4; 32],
+        &[[4; 32]],
         &ProcedureAdvertisementOptions::default(),
     )
     .unwrap();
@@ -97,7 +97,7 @@ fn a_procedure_advertisement_lives_five_minutes_under_its_procedure_key() {
     let v = verified(&encode(&sign(&ad, &key).unwrap()).unwrap());
     let read = read_procedure_advertisement(v.record()).unwrap();
     assert_eq!(read.procedure, "acme/echo");
-    assert_eq!(read.serving_station, [4; 32]);
+    assert_eq!(read.serving_stations, vec![[4; 32]]);
     assert_eq!(read.authorization, Authorization::None);
     assert_eq!(
         storage_key(v.record()).unwrap(),
@@ -107,7 +107,7 @@ fn a_procedure_advertisement_lives_five_minutes_under_its_procedure_key() {
         &node_id,
         &[3; 32],
         "acme/echo",
-        &[4; 32],
+        &[[4; 32]],
         &ProcedureAdvertisementOptions {
             ttl_ms: 5 * MINUTE + 1,
             ..Default::default()
@@ -182,7 +182,7 @@ fn a_record_is_refused_for_its_time_its_size_and_any_change() {
     ));
     assert!(matches!(
         verify(&wire, Profile::PqHybrid, created),
-        Err(RecordError::Malformed(_))
+        Err(RecordError::AlgUnsupported)
     ));
 }
 
@@ -195,7 +195,7 @@ fn a_tombstone_withdraws_a_record_from_its_slot() {
             &node_id,
             &[3; 32],
             "acme/echo",
-            &[4; 32],
+            &[[4; 32]],
             &Default::default(),
         )
         .unwrap(),
@@ -287,6 +287,9 @@ fn own_namespace_fixtures_reach_macula_s_verdicts() {
         ))
         .unwrap();
         let now_ms = v["now_ms"].as_i64().unwrap();
+        if refused_as_pre_1_0(&wire, profile, now_ms) {
+            continue;
+        }
         let record = verify(&wire, profile, now_ms).unwrap();
         assert_eq!(
             read_procedure_advertisement(record.record())
@@ -312,6 +315,26 @@ fn own_namespace_fixtures_reach_macula_s_verdicts() {
     }
 }
 
+/// Whether `wire` is a record macula signed before wire 1.0, no schema in
+/// its tbs, which a wire 1.0 reader refuses as malformed. The shared fixtures
+/// replayed here are still pre-1.0 until macula regenerates them (reported on
+/// macula#97); each such record must be refused, and once a fixture is
+/// regenerated it is held to its verdicts again.
+fn refused_as_pre_1_0(wire: &[u8], profile: Profile, now_ms: i64) -> bool {
+    let object = cbor::decode(wire).unwrap();
+    let Some(Value::Bytes(tbs)) = object.get("tbs") else {
+        return false;
+    };
+    if cbor::decode(tbs).unwrap().get("schema").is_some() {
+        return false;
+    }
+    assert!(matches!(
+        verify(wire, profile, now_ms),
+        Err(RecordError::Malformed(_))
+    ));
+    true
+}
+
 /// A record signed by hand, as the realm and org sign theirs: a signed object
 /// under the record label with the record's fields.
 fn hand_signed(
@@ -333,6 +356,11 @@ fn hand_signed(
             Value::Int(i128::from(created + lifetime)),
         ),
         (Value::text("payload"), payload),
+        (Value::text("schema"), Value::Int(1)),
+        (
+            Value::text("lifetime_class"),
+            Value::Int(i128::from(row_of(record_type))),
+        ),
     ];
     cbor::encode(
         &sign_object("MACULA-PQ-RECORD-V1", &fields, key)
@@ -340,6 +368,17 @@ fn hand_signed(
             .to_value(),
     )
     .unwrap()
+}
+
+/// The lifetime row WIRE_1_0.md section 5.1 gives the types these tests
+/// sign by hand.
+fn row_of(record_type: u8) -> u8 {
+    match record_type {
+        0x06 | 0x12 => 0,
+        0x16 => 1,
+        0x15 => 2,
+        _ => 3,
+    }
 }
 
 struct Chain {
@@ -382,13 +421,13 @@ fn chain(org_name: &str, delegate_to_other: bool, directory_ms: u64) -> Chain {
             (Value::text("advertiser"), Value::Bytes(advertiser.to_vec())),
         ]),
         t,
-        6 * HOUR,
+        30 * MINUTE,
     );
     let ad = new_procedure_advertisement(
         &node_id,
         &realm_id,
         "acme/echo",
-        &[4; 32],
+        &[[4; 32]],
         &ProcedureAdvertisementOptions {
             authorization: Authorization::Delegation {
                 org_directory: directory,
@@ -462,7 +501,7 @@ fn an_org_procedure_without_an_authorization_is_refused() {
         &key.node_id().unwrap(),
         &[3; 32],
         "acme/echo",
-        &[4; 32],
+        &[[4; 32]],
         &Default::default(),
     )
     .unwrap();
@@ -500,7 +539,10 @@ fn advertisement_payload(node_id: &[u8; 32], extra: Vec<(Value, Value)>) -> Valu
             Value::text("advertiser_node"),
             Value::Bytes(node_id.to_vec()),
         ),
-        (Value::text("serving_station"), Value::Bytes(vec![4; 32])),
+        (
+            Value::text("serving_stations"),
+            Value::List(vec![Value::Bytes(vec![4; 32])]),
+        ),
     ];
     entries.extend(extra);
     Value::Map(entries)
@@ -539,7 +581,7 @@ fn an_advertisement_names_a_provider_s_kem_key_with_its_id() {
             &node_id,
             &[3; 32],
             "acme/echo",
-            &[4; 32],
+            &[[4; 32]],
             &ProcedureAdvertisementOptions {
                 kem_key: Some(kem_key.clone()),
                 ..Default::default()
@@ -554,7 +596,7 @@ fn an_advertisement_names_a_provider_s_kem_key_with_its_id() {
         &node_id,
         &[3; 32],
         "acme/echo",
-        &[4; 32],
+        &[[4; 32]],
         &ProcedureAdvertisementOptions::default(),
     )
     .unwrap();
@@ -568,7 +610,7 @@ fn an_advertisement_names_a_provider_s_kem_key_with_its_id() {
         &node_id,
         &[3; 32],
         "acme/echo",
-        &[4; 32],
+        &[[4; 32]],
         &ProcedureAdvertisementOptions {
             kem_key: Some(vec![1; 32]),
             ..Default::default()
@@ -694,6 +736,9 @@ fn macula_s_keyed_advertisements_verify_as_macula_rules() {
 fn keyed_advertisement_case(name: &str, profile: Profile, now_ms: i64, case: &serde_json::Value) {
     let what = format!("{name} {}", case["name"]);
     let wire = hex::decode(case["record"].as_str().unwrap()).unwrap();
+    if refused_as_pre_1_0(&wire, profile, now_ms) {
+        return;
+    }
     let verified = verify(&wire, profile, now_ms);
     match case["verdict"].as_str().unwrap() {
         "accepted" => {

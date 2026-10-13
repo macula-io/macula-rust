@@ -490,7 +490,7 @@ fn sign_tbs(key: &NodeKey, label: &str, tbs: Vec<u8>) -> Result<SignedTbs, Bindi
 }
 
 /// `label`, a zero byte and `tbs`: what a binding or status statement signs.
-fn labelled(label: &str, tbs: &[u8]) -> Vec<u8> {
+pub(crate) fn labelled(label: &str, tbs: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(label.len() + 1 + tbs.len());
     out.extend_from_slice(label.as_bytes());
     out.push(0);

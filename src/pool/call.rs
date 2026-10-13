@@ -319,7 +319,7 @@ impl PoolInner {
         let mut out: Vec<Candidate> = found
             .iter()
             .filter(|v| v.record().record_type == RecordType::PROCEDURE_ADVERTISEMENT)
-            .filter_map(|v| trusted_candidate(v, key, &trust, now))
+            .flat_map(|v| trusted_candidates(v, key, &trust, now))
             .collect();
         if out.is_empty() {
             return Err(PoolError::NoProvider(Vec::new()));
@@ -704,31 +704,32 @@ async fn first_reached(
     Err(PoolError::NoProvider(tried))
 }
 
-/// The candidate an advertisement under `key`'s slot makes, when it is one
-/// of `key`'s procedure (by `key.provider` when it is set) and `trust`
-/// authorizes it at `now`.
-fn trusted_candidate(
-    v: &Verified,
-    key: &ResolvedKey,
-    trust: &Trust,
-    now: i64,
-) -> Option<Candidate> {
-    let ad = record::read_procedure_advertisement(v.record()).ok()?;
+/// The candidates an advertisement under `key`'s slot makes, one for each of
+/// its serving stations (K > 1), when it is one of `key`'s procedure (by
+/// `key.provider` when it is set) and `trust` authorizes it at `now`.
+fn trusted_candidates(v: &Verified, key: &ResolvedKey, trust: &Trust, now: i64) -> Vec<Candidate> {
+    let Ok(ad) = record::read_procedure_advertisement(v.record()) else {
+        return Vec::new();
+    };
     let wanted = ad.realm_id == key.realm
         && ad.procedure == key.procedure
         && (key.provider == [0; 32] || ad.advertiser_node == key.provider);
     if !wanted || record::verify_authorization(v, trust, now).is_err() {
-        return None;
+        return Vec::new();
     }
-    Some(Candidate {
-        provider: Provider {
-            node: ad.advertiser_node,
-            station: ad.serving_station,
-        },
-        expires_at: v.record().expires_at,
-        created_at: v.record().created_at,
-        kem_key: ad.kem_key.map(|(key, _)| key),
-    })
+    let kem_key = ad.kem_key.map(|(key, _)| key);
+    ad.serving_stations
+        .iter()
+        .map(|station| Candidate {
+            provider: Provider {
+                node: ad.advertiser_node,
+                station: *station,
+            },
+            expires_at: v.record().expires_at,
+            created_at: v.record().created_at,
+            kem_key: kem_key.clone(),
+        })
+        .collect()
 }
 
 /// A failure of the link to carry a request, as opposed to the station's
