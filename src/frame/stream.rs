@@ -513,7 +513,10 @@ fn stream_read(
         (_, false) => &["payload"],
         (_, true) => &["sealed"],
     };
-    let carried = 5 + own.len() + usize::from(fields.contains_key("alg"));
+    let carried = 5
+        + own.len()
+        + usize::from(fields.contains_key("alg"))
+        + usize::from(fields.contains_key("ext"));
     if !has_fields(&fields, own) || fields.len() != carried {
         return Err(FrameError::Malformed);
     }
@@ -549,6 +552,7 @@ fn stream_table_read(
         ("message", Rule::TextWithin(MAX_ERROR_TEXT_BYTES)),
         ("payload", Rule::Any),
         ("sealed", Rule::Sealed(context)),
+        ("ext", Rule::Ext),
     ];
     let fields = read_fields(&verified.fields, &table).ok_or(FrameError::Malformed)?;
     if !has_fields(
@@ -559,6 +563,7 @@ fn stream_table_read(
     }
     super::tbs_enum(&fields, "encoding", &["raw", "msgpack"])?;
     super::tbs_enum(&fields, "role", &["send", "both"])?;
+    super::signed_ext(&fields)?;
     Ok(fields)
 }
 

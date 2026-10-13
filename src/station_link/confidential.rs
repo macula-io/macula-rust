@@ -255,6 +255,7 @@ pub(super) fn sealed_request(
         .map_err(|e| LinkError::Frame(frame::FrameError::Payload(e.to_string())))?;
     let key_id = key.key_id();
     let sealed = Sealed {
+        scheme: frame::SEALED_SCHEME,
         key_id,
         kem_ct: Some(kem_ct),
         nonce: None,
@@ -324,7 +325,7 @@ pub(super) fn reply_outcome(
         (Some(sealed), frame_type, _) => {
             // As macula's open_reply/4: an answer naming another key than
             // the request's is not opened.
-            if sealed.key_id != s.key_id {
+            if sealed.key_id != s.key_id || !sealed.known_scheme() {
                 return Err(not_opened());
             }
             let nonce: [u8; NONCE_SIZE] = sealed
@@ -388,7 +389,7 @@ pub(super) fn opened_request(
         return Err(NO_KEY_DETAIL.into());
     };
     let refused = hex(&keyring.current_id());
-    let Some(sealed) = &request.sealed else {
+    let Some(sealed) = request.sealed.as_ref().filter(|s| s.known_scheme()) else {
         return Err(refused);
     };
     let key = keyring
@@ -450,6 +451,7 @@ impl CallSeal {
         let nonce = seal::random_nonce().map_err(|_| LinkError::Io("no randomness".into()))?;
         let aad = seal::reply_aad(&self.request, frame_type, request_hash, responded_by);
         Ok(Sealed {
+            scheme: frame::SEALED_SCHEME,
             key_id: self.key_id,
             kem_ct: None,
             nonce: Some(nonce.to_vec()),
@@ -582,6 +584,7 @@ impl StreamSeal {
         };
         let aad = seal::stream_aad(p.frame_type, &self.request_id, seq, self.directions().0);
         let sealed = Sealed {
+            scheme: frame::SEALED_SCHEME,
             key_id: self.key_id,
             kem_ct: None,
             nonce: carried,
@@ -611,7 +614,7 @@ impl StreamSeal {
         };
         // As macula_stream's opened/5: a frame naming another key than the
         // stream's is not opened.
-        if sealed.key_id != self.key_id {
+        if sealed.key_id != self.key_id || !sealed.known_scheme() {
             return Err(not_opened());
         }
         // A provider's frame carries its nonce; a caller's is its seq.
@@ -790,6 +793,22 @@ mod tests {
         assert_eq!(
             opened_request(None, &request).err().as_deref(),
             Some(NO_KEY_DETAIL)
+        );
+    }
+
+    /// WIRE_1_0.md section 7: a request sealed under a scheme this node does
+    /// not know, even to its own current key, is answered sealed_refused.
+    #[test]
+    fn a_request_sealed_under_an_unknown_scheme_is_refused() {
+        let keyring = Keyring::system(Profile::PqPure).unwrap();
+        let (mut request, _) = sealed_to(&keyring, RequestType::Call);
+        assert!(opened_request(Some(&keyring), &request).is_ok());
+        if let Some(sealed) = request.sealed.as_mut() {
+            sealed.scheme = 2;
+        }
+        assert_eq!(
+            opened_request(Some(&keyring), &request).err(),
+            Some(hex(&keyring.current_id()))
         );
     }
 

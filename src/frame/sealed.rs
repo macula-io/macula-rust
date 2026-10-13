@@ -10,7 +10,8 @@ use crate::cbor::Value;
 
 use super::{entry, fixed, has_fields, protocol_uint, read_fields, uint, Fields, Rule};
 
-/// The only scheme a sealed map may name.
+/// The seal scheme this crate seals and opens, scheme 1. A map naming
+/// another is read but never opened (WIRE_1_0.md section 7).
 pub const SEALED_SCHEME: u64 = 1;
 
 const KEM_CT_PURE_SIZE: usize = 1568;
@@ -20,6 +21,9 @@ const SEALED_NONCE_SIZE: usize = 12;
 /// A payload sealed end to end, as a frame carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sealed {
+    /// The scheme the map names, which selects the KEM, KDF, AEAD and
+    /// ciphertext layout: [`SEALED_SCHEME`] on what this crate builds.
+    pub scheme: u64,
     pub key_id: [u8; 8],
     pub kem_ct: Option<Vec<u8>>,
     pub nonce: Option<Vec<u8>>,
@@ -39,7 +43,7 @@ impl Sealed {
     /// The sealed map as it travels.
     pub(super) fn value(&self) -> Value {
         let mut entries = vec![
-            entry("scheme", uint(SEALED_SCHEME)),
+            entry("scheme", uint(self.scheme)),
             entry("key_id", Value::Bytes(self.key_id.to_vec())),
             entry("ct", Value::Bytes(self.ct.clone())),
         ];
@@ -50,6 +54,11 @@ impl Sealed {
             entries.push(entry("nonce", Value::Bytes(nonce.clone())));
         }
         Value::Map(entries)
+    }
+
+    /// Whether the map names the scheme this crate opens.
+    pub fn known_scheme(&self) -> bool {
+        self.scheme == SEALED_SCHEME
     }
 
     /// Whether the map has the shape its frame's context requires, as
@@ -81,27 +90,29 @@ const SEALED_TABLE: &[(&str, Rule)] = &[
     ("ct", Rule::AnyBytes),
 ];
 
-/// A sealed map as a verifier reads it, opening nothing: scheme 1, a key id
-/// and a ciphertext, and the shape its frame's context requires. Any other
-/// map, or a key the table cannot name, is not one.
+/// A sealed map as a verifier reads it, opening nothing: a scheme, a key id
+/// and a ciphertext, and for scheme 1 the shape its frame's context requires.
+/// Another scheme is read with its layout unjudged, to be refused when opened
+/// (`sealed_refused`, WIRE_1_0.md section 7). Any other map, or a key the
+/// table cannot name, is not one.
 pub(super) fn read_sealed(v: &Value, context: SealedContext) -> Option<Sealed> {
     let fields = read_fields(v, SEALED_TABLE)?;
-    if !has_fields(&fields, &["scheme", "key_id", "ct"])
-        || protocol_uint(&fields["scheme"]) != Some(SEALED_SCHEME)
-    {
+    if !has_fields(&fields, &["scheme", "key_id", "ct"]) {
         return None;
     }
+    let scheme = protocol_uint(&fields["scheme"])?;
     let bytes = |name: &str| match fields.get(name) {
         Some(Value::Bytes(b)) => Some(b.clone()),
         _ => None,
     };
     let sealed = Sealed {
+        scheme,
         key_id: fixed(&fields["key_id"]),
         kem_ct: bytes("kem_ct"),
         nonce: bytes("nonce"),
         ct: bytes("ct")?,
     };
-    sealed.shaped(context).then_some(sealed)
+    (!sealed.known_scheme() || sealed.shaped(context)).then_some(sealed)
 }
 
 /// Whether `fields` carry `clear` in the clear or `sealed`, exactly one of
@@ -122,11 +133,28 @@ mod tests {
 
     fn sealed(kem_ct: Option<usize>, nonce: Option<usize>) -> Sealed {
         Sealed {
+            scheme: SEALED_SCHEME,
             key_id: [7; 8],
             kem_ct: kem_ct.map(|n| vec![1; n]),
             nonce: nonce.map(|n| vec![2; n]),
             ct: vec![3; 20],
         }
+    }
+
+    /// WIRE_1_0.md section 7: a map naming another scheme reads, its layout
+    /// unjudged, so it can be refused by name when opened.
+    #[test]
+    fn a_map_of_another_scheme_reads_with_its_layout_unjudged() {
+        // A nonce and no kem_ct: scheme 1's reply shape, not a request's.
+        let other = Sealed {
+            scheme: 2,
+            ..sealed(None, Some(12))
+        };
+        let read = read_sealed(&other.value(), SealedContext::Request).unwrap();
+        assert_eq!(read.scheme, 2);
+        assert!(!read.known_scheme());
+        let scheme_1 = sealed(None, Some(12));
+        assert_eq!(read_sealed(&scheme_1.value(), SealedContext::Request), None);
     }
 
     #[test]
@@ -154,15 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_map_of_another_scheme_or_with_a_key_the_table_cannot_name_is_not_one() {
-        let Value::Map(mut other_scheme) = sealed(None, Some(12)).value() else {
-            unreachable!()
-        };
-        other_scheme[0] = entry("scheme", uint(2));
-        assert_eq!(
-            read_sealed(&Value::Map(other_scheme), SealedContext::Reply),
-            None
-        );
+    fn a_sealed_map_with_a_key_the_table_cannot_name_is_not_one() {
         let Value::Map(mut extra) = sealed(None, Some(12)).value() else {
             unreachable!()
         };

@@ -274,6 +274,8 @@ enum Rule {
     EnumText,
     /// The unsigned 0 or 1.
     ZeroOrOne,
+    /// A well-formed `ext` map (WIRE_1_0.md section 3.2), not yet acted on.
+    Ext,
 }
 
 impl Rule {
@@ -294,6 +296,7 @@ impl Rule {
             Rule::Proofs => request::proofs_within_bound(v),
             Rule::Sealed(context) => sealed::read_sealed(v, context).is_some(),
             Rule::ZeroOrOne => matches!(v, Value::Int(0 | 1)),
+            Rule::Ext => check_ext(v).is_ok(),
             Rule::EnumText => {
                 matches!(v, Value::Text(t) if !t.is_empty() && t.len() <= MAX_ENUM_VALUE_BYTES)
             }
@@ -323,6 +326,16 @@ fn read_fields(v: &Value, table: &[(&str, Rule)]) -> Option<Fields> {
         fields.insert(name.clone(), value.clone());
     }
     Some(fields)
+}
+
+/// Acts on the `ext` a signed object's tbs carries (WIRE_1_0.md section 3.2):
+/// an unknown critical extension refuses that object, by name, never the
+/// link; an unknown non-critical one is counted.
+fn signed_ext(fields: &Fields) -> Result<(), FrameError> {
+    match fields.get("ext") {
+        Some(ext) => act_on_ext(ext),
+        None => Ok(()),
+    }
 }
 
 /// Refuses a signed object whose `field` holds an enum value outside `known`

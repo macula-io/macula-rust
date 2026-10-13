@@ -245,6 +245,7 @@ pub fn verify_reply(
     {
         return Err(FrameError::Malformed);
     }
+    super::signed_ext(&fields)?;
     let reply = VerifiedReply {
         frame_type: if frame_type == RESULT {
             ReplyType::Result
@@ -287,6 +288,7 @@ fn reply_table(frame_type: &str) -> Vec<(&'static str, Rule)> {
         ("code", Rule::TextWithin(MAX_ERROR_CODE_BYTES)),
         ("detail", Rule::TextWithin(MAX_ERROR_TEXT_BYTES)),
         ("sealed", Rule::Sealed(SealedContext::Reply)),
+        ("ext", Rule::Ext),
     ]
 }
 
@@ -354,6 +356,7 @@ pub fn verify_relay_error(
         return Err(FrameError::Malformed);
     }
     super::tbs_enum(&fields, "code", RELAY_CODES)?;
+    super::signed_ext(&fields)?;
     let relay_error = VerifiedRelayError {
         frame_type: if frame_type == ERROR {
             RelayErrorType::Error
@@ -392,6 +395,7 @@ fn relay_error_table(frame_type: &str) -> Vec<(&'static str, Rule)> {
         ("reported_by", Rule::BytesOf(32)),
         ("code", Rule::EnumText),
         ("offending_hop", Rule::BytesOf(32)),
+        ("ext", Rule::Ext),
     ]
 }
 

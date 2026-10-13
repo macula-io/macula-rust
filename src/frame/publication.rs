@@ -99,6 +99,7 @@ const PUBLICATION_TABLE: &[(&str, Rule)] = &[
     ("published_at", Rule::ProtocolUint),
     ("ttl_ms", Rule::ProtocolUint),
     ("payload", Rule::Any),
+    ("ext", Rule::Ext),
 ];
 
 /// How a received EVENT says its publication reached this node, a per-hop
@@ -153,6 +154,7 @@ pub fn verify_publication(
     ) {
         return Err(FrameError::Malformed);
     }
+    super::signed_ext(&fields)?;
     let ttl_ms = fields.get("ttl_ms").and_then(protocol_uint);
     let published_at = protocol_uint(&fields["published_at"]).unwrap_or(0);
     let publication = VerifiedPublication {

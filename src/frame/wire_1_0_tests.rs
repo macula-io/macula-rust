@@ -219,3 +219,59 @@ fn the_wire_1_0_enum_vectors() {
     }
     assert_eq!(ran, 21, "the enum cases a client reads");
 }
+
+/// A CALL signed with `ext` in its request's tbs, by a fresh identity key.
+fn call_with_ext(ext: Value) -> Value {
+    let key =
+        crate::node_key::NodeKey::generate_identity(crate::profile::Profile::PqPure, 0).unwrap();
+    let spec = RequestSpec {
+        request_id: [1; 16],
+        realm: [2; 32],
+        procedure: "example.procedure".into(),
+        target: [3; 32],
+        deadline: 1,
+        payload: Value::Map(Vec::new()),
+        sealed: None,
+        mode: None,
+        token: None,
+        proofs: Vec::new(),
+        source_route: None,
+        retry_budget: None,
+    };
+    let call = sign_call(&spec, &key).unwrap();
+    let object = crate::signed_object::Object::from_value(call.get("request").unwrap()).unwrap();
+    let Value::Map(fields) = cbor::decode(&object.tbs).unwrap().with_field("ext", ext) else {
+        unreachable!()
+    };
+    let resigned = crate::signed_object::sign_object(REQUEST_LABEL, &fields, &key).unwrap();
+    call.with_field("request", resigned.to_value())
+}
+
+fn one_ext(name: &str, critical: i128) -> Value {
+    Value::Map(vec![(
+        Value::text(name),
+        Value::Map(vec![
+            (Value::text("critical"), Value::Int(critical)),
+            (Value::text("value"), Value::text("x")),
+        ]),
+    )])
+}
+
+/// WIRE_1_0.md section 3.2: ext inside a signed object's tbs. An unknown
+/// critical extension refuses the object by name; a non-critical one is read
+/// past and counted.
+#[test]
+fn a_signed_object_acts_on_the_ext_in_its_tbs() {
+    let profile = crate::profile::Profile::PqPure;
+    let refused = verify_request(&call_with_ext(one_ext("example.critical", 1)), profile);
+    assert_eq!(
+        refused.err(),
+        Some(FrameError::ExtensionUnsupported("example.critical".into()))
+    );
+    let ignored = |w: &WireCounts| w.ext_ignored.get("example.ignored").copied().unwrap_or(0);
+    let before = ignored(&wire_counters());
+    assert!(verify_request(&call_with_ext(one_ext("example.ignored", 0)), profile).is_ok());
+    assert!(ignored(&wire_counters()) > before);
+    let empty = verify_request(&call_with_ext(Value::Map(Vec::new())), profile);
+    assert_eq!(empty.err(), Some(FrameError::Malformed));
+}

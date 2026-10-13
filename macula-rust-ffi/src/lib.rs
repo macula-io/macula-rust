@@ -1,4 +1,4 @@
-//! UniFFI (Kotlin/Swift) bindings for [`macula_rust`] on the macula 12 wire.
+//! UniFFI (Kotlin/Swift) bindings for [`macula_rust`] on wire 1.0.
 //! A thin wrapper, not a reimplementation: everything here delegates to the
 //! core crate's [`macula_rust::pool`], and nothing wire-level lives in this
 //! crate. A separate crate keeps the core free of any UniFFI dependency or
@@ -51,6 +51,14 @@ use macula_rust::pool::PoolError;
 use macula_rust::station_link::{LinkError, ReportError};
 
 uniffi::setup_scaffolding!();
+
+/// The wire this library speaks, major.minor, e.g. "1.0" (macula
+/// docs/design/WIRE_1_0.md): every wire 1.x peer shares its frozen core, so
+/// an app can show or check which wire it links.
+#[uniffi::export]
+pub fn wire_version() -> String {
+    macula_rust::WIRE_VERSION.to_string()
+}
 
 /// Why an operation failed, as Kotlin and Swift see it.
 #[derive(Debug, Clone, PartialEq, thiserror::Error, uniffi::Error)]
@@ -334,5 +342,13 @@ impl TryFrom<macula_rust::cbor::Value> for FfiValue {
                 .collect::<Result<Vec<_>, FfiError>>()
                 .map(FfiValue::Fields),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_library_says_it_speaks_wire_1_0() {
+        assert_eq!(super::wire_version(), "1.0");
     }
 }
