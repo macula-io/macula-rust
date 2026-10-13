@@ -51,7 +51,7 @@ use tokio::sync::watch;
 
 use crate::cbor::{self, Value};
 use crate::frame::{self, Envelope, FrameError, Liveness};
-use crate::handshake::{self, ClientSession, Exporter, HandshakeError, Peer, Station, VERSION_5};
+use crate::handshake::{self, ClientSession, Exporter, HandshakeError, Peer, Ranges, Station};
 use crate::node_key::NodeKey;
 use crate::profile::Profile;
 use crate::record::RecordError;
@@ -363,7 +363,7 @@ impl Link {
                 "kem_advertise names a key: it needs a keyring".into(),
             ));
         }
-        dial_once(&cfg, VERSION_5).await
+        dial_once(&cfg).await
     }
 
     /// The handshake version the link completed.
@@ -432,13 +432,13 @@ impl Link {
     }
 }
 
-/// One QUIC connection and one handshake in `version`, within
-/// [`HANDSHAKE_TIMEOUT`]. A failed handshake closes its connection.
-async fn dial_once(cfg: &Config, version: i64) -> Result<Link, LinkError> {
+/// One QUIC connection and one handshake, within [`HANDSHAKE_TIMEOUT`]. A
+/// failed handshake closes its connection.
+async fn dial_once(cfg: &Config) -> Result<Link, LinkError> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let dialed = transport::dial_target(&cfg.target).await?;
         let connection = dialed.connection.clone();
-        let linked = handshaken(cfg, dialed, version).await;
+        let linked = handshaken(cfg, dialed).await;
         if let Err(e) = &linked {
             versions::count_refusal(e);
             connection.close(0u32.into(), b"handshake failed");
@@ -450,13 +450,11 @@ async fn dial_once(cfg: &Config, version: i64) -> Result<Link, LinkError> {
     .and_then(|linked| linked)
 }
 
-/// Runs the client's side of the handshake, in `version`, on a new control
-/// stream of `dialed`.
-async fn handshaken(
-    cfg: &Config,
-    dialed: transport::Dialed,
-    version: i64,
-) -> Result<Link, LinkError> {
+/// Runs the client's side of the handshake on a new control stream of
+/// `dialed`: the opener with this crate's ranges, the challenge checked
+/// against them and the floor this process holds for the station, CONNECT,
+/// HELLO. A completed handshake raises the floor.
+async fn handshaken(cfg: &Config, dialed: transport::Dialed) -> Result<Link, LinkError> {
     let export = keying_exporter(dialed.connection.clone());
     let export: &Exporter = &export;
     let (send, mut recv) = dialed
@@ -466,17 +464,21 @@ async fn handshaken(
         .map_err(|e| LinkError::Io(format!("open the control stream: {e}")))?;
     let control = FrameWriter::new(send);
     control
-        .write(&handshake::opener(), HANDSHAKE_FRAME_BYTES)
+        .write(
+            &handshake::opener(&Ranges::supported(cfg.target.profile)),
+            HANDSHAKE_FRAME_BYTES,
+        )
         .await?;
     let challenge = read_frame(&mut recv, HANDSHAKE_FRAME_BYTES).await?;
     let material = cfg.issuer.connect_material().map_err(LinkError::Issuer)?;
     let (connect, station) = handshake::answer_challenge(
         &challenge,
-        &client_session(cfg, &dialed.leaf, &material, version, export),
+        &client_session(cfg, &dialed.leaf, &material, export),
     )?;
     control.write(&connect, HANDSHAKE_FRAME_BYTES).await?;
     let hello = read_frame(&mut recv, HANDSHAKE_FRAME_BYTES).await?;
     let capabilities = handshake::read_hello(&hello, &station)?;
+    versions::completed(&station.node_id, station.version);
     let self_id = cfg
         .identity
         .node_id()
@@ -504,14 +506,15 @@ fn keying_exporter(
     }
 }
 
-/// What the client brings to the handshake in `version`: the configured
-/// identity and target, the leaf it received, and the issuer's CONNECT
-/// material, at the time now.
+/// What the client brings to the handshake: the configured identity and
+/// target, the leaf it received, the issuer's CONNECT material, at the time
+/// now, this crate's ranges and the floor this process holds. It declares
+/// [`handshake::CAP_RELAY_OVERLOADED`]: a station may refuse an excess call
+/// with `overloaded`, and the call ends at once (macula#54).
 fn client_session<'a>(
     cfg: &Config,
     leaf: &'a [u8],
     material: &'a ConnectMaterial,
-    version: i64,
     export: &'a Exporter,
 ) -> ClientSession<'a> {
     ClientSession {
@@ -522,11 +525,12 @@ fn client_session<'a>(
         connect_key: &material.key,
         connect_binding: &material.binding,
         connect_status: &material.status,
-        capabilities: 0,
+        capabilities: handshake::CAP_RELAY_OVERLOADED,
         now_ms: now_ms(),
         member_endorsement: cfg.member_endorsement.clone(),
-        version,
-        export: Some(export),
+        ranges: Ranges::supported(cfg.target.profile),
+        floor: &versions::floor,
+        export,
     }
 }
 

@@ -8,10 +8,9 @@ draft's vector for id-MLDSA87-RSA4096-PSS-SHA512 as macula v12.7.0 carries it.
 
 | Directory | What it pins |
 |-----------|--------------|
+| `wire_1_0/` | the wire 1.0 conformance vectors (macula#97), copied unchanged from macula ef1cfe68's `priv/vectors/wire_1_0/` with the spec page `WIRE_1_0.md` they make executable: the frame envelope, frames, enums, records for readers and custodians, check order, tbs bytes, `_dht.*` shapes and handshake transcripts. Every class runs in `cargo test` |
 | `cbor/` | the decoding rule every stack applies to what a peer sends |
 | `identity/` | TLS and CONNECT bindings, status statements, the LAMPS composite, and identity layout v1's stored-identity paths, refused names and old-key moves (`identity_layout_v1.json`, copied unchanged from macula v14.4.0's `test/vectors/`) |
-| `handshake/` | the version-4 and version-5 handshake, from macula-go's `handshake/testdata/erlang_handshake.json`, which macula 8b8bb80a (13.2.0's handshake) generated; version 5 uses the HMAC-SHA256 exporter stand-in both stacks share |
-| `frame/` | signed neighbour frames |
 | `record/` | own-namespace procedure advertisements and their verdicts |
 | `manifest/` | content manifests and their ids |
 | `seal/` | E2E seal scheme 1's recipient keys and ids, and keyed procedure advertisements signed by macula with their verdicts, copied unchanged from macula v13.3.0's `test/vectors/e2e_seal_v1.json` and `e2e_seal_v1_advertisements.json` |

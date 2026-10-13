@@ -55,6 +55,7 @@ pub use stream::{
     verify_provider_stream, StreamEncoding, StreamFields, StreamMode, StreamRole, StreamState,
     VerifiedStreamFrame,
 };
+pub(crate) use wire_counters::count_enum_fallback;
 pub use wire_counters::{wire_counters, WireCounts};
 
 use std::fmt;

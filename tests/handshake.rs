@@ -1,8 +1,11 @@
-//! macula's version-4 handshake: opener, challenge, CONNECT, HELLO and
-//! status frames. Held to the frames macula itself made
-//! (tests/vectors/handshake/erlang_handshake.json, macula_handshake at macula
-//! 8b8bb80a) both ways, then driven end to end between this crate's client and
-//! station halves, and refused where macula refuses.
+//! The wire 1.0 handshake through the crate's public API, between its client
+//! and station halves: a whole handshake and a status renewal, and the
+//! refusals each side reaches before it signs anything, with the one coarse
+//! code a refusing HELLO carries. The transcripts every stack shares are
+//! the handshake class of the wire 1.0 vectors (src/handshake/
+//! wire_1_0_tests.rs).
+
+use std::sync::Arc;
 
 use macula_rust::binding::{
     connect_binding, status_statement, tls_binding, BindingError, SignedTbs,
@@ -10,18 +13,16 @@ use macula_rust::binding::{
 use macula_rust::cbor::{self, Value};
 use macula_rust::handshake::{
     accept_connect, answer_challenge, challenge, opener, read_hello, read_opener, read_status,
-    status_frame, ClientSession, HandshakeError, Peer, PuzzleMode, PuzzleResult, RefusalCode,
-    Station, StationMaterial, StationSession, VERSION,
+    status_frame, ClientSession, Exporter, Floor, HandshakeError, Negotiated, Peer, PuzzleMode,
+    PuzzleResult, Ranges, RefusalCode, StationMaterial, StationSession,
 };
 use macula_rust::node_key::{NodeKey, Purpose};
 use macula_rust::profile::Profile;
 
+const NOW: i64 = 1_789_000_000_000;
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
-
-fn unhex(s: &str) -> Vec<u8> {
-    hex::decode(s).unwrap()
-}
+const LEAF: &[u8] = b"the leaf this connection presents";
 
 /// A client's identity key, CONNECT key, binding and status statement.
 struct ClientKeys {
@@ -31,11 +32,11 @@ struct ClientKeys {
     status: SignedTbs,
 }
 
-fn client_keys(profile: Profile, now: i64) -> ClientKeys {
+fn client_keys(profile: Profile) -> ClientKeys {
     let identity = NodeKey::generate_identity(profile, 0).unwrap();
     let connect = NodeKey::generate(Purpose::Connect, profile).unwrap();
-    let binding = connect_binding(&identity, &connect.public_key(), now, now + DAY_MS).unwrap();
-    let status = status_statement(&identity, &binding, now, now + HOUR_MS).unwrap();
+    let binding = connect_binding(&identity, &connect.public_key(), NOW, NOW + DAY_MS).unwrap();
+    let status = status_statement(&identity, &binding, NOW, NOW + HOUR_MS).unwrap();
     ClientKeys {
         identity,
         connect,
@@ -44,49 +45,21 @@ fn client_keys(profile: Profile, now: i64) -> ClientKeys {
     }
 }
 
-fn session<'a>(
-    keys: &'a ClientKeys,
-    profile: Profile,
-    expected: [u8; 32],
-    leaf: &'a [u8],
-    now: i64,
-) -> ClientSession<'a> {
-    ClientSession {
-        profile,
-        expected_node_id: expected,
-        leaf,
-        identity_key: keys.identity.public_key(),
-        connect_key: &keys.connect,
-        connect_binding: &keys.binding,
-        connect_status: &keys.status,
-        capabilities: 3,
-        now_ms: now,
-        member_endorsement: Vec::new(),
-        version: VERSION,
-        export: None,
-    }
+/// Both ends of one TLS session export the same 32 bytes.
+fn export() -> Arc<Exporter> {
+    Arc::new(|_: &str, _: &[u8], length: usize| Some(vec![0x5E; length]))
 }
 
-/// What a v4 client knows of a fresh station, to read a v4 HELLO against.
-fn v4_station(profile: Profile) -> Station {
-    let now = 1_789_000_000_000;
-    let leaf = b"a leaf".to_vec();
-    let (station_key, material) = station(profile, &leaf, now);
-    let keys = client_keys(profile, now);
-    answer_challenge(
-        &challenge(&material).unwrap(),
-        &session(&keys, profile, station_key.node_id().unwrap(), &leaf, now),
-    )
-    .unwrap()
-    .1
+fn no_floor() -> Arc<Floor> {
+    Arc::new(|_: &[u8; 32]| 0)
 }
 
 /// A station: its identity key, and the material it challenges with for
 /// `leaf`.
-fn station(profile: Profile, leaf: &[u8], now: i64) -> (NodeKey, StationMaterial) {
-    let identity = NodeKey::generate_identity(profile, 0).unwrap();
-    let binding = tls_binding(&identity, leaf, now, now + DAY_MS).unwrap();
-    let status = status_statement(&identity, &binding, now, now + HOUR_MS).unwrap();
+fn station(profile: Profile, leaf: &[u8]) -> (Arc<NodeKey>, StationMaterial) {
+    let identity = Arc::new(NodeKey::generate_identity(profile, 0).unwrap());
+    let binding = tls_binding(&identity, leaf, NOW, NOW + DAY_MS).unwrap();
+    let status = status_statement(&identity, &binding, NOW, NOW + HOUR_MS).unwrap();
     let material = StationMaterial {
         profile,
         identity_key: identity.public_key(),
@@ -96,154 +69,124 @@ fn station(profile: Profile, leaf: &[u8], now: i64) -> (NodeKey, StationMaterial
     (identity, material)
 }
 
-fn station_session(profile: Profile, challenge: &[u8], leaf: &[u8], now: i64) -> StationSession {
-    StationSession {
-        profile,
-        challenge: challenge.to_vec(),
-        leaf: leaf.to_vec(),
-        puzzle_difficulty: 0,
-        puzzle_mode: PuzzleMode::Enforce,
-        capabilities: 5,
-        now_ms: now,
-        v5: None,
-    }
-}
-
-/// One profile's frames: a challenge macula made as a station, its node_id,
-/// and a CONNECT macula made answering a challenge macula-go made.
-struct ErlangEntry {
+/// One run: a station, a client, what the station chose and the challenge it
+/// sent.
+struct Run {
     profile: Profile,
-    erlang_challenge: Vec<u8>,
-    station_node_id: [u8; 32],
-    go_challenge: Vec<u8>,
-    erlang_connect: Vec<u8>,
+    station_key: Arc<NodeKey>,
+    material: StationMaterial,
+    keys: ClientKeys,
+    negotiated: Negotiated,
+    challenge: Vec<u8>,
+    export: Arc<Exporter>,
+    floor: Arc<Floor>,
 }
 
-struct Erlang {
-    now: i64,
-    leaf: Vec<u8>,
-    entries: Vec<ErlangEntry>,
-}
-
-fn erlang() -> Erlang {
-    let text = std::fs::read_to_string("tests/vectors/handshake/erlang_handshake.json").unwrap();
-    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-    let s = |v: &serde_json::Value| v.as_str().unwrap().to_owned();
-    let entries: Vec<_> = doc["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| ErlangEntry {
-            profile: Profile::parse(&s(&e["profile"])).unwrap(),
-            erlang_challenge: unhex(&s(&e["erlang_challenge"])),
-            station_node_id: unhex(&s(&e["erlang_station_node_id"])).try_into().unwrap(),
-            go_challenge: unhex(&s(&e["go_challenge"])),
-            erlang_connect: unhex(&s(&e["erlang_connect"])),
-        })
-        .collect();
-    assert_eq!(entries.len(), 2);
-    Erlang {
-        now: doc["now"].as_i64().unwrap(),
-        leaf: unhex(&s(&doc["leaf"])),
-        entries,
+fn run(profile: Profile) -> Run {
+    let (station_key, material) = station(profile, LEAF);
+    let ranges = Ranges::supported(profile);
+    let (negotiated, hello) = read_opener(&opener(&ranges), &ranges);
+    assert_eq!(hello, None);
+    let negotiated = negotiated.unwrap();
+    let challenge = challenge(&material, &negotiated, &ranges).unwrap();
+    Run {
+        profile,
+        station_key,
+        material,
+        keys: client_keys(profile),
+        negotiated,
+        challenge,
+        export: export(),
+        floor: no_floor(),
     }
 }
 
-#[test]
-fn a_challenge_macula_made_is_answered() {
-    let h = erlang();
-    for e in &h.entries {
-        let keys = client_keys(e.profile, h.now);
-        let (connect, station) = answer_challenge(
-            &e.erlang_challenge,
-            &session(&keys, e.profile, e.station_node_id, &h.leaf, h.now + 60_000),
-        )
-        .unwrap();
-        assert_eq!(station.node_id, e.station_node_id, "{:?}", e.profile);
-        assert!(!connect.is_empty());
+impl Run {
+    fn session<'a>(&'a self, expected: [u8; 32], leaf: &'a [u8]) -> ClientSession<'a> {
+        ClientSession {
+            profile: self.profile,
+            expected_node_id: expected,
+            leaf,
+            identity_key: self.keys.identity.public_key(),
+            connect_key: &self.keys.connect,
+            connect_binding: &self.keys.binding,
+            connect_status: &self.keys.status,
+            capabilities: 3,
+            now_ms: NOW,
+            member_endorsement: Vec::new(),
+            ranges: Ranges::supported(self.profile),
+            floor: self.floor.as_ref(),
+            export: self.export.as_ref(),
+        }
     }
-}
 
-#[test]
-fn a_connect_macula_made_is_accepted() {
-    let h = erlang();
-    for e in &h.entries {
-        let (accepted, hello) = accept_connect(
-            &e.erlang_connect,
-            &station_session(e.profile, &e.go_challenge, &h.leaf, h.now + 60_000),
-        );
-        let client = accepted.unwrap();
-        assert_eq!(
-            read_hello(&hello, &v4_station(e.profile)).unwrap(),
-            5,
-            "{:?}",
-            e.profile
-        );
-        assert!(client.member_endorsement.is_empty());
+    fn dialed(&self) -> [u8; 32] {
+        self.station_key.node_id().unwrap()
+    }
+
+    fn station_session(&self, leaf: &[u8]) -> StationSession {
+        let key = self.station_key.clone();
+        StationSession {
+            profile: self.profile,
+            negotiated: self.negotiated.clone(),
+            challenge: self.challenge.clone(),
+            leaf: leaf.to_vec(),
+            puzzle_difficulty: 0,
+            puzzle_mode: PuzzleMode::Enforce,
+            capabilities: 5,
+            now_ms: NOW,
+            floor: no_floor(),
+            export: self.export.clone(),
+            sign_session_proof: Arc::new(move |_: &[u8; 32], message: &[u8]| {
+                key.sign(message).map_err(HandshakeError::Key)
+            }),
+        }
     }
 }
 
 #[test]
 fn a_client_and_a_station_complete_the_handshake_and_renew_status() {
-    let now = 1_789_000_000_000;
-    let leaf = b"the leaf this connection presents".to_vec();
     for profile in [Profile::PqPure, Profile::PqHybrid] {
-        let first = opener();
-        read_opener(&first).unwrap();
-        let (station_key, material) = station(profile, &leaf, now);
-        let challenge_frame = challenge(&material).unwrap();
-        let keys = client_keys(profile, now);
-        let (connect, seen) = answer_challenge(
-            &challenge_frame,
-            &session(&keys, profile, station_key.node_id().unwrap(), &leaf, now),
-        )
-        .unwrap();
-        assert_eq!(seen.status_expires_at, now + HOUR_MS);
-        let (accepted, hello) = accept_connect(
-            &connect,
-            &station_session(profile, &challenge_frame, &leaf, now),
-        );
+        let r = run(profile);
+        let (connect, seen) = answer_challenge(&r.challenge, &r.session(r.dialed(), LEAF)).unwrap();
+        assert_eq!(seen.status_expires_at, NOW + HOUR_MS);
+        let (accepted, hello) = accept_connect(&connect, &r.station_session(LEAF));
         let client = accepted.unwrap();
-        assert_eq!(client.node_id, keys.identity.node_id().unwrap());
+        assert_eq!(client.node_id, r.keys.identity.node_id().unwrap());
         assert_eq!(client.capabilities, 3);
         assert_eq!(client.puzzle, PuzzleResult::Solved);
         assert_eq!(read_hello(&hello, &seen).unwrap(), 5);
 
         // A renewed statement on the open connection.
+        let later = NOW + 900_000;
         let renewed = status_statement(
-            &station_key,
-            &material.tls_binding,
-            now + 900_000,
-            now + 900_000 + HOUR_MS,
+            &r.station_key,
+            &r.material.tls_binding,
+            later,
+            later + HOUR_MS,
         )
         .unwrap();
         let peer = Peer {
             profile,
-            identity_key: material.identity_key.clone(),
-            binding: material.tls_binding.clone(),
-            now_ms: now + 900_000,
+            identity_key: r.material.identity_key.clone(),
+            binding: r.material.tls_binding.clone(),
+            now_ms: later,
         };
         assert_eq!(
             read_status(&status_frame(&renewed), &peer).unwrap(),
-            now + 900_000 + HOUR_MS
+            later + HOUR_MS
         );
     }
 }
 
 #[test]
 fn a_station_that_is_not_the_node_dialed_is_refused_before_anything_is_signed() {
-    let now = 1_789_000_000_000;
-    let leaf = b"leaf".to_vec();
-    let (station_key, material) = station(Profile::PqPure, &leaf, now);
-    let keys = client_keys(Profile::PqPure, now);
+    let r = run(Profile::PqPure);
     let dialed = [9u8; 32];
-    match answer_challenge(
-        &challenge(&material).unwrap(),
-        &session(&keys, Profile::PqPure, dialed, &leaf, now),
-    ) {
+    match answer_challenge(&r.challenge, &r.session(dialed, LEAF)) {
         Err(HandshakeError::PeerIdentityMismatch { expected, derived }) => {
             assert_eq!(expected, dialed);
-            assert_eq!(derived, station_key.node_id().unwrap());
+            assert_eq!(derived, r.dialed());
         }
         other => panic!("{:?}", other.map(|(c, _)| c.len())),
     }
@@ -251,107 +194,68 @@ fn a_station_that_is_not_the_node_dialed_is_refused_before_anything_is_signed() 
 
 #[test]
 fn a_challenge_for_another_leaf_or_profile_is_refused() {
-    let now = 1_789_000_000_000;
-    let (station_key, material) = station(Profile::PqPure, b"the real leaf", now);
-    let frame = challenge(&material).unwrap();
-    let keys = client_keys(Profile::PqPure, now);
-    let expected = station_key.node_id().unwrap();
+    let r = run(Profile::PqPure);
     assert_eq!(
-        answer_challenge(
-            &frame,
-            &session(&keys, Profile::PqPure, expected, b"another leaf", now)
-        )
-        .unwrap_err(),
+        answer_challenge(&r.challenge, &r.session(r.dialed(), b"another leaf")).unwrap_err(),
         HandshakeError::Binding(BindingError::KeyMismatch)
     );
-    let hybrid = client_keys(Profile::PqHybrid, now);
+    let mut hybrid = r.session(r.dialed(), LEAF);
+    hybrid.profile = Profile::PqHybrid;
+    hybrid.ranges = Ranges::supported(Profile::PqHybrid);
     assert_eq!(
-        answer_challenge(
-            &frame,
-            &session(&hybrid, Profile::PqHybrid, expected, b"the real leaf", now)
-        )
-        .unwrap_err(),
-        HandshakeError::ProfileMismatch
+        answer_challenge(&r.challenge, &hybrid).unwrap_err(),
+        HandshakeError::DowngradeDetected
     );
 }
 
 #[test]
 fn a_connect_key_that_is_the_identity_key_is_refused() {
-    let now = 1_789_000_000_000;
-    let leaf = b"leaf".to_vec();
-    let (station_key, material) = station(Profile::PqPure, &leaf, now);
-    let identity = NodeKey::generate_identity(Profile::PqPure, 0).unwrap();
+    let mut r = run(Profile::PqPure);
     // The identity key's own halves, as a CONNECT key: its key file with the
     // purpose byte after the magic changed to connect.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("key");
-    identity.save(&path).unwrap();
+    r.keys.identity.save(&path).unwrap();
     let mut file = std::fs::read(&path).unwrap();
     file[b"macula-node-key-seed-v1\0".len()] = 2;
     std::fs::write(&path, &file).unwrap();
     let same = NodeKey::load(&path, Purpose::Connect, Profile::PqPure).unwrap();
-    let binding = connect_binding(&identity, &same.public_key(), now, now + DAY_MS).unwrap();
-    let status = status_statement(&identity, &binding, now, now + HOUR_MS).unwrap();
-    let keys = ClientKeys {
-        identity,
-        connect: same,
-        binding,
-        status,
-    };
+    r.keys.binding =
+        connect_binding(&r.keys.identity, &same.public_key(), NOW, NOW + DAY_MS).unwrap();
+    r.keys.status =
+        status_statement(&r.keys.identity, &r.keys.binding, NOW, NOW + HOUR_MS).unwrap();
+    r.keys.connect = same;
     assert_eq!(
-        answer_challenge(
-            &challenge(&material).unwrap(),
-            &session(
-                &keys,
-                Profile::PqPure,
-                station_key.node_id().unwrap(),
-                &leaf,
-                now
-            )
-        )
-        .unwrap_err(),
+        answer_challenge(&r.challenge, &r.session(r.dialed(), LEAF)).unwrap_err(),
         HandshakeError::KeyPurposeReuse
     );
 }
 
 #[test]
 fn a_station_refuses_with_one_coarse_code() {
-    let now = 1_789_000_000_000;
-    let leaf = b"leaf".to_vec();
-    let (station_key, material) = station(Profile::PqPure, &leaf, now);
-    let frame = challenge(&material).unwrap();
-    let keys = client_keys(Profile::PqPure, now);
-    let (connect, seen) = answer_challenge(
-        &frame,
-        &session(
-            &keys,
-            Profile::PqPure,
-            station_key.node_id().unwrap(),
-            &leaf,
-            now,
-        ),
-    )
-    .unwrap();
+    let r = run(Profile::PqPure);
+    let (connect, seen) = answer_challenge(&r.challenge, &r.session(r.dialed(), LEAF)).unwrap();
+    let refused = |code| HandshakeError::Refused {
+        code,
+        station_ranges: None,
+    };
 
     // The proof covers the leaf: presented another one, the station refuses.
-    let (refused, hello) = accept_connect(
-        &connect,
-        &station_session(Profile::PqPure, &frame, b"other", now),
-    );
-    assert_eq!(refused.unwrap_err(), HandshakeError::ProofInvalid);
+    let (verdict, hello) = accept_connect(&connect, &r.station_session(b"other"));
+    assert_eq!(verdict.unwrap_err(), HandshakeError::ProofInvalid);
     assert_eq!(
         read_hello(&hello, &seen).unwrap_err(),
-        HandshakeError::Refused(RefusalCode::NotAccepted)
+        refused(RefusalCode::NotAccepted)
     );
 
     // A node_id that misses an enforced puzzle.
-    let mut hard = station_session(Profile::PqPure, &frame, &leaf, now);
+    let mut hard = r.station_session(LEAF);
     hard.puzzle_difficulty = 256;
-    let (refused, hello) = accept_connect(&connect, &hard);
-    assert_eq!(refused.unwrap_err(), HandshakeError::PuzzleInvalid);
+    let (verdict, hello) = accept_connect(&connect, &hard);
+    assert_eq!(verdict.unwrap_err(), HandshakeError::PuzzleInvalid);
     assert_eq!(
         read_hello(&hello, &seen).unwrap_err(),
-        HandshakeError::Refused(RefusalCode::PuzzleInvalid)
+        refused(RefusalCode::PuzzleInvalid)
     );
 
     // Logged, not enforced: accepted, and reported unsolved.
@@ -370,28 +274,31 @@ fn rewritten(frame: &[u8], f: impl FnOnce(&mut Vec<(Value, Value)>)) -> Vec<u8> 
     cbor::encode(&Value::Map(pairs)).unwrap()
 }
 
-/// A frame's map with its version set to 3.
-fn version_3(p: &mut [(Value, Value)]) {
-    for (k, v) in p.iter_mut() {
-        if *k == Value::text("version") {
-            *v = Value::Int(3);
-        }
-    }
-}
-
 #[test]
 fn a_frame_is_read_strictly_in_macula_s_order() {
-    let first = opener();
-    let v3 = rewritten(&first, |p| version_3(p));
+    let ranges = Ranges::supported(Profile::PqPure);
+    let first = opener(&ranges);
+    let v4 = rewritten(&first, |p| {
+        p.retain(|(k, _)| *k != Value::text("version"));
+        p.push((Value::text("version"), Value::Int(4)));
+    });
     assert_eq!(
-        read_opener(&v3).unwrap_err(),
+        read_opener(&v4, &ranges).0.unwrap_err(),
         HandshakeError::UnsupportedVersion
     );
     let extra = rewritten(&first, |p| p.push((Value::text("more"), Value::Int(1))));
-    assert_eq!(read_opener(&extra).unwrap_err(), HandshakeError::Malformed);
     assert_eq!(
-        read_hello(&first, &v4_station(Profile::PqPure)).unwrap_err(),
+        read_opener(&extra, &ranges).0.unwrap_err(),
+        HandshakeError::Malformed
+    );
+    let r = run(Profile::PqPure);
+    let (_, seen) = answer_challenge(&r.challenge, &r.session(r.dialed(), LEAF)).unwrap();
+    assert_eq!(
+        read_hello(&first, &seen).unwrap_err(),
         HandshakeError::UnexpectedFrame
     );
-    assert_eq!(read_opener(b"\xff").unwrap_err(), HandshakeError::Malformed);
+    assert_eq!(
+        read_opener(b"\xff", &ranges).0.unwrap_err(),
+        HandshakeError::Malformed
+    );
 }
