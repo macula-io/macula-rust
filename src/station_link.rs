@@ -770,8 +770,8 @@ fn received(inner: &Arc<Inner>, payload: &[u8]) -> Result<(), LinkError> {
     let v = envelope.frame;
     match envelope.frame_type.as_str() {
         "status" => {
-            let expires_at = handshake::read_status(
-                payload,
+            let expires_at = handshake::read_status_frame(
+                &v,
                 &Peer {
                     profile: inner.profile,
                     identity_key: inner.station.identity_key.clone(),
@@ -805,8 +805,8 @@ fn received(inner: &Arc<Inner>, payload: &[u8]) -> Result<(), LinkError> {
 }
 
 /// The station's REGISTER_ACK: a refused ADVERTISE of the served
-/// procedure's current record ends that serving, a refused SUBSCRIBE ends the
-/// subscription, and every ack is counted by its kind and outcome. One of a
+/// procedure's current record ends that serving, a refused SUBSCRIBE of this
+/// node ends the subscription, and every ack is counted by its kind and outcome. One of a
 /// kind this crate does not know is read past, counted.
 fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
     let Some(ack) = frame::read_register_ack(v)? else {
@@ -831,12 +831,21 @@ fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
                 refused,
             )
         }
-        (frame::RegisterKind::Subscribe, _) => {
+        (frame::RegisterKind::Subscribe, answered)
+            if subscribe_ack_is_ours(answered, &inner.self_id) =>
+        {
             pubsub::subscribe_refused(inner, &(ack.realm, ack.name.clone()))
         }
+        (frame::RegisterKind::Subscribe, _) => inner.count("register_ack_subscribe_not_ours"),
         _ => {}
     }
     Ok(())
+}
+
+/// Whether a SUBSCRIBE ack answers this link's own node: one naming another
+/// subscriber is counted and ends nothing.
+fn subscribe_ack_is_ours(answered: &frame::Answered, self_id: &[u8; 32]) -> bool {
+    matches!(answered, frame::Answered::Subscription { subscriber } if subscriber == self_id)
 }
 
 /// Answers the station's liveness_ping with a liveness_pong of the same
@@ -924,6 +933,21 @@ mod tests {
 
     /// macula-rust#9: a burst of pings takes one pong slot until its pong is
     /// written.
+    /// A refused SUBSCRIBE ends a subscription only when it names this
+    /// link's own node as the subscriber.
+    #[test]
+    fn a_refused_subscribe_of_another_subscriber_is_not_ours() {
+        let me = [2u8; 32];
+        let ours =
+            |subscriber| subscribe_ack_is_ours(&frame::Answered::Subscription { subscriber }, &me);
+        assert!(ours(me));
+        assert!(!ours([1u8; 32]));
+        let advert = frame::Answered::Advertisement {
+            record_version: [0; 16],
+        };
+        assert!(!subscribe_ack_is_ours(&advert, &me));
+    }
+
     #[test]
     fn a_burst_of_pings_starts_one_pong_at_a_time() {
         let in_flight = AtomicBool::new(false);

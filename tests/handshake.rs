@@ -302,3 +302,75 @@ fn a_frame_is_read_strictly_in_macula_s_order() {
         HandshakeError::Malformed
     );
 }
+
+/// `status` with `extra` entries added to its map, re-encoded.
+fn status_with(statement: &SignedTbs, extra: Vec<(Value, Value)>) -> Vec<u8> {
+    let Ok(Value::Map(mut pairs)) = cbor::decode(&status_frame(statement)) else {
+        panic!("a status frame is a map");
+    };
+    pairs.extend(extra);
+    cbor::encode(&Value::Map(pairs)).unwrap()
+}
+
+fn text(s: &str) -> Value {
+    Value::Text(s.to_string())
+}
+
+#[test]
+fn a_status_reads_with_the_optional_envelope_keys_every_frame_may_carry() {
+    let r = run(Profile::PqPure);
+    let later = NOW + 900_000;
+    let renewed = status_statement(
+        &r.station_key,
+        &r.material.tls_binding,
+        later,
+        later + HOUR_MS,
+    )
+    .unwrap();
+    let peer = Peer {
+        profile: Profile::PqPure,
+        identity_key: r.material.identity_key.clone(),
+        binding: r.material.tls_binding.clone(),
+        now_ms: later,
+    };
+    let ignored_ext = Value::Map(vec![(
+        text("x.future"),
+        Value::Map(vec![
+            (text("critical"), Value::Int(0)),
+            (text("value"), Value::Int(1)),
+        ]),
+    )]);
+    let enveloped = status_with(
+        &renewed,
+        vec![
+            (text("frame_id"), Value::Bytes(vec![7; 16])),
+            (text("sent_at_ms"), Value::Int(i128::from(later))),
+            (text("ext"), ignored_ext),
+        ],
+    );
+    assert_eq!(read_status(&enveloped, &peer).unwrap(), later + HOUR_MS);
+
+    let extra_core_field = status_with(&renewed, vec![(text("renewal"), Value::Int(1))]);
+    assert_eq!(
+        read_status(&extra_core_field, &peer).unwrap_err(),
+        HandshakeError::Malformed
+    );
+}
+
+#[test]
+fn a_refusal_in_place_of_the_challenge_reads_as_the_station_refusing_with_its_ranges() {
+    let r = run(Profile::PqPure);
+    let station = Ranges::supported(Profile::PqHybrid);
+    let (negotiated, hello) = read_opener(&opener(&Ranges::supported(Profile::PqPure)), &station);
+    assert!(negotiated.is_err());
+    let hello = hello.expect("an early refusal answers the opener");
+    assert_eq!(
+        answer_challenge(&hello, &r.session(r.dialed(), LEAF))
+            .map(|(c, _)| c.len())
+            .unwrap_err(),
+        HandshakeError::Refused {
+            code: RefusalCode::ProfileUnsupported,
+            station_ranges: Some(station),
+        }
+    );
+}

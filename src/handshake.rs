@@ -139,7 +139,6 @@ const HELLO_EARLY_KEYS: &[&str] = &[
     "version",
     "versions",
 ];
-const STATUS_KEYS: &[&str] = &["frame_type", "statement", "version"];
 
 /// The one coarse reason a refusing HELLO carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -537,7 +536,8 @@ impl Station {
 /// node_id against the one dialed; the TLS binding against the leaf received;
 /// the status statement; and the session's exporter value.
 fn read_challenge(challenge: &[u8], s: &ChallengeCheck<'_>) -> Result<Station, HandshakeError> {
-    let f = decode(challenge, "challenge", &[CHALLENGE_KEYS])?;
+    let f = decode(challenge, "challenge", &[CHALLENGE_KEYS])
+        .map_err(|e| refusal_before_challenge(challenge).unwrap_or(e))?;
     let negotiated = negotiate(s.ranges, &f.ranges()).ok();
     let chosen = negotiated.filter(|(version, profile)| {
         i128::from(*version) == f.int("version")
@@ -1038,6 +1038,18 @@ pub fn read_hello(hello: &[u8], station: &Station) -> Result<u64, HandshakeError
     Ok(f.uint("capabilities"))
 }
 
+/// A station that shares no version or profile with the opener answers it
+/// with a refusing HELLO in place of the challenge (WIRE_1_0.md section 4.4):
+/// that HELLO as [`HandshakeError::Refused`] with the station's ranges, or
+/// `None` for any other frame.
+fn refusal_before_challenge(frame: &[u8]) -> Option<HandshakeError> {
+    let f = decode(frame, "hello", &[HELLO_EARLY_KEYS]).ok()?;
+    (f.int("accepted") == 0).then(|| HandshakeError::Refused {
+        code: RefusalCode::read(f.text("refusal_code")),
+        station_ranges: Some(f.ranges()),
+    })
+}
+
 /// A status frame carrying a fresh status statement, sent at every reissue.
 pub fn status_frame(statement: &SignedTbs) -> Vec<u8> {
     encode_frame("status", vec![entry("statement", statement.to_value())])
@@ -1054,11 +1066,29 @@ pub struct Peer {
     pub now_ms: i64,
 }
 
-/// Checks a peer's status frame, and returns when its statement expires.
+/// Checks a peer's status frame, and returns when its statement expires. A
+/// STATUS is a control frame, not a handshake frame: it is read as every
+/// frame after HELLO is (WIRE_1_0.md section 3), so it may carry the optional
+/// envelope keys and a non-critical `ext`, and any other extra key is
+/// [`HandshakeError::Malformed`].
 pub fn read_status(frame: &[u8], p: &Peer) -> Result<i64, HandshakeError> {
-    let f = decode(frame, "status", &[STATUS_KEYS])?;
+    let envelope = cbor::decode(frame)
+        .ok()
+        .and_then(|v| crate::frame::read_envelope(&v).ok())
+        .filter(|e| e.frame_type == "status")
+        .ok_or(HandshakeError::Malformed)?;
+    read_status_frame(&envelope.frame, p)
+}
+
+/// [`read_status`] of a frame whose envelope is already read, `ext` gone.
+pub fn read_status_frame(frame: &Value, p: &Peer) -> Result<i64, HandshakeError> {
+    let statement = crate::frame::read_control(frame)
+        .ok()
+        .and_then(|f| f.get("statement").map(SignedTbs::from_value))
+        .ok_or(HandshakeError::Malformed)?
+        .map_err(|_| HandshakeError::Malformed)?;
     Ok(verify_status(
-        &f.signed("statement"),
+        &statement,
         &p.binding,
         &p.identity_key,
         p.profile,

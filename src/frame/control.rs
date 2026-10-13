@@ -1,6 +1,7 @@
 //! The control frames a client link exchanges after HELLO (WIRE_1_0.md
 //! section 3): ADVERTISE and UNADVERTISE carry a signed record, SUBSCRIBE and
-//! UNSUBSCRIBE a topic, GOODBYE a reason, and the liveness probe a nonce. None
+//! UNSUBSCRIBE a topic, STATUS a status statement, GOODBYE a reason, and the
+//! liveness probe a nonce. None
 //! carries a signature of its own: the session proofs authenticated the peer
 //! once, and QUIC's AEAD authenticates every frame.
 
@@ -49,6 +50,7 @@ fn control_table(frame_type: &str) -> Option<(Table, Required)> {
             ],
             &["reason"],
         ),
+        "status" => (&[("statement", Rule::Any)], &["statement"]),
         "liveness_ping" | "liveness_pong" => {
             (&[("nonce", Rule::BytesOf(LIVENESS_NONCE_SIZE))], &["nonce"])
         }
