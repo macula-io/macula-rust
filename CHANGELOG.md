@@ -15,6 +15,8 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.10.0] - 2026-10-13
+
 Wire 1.0 (macula `docs/design/WIRE_1_0.md`, macula#83; macula-rust#27). A
 node on this release reaches stations on wire 1.0 and no others: the live
 fleet runs the earlier wire until it moves, and 0.9.x is the release for it.
