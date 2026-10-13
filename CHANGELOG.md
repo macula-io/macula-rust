@@ -13,6 +13,71 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ## macula-rust
 
+### [Unreleased]
+
+Wire 1.0 (macula `docs/design/WIRE_1_0.md`, macula#83; macula-rust#27). A
+node on this release reaches stations on wire 1.0 and no others: the live
+fleet runs the earlier wire until it moves, and 0.9.x is the release for it.
+Every class of macula's wire 1.0 conformance vectors passes in `cargo test`
+(`tests/vectors/wire_1_0/`).
+
+#### Changed (breaking)
+
+- **The handshake is version 5 only.** The opener names the client's
+  versions and profiles; the station picks the highest common version and
+  the first common profile, or refuses at once naming its own. CONNECT's
+  proof is V3, over the CONNECT tbs; HELLO's session proof is V2, over the
+  HELLO tbs. A client detects a downgraded choice (`DowngradeDetected`) and
+  never completes below the version it last completed with a station
+  (`VersionBelowFloor`), held for the run. Handshake v4, the v4 fallback,
+  `forget_v5_peer` and neighbour signatures are gone. `handshake::opener`,
+  `read_opener`, `challenge`, `ClientSession` and `StationSession` take
+  `Ranges` and a floor; `HandshakeError::Refused` carries the station's
+  ranges when it refused before the challenge.
+- **Every frame is version 5** and omits the keys it has no value for; the
+  `capabilities` header is gone. A received frame is read through the wire
+  1.0 envelope: an unknown frame type is counted and read past, or aborts a
+  dedicated stream with QUIC code 5; an unknown critical extension drops the
+  frame with the link up; an unknown per-hop enum value reads as its
+  fallback, and one inside a tbs refuses that object (`FrameError::EnumUnknown`).
+- **Records carry `schema` and `lifetime_class`** (a row of the frozen
+  lifetime table) and may carry `ext`. `record::verify` is a reader:
+  `check_as_custodian` first (the alg allowlist before any signature work,
+  the envelope keys, the clock, the row, the slot), then a known type, a
+  schema it reads, `ext`, the payload rules and a content id tag it knows.
+  New refusals: `AlgUnsupported` (was `AlgMismatch`), `LifetimeClassUnknown`,
+  `LifetimeClassMismatch`, `SubjectMissing`, `TypeUnknown`,
+  `SchemaUnsupported`, `McidTagUnknown`, `ExtensionUnsupported`.
+- **A procedure advertisement names 1 to 8 `serving_stations`**, strictly
+  ascending; `new_procedure_advertisement` takes a slice and
+  `ProcedureAdvertisement::serving_stations` is a list. The pool reaches the
+  provider through each.
+- **`_dht.*` calls use the versioned `{v: 1, ...}` forms.** A refused put is
+  `LinkError::RecordRefused` with the custodian's refusal; a reply of another
+  version is `LinkError::ReplyVersionUnsupported`.
+
+#### Added
+
+- `WIRE_VERSION` ("1.0"), and the wire counters (`frame::wire_counters`):
+  unknown frame types, ignored and refused extensions (64 names kept apart,
+  the rest under `other`), enum fallbacks.
+- The station's REGISTER_ACK is read; a refused ADVERTISE ends that serving
+  (`LinkError::RegisterRefused`) and a refused SUBSCRIBE that subscription.
+- Station authorization (0x13) and the app record (0x17) are known record
+  types, with `read_station_authorization`, `station_authorization_key` and
+  `app_record_key`.
+- `ext` inside a signed object's tbs: an unknown critical extension refuses
+  that object by name, an unknown non-critical one is counted.
+- The relay code `overloaded`: a station may refuse an excess call with it
+  (the link declares `relay_overloaded`), and the call ends at once.
+
+#### Fixed
+
+- A sealed request under a scheme this node does not know is answered
+  `sealed_refused` instead of being dropped as malformed.
+- A frame length header of 16 MiB is refused; the cap is 16 MiB minus one
+  byte, as the spec has it.
+
 ### [0.9.3] - 2026-10-12
 
 #### Fixed
@@ -691,6 +756,15 @@ this crate's own FFI-surface coverage of whatever `macula-rust` shipped the
 same day, not a separate feature set. Independently versioned from the core
 crate since day one (this crate started at 0.1.0 the same day the core crate
 did, but the two have moved at different paces ever since).
+
+
+### [Unreleased]
+
+#### Added
+
+- `wire_version()` (`wireVersion` in Kotlin): the wire the library speaks,
+  "1.0". Built on the wire 1.0 `macula-rust`, which reaches wire 1.0
+  stations only.
 
 ### [ffi-0.9.0] - 2026-10-08
 

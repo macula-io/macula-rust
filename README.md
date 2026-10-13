@@ -19,15 +19,20 @@
 
 ---
 
-> **Status, 2026-09-26:** on the **macula 12** wire. That means post-quantum
-> ML-DSA-87 identities (in pq_hybrid, the fleet's profile, the ML-DSA-87 +
-> RSA-PSS-4096 composite), ML-KEM hybrid key exchange, and signed requests.
-> Calls and streams by direct dial, serving (under an org or in a node's own
-> namespace), publish/subscribe, node-served content and the DHT are tested
-> against in-process macula 12 stations on every `cargo test`, and calls,
-> pubsub and the DHT live against the fleet. Every link runs macula 13.2's
-> handshake v5, bound to its TLS session, and falls back to v4 only for a
-> station never seen on v5. A call or stream to a provider whose
+> **Status, 2026-10-13:** on **wire 1.0** (macula `docs/design/WIRE_1_0.md`),
+> the wire an operator can run for years on security fixes alone. Every class
+> of macula's wire 1.0 conformance vectors passes on every `cargo test`: the
+> frame envelope, frames, enums, records for readers and custodians, the
+> check order, tbs bytes, `_dht.*` shapes and the handshake transcripts. The
+> live fleet still runs the earlier wire until it moves to 1.0; 0.9.x is the
+> release that reaches it today. Post-quantum ML-DSA-87 identities (in
+> pq_hybrid, the fleet's profile, the ML-DSA-87 + RSA-PSS-4096 composite),
+> ML-KEM hybrid key exchange, and signed requests. Calls and streams by
+> direct dial, serving (under an org or in a node's own namespace),
+> publish/subscribe, node-served content and the DHT are tested against
+> in-process wire 1.0 stations. Every link runs handshake version 5, bound to
+> its TLS session, with proof V3 and session proof V2, and never completes
+> below the version it last completed with a station. A call or stream to a provider whose
 > advertisement names a KEM key is sealed end to end to that key (macula 13's
 > seal scheme 1), and a node with `kem_advertise` on names its key, opens
 > sealed requests and answers them sealed, and a caller's seal report says
@@ -157,7 +162,7 @@ compatibility layer.
 |---|---|---|---|
 | Node keys (`node_key::NodeKey`) | ✅ | ✅ | `pq_hybrid` (the fleet's) or `pq_pure`; on unix key files readable by the owner only, stored by name and profile under the account's identity directory (identity layout v1, checked against macula's vectors), or a key store (`keystore`); on Windows Credential Manager only (a key file is refused); a key store keeps the private part only; pq_hybrid checked against the LAMPS draft's own vector and cross-verified with macula 12.8.0 |
 | Pool of station links (`pool::Pool`) | ✅ | ✅ | Seeds pinned by node_id; realm keys pinned; links redialed with subscriptions and served procedures replayed |
-| One station link (`station_link::Link`) | ✅ | ✅ | Handshake v5 bound to the TLS session (v4 once after `unsupported_version`, never after a node was seen on v5), status statements both ways, neighbour signatures on v4 links in pq_hybrid, a liveness probe |
+| One station link (`station_link::Link`) | ✅ | ✅ | The wire 1.0 handshake: negotiated versions and profiles, downgrades detected, bound to the TLS session, a per-station version floor; status statements both ways, a liveness probe; every frame read through the wire 1.0 envelope (unknown frame types and extensions read past and counted, `wire_counters`), and the station's REGISTER_ACK, whose refusal ends what it refused |
 | Calls by direct dial (`call`, `providers`) | ✅ | ✅ | Candidates tried freshest first; errors arrive as `LinkError::Provider` / `LinkError::Relay` |
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
@@ -165,7 +170,7 @@ compatibility layer.
 | End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; `call_report` and `Stream::report` give the caller's seal report |
 | UCAN (`ucan`, `Call::token`, `Offer::policy`) | ✅ | ✅ | macula 12's tokens (D7) in the node's profile: `ucan::create` mints, a call or open presents a token and its chain's proofs, and an `Offer` gated on `Policy::UcanRequired` or `RealmMemberRequired` refuses what `ucan::authorize` does not accept `unauthorized` (a stray proof `malformed_frame`) before its handler runs; held to macula v13.6.0's `ucan_v1.json` |
 | Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |
-| DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | Records verified before they are handed on |
+| DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | The versioned `_dht.*` forms; every record found verified as a reader verifies it before it is handed on; `record::check_as_custodian` runs the checks a station stores any record by |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | `macula-rust-ffi`, below |
 
 The link and the pool are ported from macula-go v0.12.0's `stationlink` and
@@ -247,8 +252,8 @@ cargo test --workspace
 
 The integration tests (`tests/station_link.rs`, `tests/pool.rs`,
 `macula-rust-ffi/tests/pool_ffi.rs`) run against `tests/teststation`, a Go
-helper around macula-go's `teststation`. It starts in-process macula 13.2
-stations, which answer handshake v5, realms and orgs as each test asks, and reports what a station sees
+helper around macula-go's `teststation`. It starts in-process wire 1.0
+stations, realms and orgs as each test asks, and reports what a station sees
 (who is connected, what is advertised or subscribed, how many streams it
 relays). A test fails, not skips, when the helper is missing. No network is
 needed. Go ≥ 1.27 builds the helper.
