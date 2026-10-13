@@ -47,7 +47,10 @@ Every class of macula's wire 1.0 conformance vectors passes in `cargo test`
   schema it reads, `ext`, the payload rules and a content id tag it knows.
   New refusals: `AlgUnsupported` (was `AlgMismatch`), `LifetimeClassUnknown`,
   `LifetimeClassMismatch`, `SubjectMissing`, `TypeUnknown`,
-  `SchemaUnsupported`, `McidTagUnknown`, `ExtensionUnsupported`.
+  `SchemaUnsupported`, `McidTagUnknown`, `ExtensionUnsupported`. A
+  custodian stores a tombstone of a type it does not know at that type's
+  unknown-tag slot, bounded by the row it names plus 10 minutes, so a newer
+  record can be withdrawn early; a reader refuses it as `TypeUnknown`.
 - **A procedure advertisement names 1 to 8 `serving_stations`**, strictly
   ascending; `new_procedure_advertisement` takes a slice and
   `ProcedureAdvertisement::serving_stations` is a list. The pool reaches the
@@ -62,7 +65,10 @@ Every class of macula's wire 1.0 conformance vectors passes in `cargo test`
   unknown frame types, ignored and refused extensions (64 names kept apart,
   the rest under `other`), enum fallbacks.
 - The station's REGISTER_ACK is read; a refused ADVERTISE ends that serving
-  (`LinkError::RegisterRefused`) and a refused SUBSCRIBE that subscription.
+  (`LinkError::RegisterRefused`) and a refused SUBSCRIBE of this node that
+  subscription.
+- STATUS is read as a control frame: the optional `frame_id`, `sent_at_ms`
+  and `ext` pass, a routing key is malformed (`handshake::read_status_frame`).
 - Station authorization (0x13) and the app record (0x17) are known record
   types, with `read_station_authorization`, `station_authorization_key` and
   `app_record_key`.

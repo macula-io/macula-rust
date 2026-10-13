@@ -489,7 +489,8 @@ fn custodian_checks(wire: &[u8], profile: Profile, now_ms: i64) -> Result<Record
 
 /// A record's slot as a custodian places it: a known type by its own rule,
 /// any other by H(type | signer key id | subject), refusing one without a
-/// subject.
+/// subject. A tombstone of a type this crate does not know takes that type's
+/// slot, with its payload's subject (WIRE_1_0.md section 5.1).
 fn custodian_slot(r: &Record) -> Result<[u8; 32], RecordError> {
     if type_row(i128::from(r.record_type.0), &r.payload).1 {
         return storage_key(r).map_err(|e| match e {
@@ -497,13 +498,21 @@ fn custodian_slot(r: &Record) -> Result<[u8; 32], RecordError> {
             other => malformed(other.to_string()),
         });
     }
-    let subject = r.subject.as_deref().ok_or(RecordError::SubjectMissing)?;
+    let (t, subject) = match (r.record_type, withdrawn_type(&r.payload)) {
+        (RecordType::TOMBSTONE, Some(Some(w))) => {
+            let t = u8::try_from(w).map_err(|_| malformed("a withdrawn_type beyond 255"))?;
+            let subject = match r.payload.get("subject") {
+                None => None,
+                Some(Value::Bytes(s)) => Some(s.as_slice()),
+                Some(_) => return Err(malformed("a tombstone's subject that is not bytes")),
+            };
+            (t, subject)
+        }
+        _ => (r.record_type.0, r.subject.as_deref()),
+    };
+    let subject = subject.ok_or(RecordError::SubjectMissing)?;
     let key_id = r.signed.as_ref().ok_or(RecordError::Unsigned)?.key_id;
-    Ok(storage_key::unknown_type_key(
-        r.record_type.0,
-        &key_id,
-        subject,
-    ))
+    Ok(storage_key::unknown_type_key(t, &key_id, subject))
 }
 
 /// A reader's step 10: a type this crate knows and a schema it reads.
@@ -708,7 +717,8 @@ fn withdrawn_type(payload: &Value) -> Option<Option<i128>> {
 /// advertisement and station endpoint 5 minutes; realm stations and org
 /// directory 6 hours; procedure delegation, app record and station
 /// authorization 30 minutes; a domain type 7 days; the other built-in types it
-/// knows 30 days; and a tombstone the row of the type it withdraws.
+/// knows 30 days; and a tombstone the row of the type it withdraws, known only
+/// when that type is.
 fn type_row(t: i128, payload: &Value) -> (u8, bool) {
     match t {
         0x01 | 0x11 => (ROW_48_HOURS, true),
@@ -717,7 +727,7 @@ fn type_row(t: i128, payload: &Value) -> (u8, bool) {
         0x13 | 0x16 | 0x17 => (ROW_30_MINUTES, true),
         0x03 | 0x05 | 0x0D..=0x10 => (ROW_30_DAYS, true),
         0x0C => match withdrawn_type(payload) {
-            Some(Some(w)) if w != 0x0C => (type_row(w, &Value::Map(Vec::new())).0, true),
+            Some(Some(w)) if w != 0x0C => type_row(w, &Value::Map(Vec::new())),
             _ => (ROW_30_DAYS, true),
         },
         0x20..=0xFF => (ROW_7_DAYS, true),

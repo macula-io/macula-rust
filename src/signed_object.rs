@@ -342,6 +342,6 @@ mod wire_1_0_tests {
                 c.id
             );
         }
-        assert_eq!(file.cases.len(), 28);
+        assert_eq!(file.cases.len(), 30);
     }
 }

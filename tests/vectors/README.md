@@ -8,7 +8,7 @@ draft's vector for id-MLDSA87-RSA4096-PSS-SHA512 as macula v12.7.0 carries it.
 
 | Directory | What it pins |
 |-----------|--------------|
-| `wire_1_0/` | the wire 1.0 conformance vectors (macula#97), copied unchanged from macula ef1cfe68's `priv/vectors/wire_1_0/` with the spec page `WIRE_1_0.md` they make executable: the frame envelope, frames, enums, records for readers and custodians, check order, tbs bytes, `_dht.*` shapes and handshake transcripts. Every class runs in `cargo test` |
+| `wire_1_0/` | the wire 1.0 conformance vectors (macula#97), copied unchanged from macula 3a57f890's `priv/vectors/wire_1_0/` with the spec page `WIRE_1_0.md` they make executable: the frame envelope, frames, enums, records for readers and custodians, check order, tbs bytes, `_dht.*` shapes and handshake transcripts. Every class runs in `cargo test` |
 | `cbor/` | the decoding rule every stack applies to what a peer sends |
 | `identity/` | TLS and CONNECT bindings, status statements, the LAMPS composite, and identity layout v1's stored-identity paths, refused names and old-key moves (`identity_layout_v1.json`, copied unchanged from macula v14.4.0's `test/vectors/`) |
 | `record/` | own-namespace procedure advertisements and their verdicts, copied unchanged from macula 4c1d278a's `test/fixtures/own_namespace/` (wire 1.0 records, macula#100) |

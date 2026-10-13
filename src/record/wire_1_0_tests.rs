@@ -78,7 +78,7 @@ fn the_wire_1_0_reader_vectors() {
     }
     assert_eq!(
         cases.len(),
-        132 + 14,
+        138 + 14,
         "verify.json's cases and check_order.json's reader ones"
     );
 }
@@ -113,7 +113,7 @@ fn the_wire_1_0_custodian_vectors() {
     }
     assert_eq!(
         cases.len(),
-        132 + 26,
+        138 + 26,
         "custodian.json's cases and check_order.json's custodian ones"
     );
 }

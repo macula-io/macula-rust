@@ -1,5 +1,5 @@
 //! The wire 1.0 conformance vectors (tests/vectors/wire_1_0/, macula#97,
-//! copied unchanged from macula ef1cfe68's priv/vectors/wire_1_0/), as each
+//! copied unchanged from macula 3a57f890's priv/vectors/wire_1_0/), as each
 //! module's runner reads them: one file per class, its cases by id, and
 //! typed JSON read back as CBOR values (FORMAT.md). Test-only.
 
