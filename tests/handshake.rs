@@ -355,6 +355,20 @@ fn a_status_reads_with_the_optional_envelope_keys_every_frame_may_carry() {
         read_status(&extra_core_field, &peer).unwrap_err(),
         HandshakeError::Malformed
     );
+
+    // STATUS routes nowhere: the envelope's routing keys are not its own.
+    for (key, value) in [
+        ("realm", Value::Bytes(vec![1; 32])),
+        ("call_id", Value::Bytes(vec![1; 16])),
+        ("source_route", Value::Bytes(vec![1])),
+    ] {
+        let routed = status_with(&renewed, vec![(text(key), value)]);
+        assert_eq!(
+            read_status(&routed, &peer).unwrap_err(),
+            HandshakeError::Malformed,
+            "{key}"
+        );
+    }
 }
 
 #[test]

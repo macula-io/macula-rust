@@ -15,6 +15,9 @@ use super::{
 const MAX_GOODBYE_REASON_BYTES: usize = 256;
 const MAX_GOODBYE_DETAIL_BYTES: usize = 256;
 
+/// The envelope keys a STATUS never carries: it routes nowhere.
+const ROUTING_KEYS: &[&str] = &["realm", "call_id", "source_route"];
+
 /// A frame type's field table, and the fields it must hold.
 type Table = Vec<(&'static str, Rule)>;
 type Required = &'static [&'static str];
@@ -65,6 +68,9 @@ fn control_table(frame_type: &str) -> Option<(Table, Required)> {
         ("call_id", Rule::BytesOf(16)),
         ("source_route", Rule::AnyBytes),
     ];
+    if frame_type == "status" {
+        table.retain(|(name, _)| !ROUTING_KEYS.contains(name));
+    }
     for (name, rule) in own {
         match table.iter_mut().find(|(n, _)| n == name) {
             Some(slot) => slot.1 = *rule,
