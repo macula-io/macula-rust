@@ -542,9 +542,9 @@ fn stream_table_read(
         ("request_hash", Rule::BytesOf(48)),
         ("signer", Rule::BytesOf(32)),
         ("seq", Rule::ProtocolUint),
-        ("encoding", Rule::TextIn(&["raw", "msgpack"])),
+        ("encoding", Rule::EnumText),
         ("body", Rule::Any),
-        ("role", Rule::TextIn(&["send", "both"])),
+        ("role", Rule::EnumText),
         ("code", Rule::TextWithin(MAX_ERROR_CODE_BYTES)),
         ("message", Rule::TextWithin(MAX_ERROR_TEXT_BYTES)),
         ("payload", Rule::Any),
@@ -557,6 +557,8 @@ fn stream_table_read(
     ) {
         return Err(FrameError::Malformed);
     }
+    super::tbs_enum(&fields, "encoding", &["raw", "msgpack"])?;
+    super::tbs_enum(&fields, "role", &["send", "both"])?;
     Ok(fields)
 }
 

@@ -20,7 +20,9 @@ const ERROR: &str = "error";
 const STREAM_ERROR: &str = "stream_error";
 
 /// The closed set of relay error codes, disjoint from every provider code.
-const RELAY_CODES: &[&str] = &["unknown_next_peer"];
+/// The relay codes, a closed set disjoint from every provider code
+/// (DESIGN_PQ_SIGNED_FRAMES_AND_RECORDS, macula#54).
+const RELAY_CODES: &[&str] = &["unknown_next_peer", "overloaded"];
 
 /// A reply's frame type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,8 +204,8 @@ fn sign_reply(
     ))
 }
 
-const REPLY_ROUTES: &[(&str, Rule)] = &[("source_route_reverse", Rule::AnyBytes)];
-const RELAY_ERROR_ROUTES: &[(&str, Rule)] = &[("source_route_partial", Rule::AnyBytes)];
+pub(super) const REPLY_ROUTES: &[(&str, Rule)] = &[("source_route_reverse", Rule::AnyBytes)];
+pub(super) const RELAY_ERROR_ROUTES: &[(&str, Rule)] = &[("source_route_partial", Rule::AnyBytes)];
 
 /// Verifies a received RESULT or provider ERROR for the request it answers:
 /// the frame's shape, the reply's signature and fields, responded_by as the
@@ -351,6 +353,7 @@ pub fn verify_relay_error(
     ) {
         return Err(FrameError::Malformed);
     }
+    super::tbs_enum(&fields, "code", RELAY_CODES)?;
     let relay_error = VerifiedRelayError {
         frame_type: if frame_type == ERROR {
             RelayErrorType::Error
@@ -387,7 +390,7 @@ fn relay_error_table(frame_type: &str) -> Vec<(&'static str, Rule)> {
         ("request_id", Rule::BytesOf(16)),
         ("request_hash", Rule::BytesOf(48)),
         ("reported_by", Rule::BytesOf(32)),
-        ("code", Rule::TextIn(RELAY_CODES)),
+        ("code", Rule::EnumText),
         ("offending_hop", Rule::BytesOf(32)),
     ]
 }

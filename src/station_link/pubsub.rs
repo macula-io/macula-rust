@@ -126,6 +126,12 @@ pub(super) struct SubscriberSlot {
     events: mpsc::Sender<Event>,
 }
 
+/// Ends every subscription to `key` on the link when the station refused
+/// its SUBSCRIBE: their events stop, and each one's `recv` gives `None`.
+pub(super) fn subscribe_refused(inner: &Inner, key: &([u8; 32], String)) {
+    inner.lock().subs.remove(key);
+}
+
 /// One subscription to a realm and topic on a link, until
 /// [`Subscription::unsubscribe`] or the link ends.
 pub struct Subscription {
@@ -234,7 +240,7 @@ impl Link {
 
     /// Sends a publication signed once for several links, as it is.
     pub async fn publish_signed(&self, p: &SignedPublication) -> Result<(), LinkError> {
-        self.inner.write_control(&p.frame).await
+        self.inner.send_control(&p.frame).await
     }
 
     /// Subscribes to `topic` in `realm`: the first subscription to a realm
@@ -278,10 +284,7 @@ pub(super) fn evented(inner: &Arc<Inner>, v: &Value) {
         inner.count("event_unverified");
         return;
     };
-    let delivered_via = match v.get("delivered_via") {
-        Some(Value::Text(t)) => t.clone(),
-        _ => String::new(),
-    };
+    let delivered_via = frame::delivered_via(v).to_string();
     if !inner
         .dedup
         .first(publication.publication_hash, publication.expires_at, now)

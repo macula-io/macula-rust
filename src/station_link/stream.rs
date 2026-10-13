@@ -30,8 +30,8 @@ use tokio::sync::{watch, Notify};
 
 use crate::cbor::{self, Value};
 use crate::frame::{
-    self, RequestSpec, StreamEncoding, StreamFields, StreamMode, StreamRole, StreamState,
-    VerifiedRequest,
+    self, FrameError, RequestSpec, StreamEncoding, StreamFields, StreamMode, StreamRole,
+    StreamState, VerifiedRequest,
 };
 use crate::seal::KEY_ID_SIZE;
 
@@ -45,7 +45,7 @@ use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
 use super::serve::{
     bounded_detail, without_caller, BoxFuture, Offer, StreamOffer, CODE_REQUEST_COPY,
 };
-use super::{frame_type_of, now_ms, Inner, Link, LinkError};
+use super::{now_ms, Inner, Link, LinkError};
 
 const STREAM_OPEN_BYTES: usize = 1024 * 1024;
 const STREAM_OPEN_WAIT: Duration = Duration::from_secs(10);
@@ -695,9 +695,9 @@ fn hold_stream(inner: &Inner, s: &Arc<StreamInner>) -> bool {
 }
 
 /// Releases a QUIC stream no session holds, in both directions.
-fn abandon(mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
-    let _ = send.reset(0u32.into());
-    let _ = recv.stop(0u32.into());
+fn abandon(mut send: quinn::SendStream, mut recv: quinn::RecvStream, code: u32) {
+    let _ = send.reset(code.into());
+    let _ = recv.stop(code.into());
 }
 
 impl Link {
@@ -819,9 +819,10 @@ pub(super) async fn accept_streams(link: Weak<Inner>) {
 /// without a word, and one the provider refuses is told why at seq 0.
 async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::RecvStream) {
     let Some(inner) = link.upgrade() else { return };
-    let Some((open, state)) = read_open(&inner, &mut recv).await else {
-        abandon(send, recv);
-        return;
+    let (open, state) = match read_open(&inner, &mut recv).await {
+        Opened::Open(opened) => *opened,
+        Opened::Unread => return abandon(send, recv, 0),
+        Opened::Unknown => return abandon(send, recv, frame::QUIC_CODE_UNKNOWN_FRAME_TYPE),
     };
     let offer = inner
         .lock()
@@ -868,38 +869,53 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     tokio::spawn(serve(s, offer));
 }
 
-/// Reads a stream's first frame within 10 seconds: its verified STREAM_OPEN
-/// for this node and the verifier state it starts, or `None`, counted, when
-/// the stream does not deliver one.
-async fn read_open(
-    inner: &Inner,
-    recv: &mut quinn::RecvStream,
-) -> Option<(VerifiedRequest, StreamState)> {
+/// What a stream's first frame gave.
+enum Opened {
+    /// A verified STREAM_OPEN for this node, and the verifier state it
+    /// starts.
+    Open(Box<(VerifiedRequest, StreamState)>),
+    /// No STREAM_OPEN this node takes, counted.
+    Unread,
+    /// A frame of a type this node does not know, counted.
+    Unknown,
+}
+
+/// Reads a stream's first frame within 10 seconds.
+async fn read_open(inner: &Inner, recv: &mut quinn::RecvStream) -> Opened {
     let payload =
         match tokio::time::timeout(STREAM_OPEN_WAIT, read_frame(recv, STREAM_OPEN_BYTES)).await {
             Ok(Ok(payload)) => payload,
             _ => {
                 inner.count("stream_open_unread");
-                return None;
+                return Opened::Unread;
             }
         };
-    let v = match cbor::decode(&payload) {
-        Ok(v) if frame_type_of(&v) == "stream_open" => v,
+    if unknown_on_stream(&payload).is_some() {
+        inner.count("stream_unknown_frame_type");
+        return Opened::Unknown;
+    }
+    let envelope = match cbor::decode(&payload)
+        .map_err(|_| FrameError::Malformed)
+        .and_then(|v| frame::read_envelope(&v))
+    {
+        Ok(envelope) if envelope.frame_type == "stream_open" => envelope,
         _ => {
             inner.count("stream_open_malformed");
-            return None;
+            return Opened::Unread;
         }
     };
-    let Ok(open) = frame::verify_request(&v, inner.profile) else {
+    let Ok(open) = frame::verify_request(&envelope.frame, inner.profile) else {
         inner.count("stream_open_unverified");
-        return None;
+        return Opened::Unread;
     };
     if open.target != inner.self_id {
         inner.count("stream_for_another_node");
-        return None;
+        return Opened::Unread;
     }
-    let state = frame::open_stream(&open).ok()?;
-    Some((open, state))
+    match frame::open_stream(&open) {
+        Ok(state) => Opened::Open(Box::new((open, state))),
+        Err(_) => Opened::Unread,
+    }
 }
 
 /// The open as its session sees it, opened when it came sealed, with the
@@ -1012,10 +1028,48 @@ async fn read(s: Arc<StreamInner>, mut recv: quinn::RecvStream, mut state: Strea
             Err(e) => return read_ended(&s, e),
         };
         match received(&s, &payload, &state).await {
-            Some(next) => state = next,
-            None => return,
+            Next::Read(next) => state = *next,
+            Next::Stop => return,
+            Next::AbortUnknown(frame_type) => {
+                s.link.count("stream_unknown_frame_type");
+                let _ = recv.stop(frame::QUIC_CODE_UNKNOWN_FRAME_TYPE.into());
+                s.writer
+                    .reset_with(frame::QUIC_CODE_UNKNOWN_FRAME_TYPE)
+                    .await;
+                let detail = format!("a frame of a type this node does not know: {frame_type}");
+                StreamInner::end(&s, Some(LinkError::Io(detail)));
+                return;
+            }
         }
     }
+}
+
+/// The frame types a dedicated stream carries; any other aborts the stream
+/// with [`frame::QUIC_CODE_UNKNOWN_FRAME_TYPE`] (WIRE_1_0.md section 3.3).
+const STREAM_FRAME_TYPES: &[&str] = &[
+    "stream_open",
+    "stream_data",
+    "stream_end",
+    "stream_error",
+    "stream_reply",
+    "error",
+];
+
+/// What the reader does after a frame: reads on in the next verifier
+/// state, stops, or aborts the stream on a frame of a type it does not know.
+enum Next {
+    Read(Box<StreamState>),
+    Stop,
+    AbortUnknown(String),
+}
+
+/// The QUIC code to abort a dedicated stream with when `payload` reads as an
+/// envelope of a type the stream does not carry, counted; `None` otherwise,
+/// for the stream's own reading to judge.
+pub(super) fn unknown_on_stream(payload: &[u8]) -> Option<u32> {
+    let envelope = frame::read_envelope(&cbor::decode(payload).ok()?).ok()?;
+    frame::unknown_frame_type(&envelope, STREAM_FRAME_TYPES)?;
+    Some(frame::QUIC_CODE_UNKNOWN_FRAME_TYPE)
 }
 
 /// Ends a stream whose peer direction finished: after the peer's last frame
@@ -1028,28 +1082,49 @@ fn read_ended(s: &Arc<StreamInner>, e: LinkError) {
     StreamInner::end(s, Some(err));
 }
 
-/// Handles one frame from the peer; the next verifier state, or `None` when
-/// reading stops.
-async fn received(
-    s: &Arc<StreamInner>,
-    payload: &[u8],
-    state: &StreamState,
-) -> Option<StreamState> {
-    let v = match cbor::decode(payload) {
-        Ok(v) => v,
+/// Handles one frame from the peer, read as wire 1.0 reads it: one with an
+/// unknown critical extension in its envelope is dropped and counted, one of
+/// a type the stream does not carry aborts it, and any other is verified.
+async fn received(s: &Arc<StreamInner>, payload: &[u8], state: &StreamState) -> Next {
+    let envelope = match cbor::decode(payload)
+        .map_err(|e| FrameError::Payload(e.to_string()))
+        .and_then(|v| frame::read_envelope(&v))
+    {
+        Ok(envelope) => envelope,
+        Err(FrameError::ExtensionUnsupported(_)) => {
+            s.link.count("extension_unsupported");
+            return Next::Read(Box::new(state.clone()));
+        }
         Err(e) => {
             s.fail("malformed_frame", Some(e.to_string())).await;
-            return None;
+            return Next::Stop;
         }
     };
+    if let Some(frame_type) = frame::unknown_frame_type(&envelope, STREAM_FRAME_TYPES) {
+        return Next::AbortUnknown(frame_type);
+    }
+    match verified_frame(s, &envelope.frame, payload.len(), state).await {
+        Some(next) => Next::Read(Box::new(next)),
+        None => Next::Stop,
+    }
+}
+
+/// Verifies and takes one known frame of `size` bytes from the peer; the
+/// next verifier state, or `None` when reading stops.
+async fn verified_frame(
+    s: &Arc<StreamInner>,
+    v: &Value,
+    size: usize,
+    state: &StreamState,
+) -> Option<StreamState> {
     if s.caller && v.get("relay_error").is_some() {
-        relay_failed(s, &v).await;
+        relay_failed(s, v).await;
         return None;
     }
     let verified = if s.caller {
-        frame::verify_provider_stream(&v, state, s.link.profile)
+        frame::verify_provider_stream(v, state, s.link.profile)
     } else {
-        frame::verify_caller_stream(&v, state, s.link.profile)
+        frame::verify_caller_stream(v, state, s.link.profile)
     };
     let (verified, next) = match verified {
         Ok(verified) => verified,
@@ -1058,7 +1133,6 @@ async fn received(
             return None;
         }
     };
-    let size = payload.len();
     let fields = match unsealed(verified, s.sealing.as_ref()) {
         Ok(fields) => fields,
         Err(e) => {

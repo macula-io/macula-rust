@@ -1,19 +1,19 @@
 //! A client's link to one macula station, as macula_station_link and
 //! macula-go's stationlink are: a QUIC connection dialed to the station its
-//! target pins, one bidirectional control stream, the connection handshake on
-//! it (v5, or v4 once after a station refuses v5), then status statements
-//! both ways and every frame of the session.
+//! target pins, one bidirectional control stream, the wire 1.0 connection
+//! handshake on it, then status statements both ways and every frame of the
+//! session.
 //!
 //! After HELLO the link sends its own status statement at every reissue of
 //! the node's statement issuer, and ends when the station's statement is five
 //! minutes past its expiry or the station's TLS binding reaches its
-//! not_after. On a v5 link no frame carries a neighbour signature: the
-//! session proofs authenticated the station once, and a neighbour-signed
-//! frame ends the link. On a v4 link, in pq_hybrid, every control frame is
-//! neighbour-signed with a sequence number per direction, from 0 after HELLO;
-//! a frame out of sequence ends the link. A liveness probe every 30 seconds
-//! ends the link after two misses in a row: on v5 a liveness_ping, on v4 a
-//! `_macula.ping` call.
+//! not_after. No frame carries a neighbour signature: the session proofs
+//! authenticated the station once. Every frame is read as wire 1.0 reads it
+//! (WIRE_1_0.md section 3): one of a type the link does not act on is
+//! dropped and counted, one with an unknown critical extension is dropped and
+//! counted as `extension_unsupported`, both with the link left up; one that
+//! does not read ends the link as malformed. A liveness probe every 30
+//! seconds ends the link after two misses in a row.
 
 mod admission;
 mod authorize;
@@ -39,7 +39,7 @@ pub(crate) use stream::Reseal;
 pub use stream::{
     stream_handler, Stream, StreamCall, StreamEvent, StreamHandler, DEFAULT_STREAM_DEADLINE,
 };
-pub use versions::{forget_v5_peer, handshake_counters};
+pub use versions::handshake_counters;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,14 +47,11 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use sha2::{Digest, Sha384};
 use tokio::sync::watch;
 
 use crate::cbor::{self, Value};
-use crate::frame::{self, FrameError, Liveness, NeighbourLink, NeighbourPeer};
-use crate::handshake::{
-    self, ClientSession, Exporter, HandshakeError, Peer, RefusalCode, Station, VERSION, VERSION_5,
-};
+use crate::frame::{self, Envelope, FrameError, Liveness};
+use crate::handshake::{self, ClientSession, Exporter, HandshakeError, Peer, Station, VERSION_5};
 use crate::node_key::NodeKey;
 use crate::profile::Profile;
 use crate::record::RecordError;
@@ -110,10 +107,6 @@ pub enum LinkError {
     Goodbye(String),
     /// The station missed two liveness probes in a row.
     LivenessLost,
-    /// A station this process completed handshake v5 with that now answers
-    /// v4, or a v4 link to it that a v5 completion ended: refused, not
-    /// retried, until [`forget_v5_peer`].
-    V5DowngradeRefused,
     /// No verified reply answered the call within its timeout.
     CallTimeout,
     /// A provider's ERROR for the call.
@@ -140,6 +133,12 @@ pub enum LinkError {
     KemAdvertiseDisabled,
     /// A served procedure withdrawn by its owner.
     Stopped,
+    /// The station refused an ADVERTISE or SUBSCRIBE (REGISTER_ACK,
+    /// WIRE_1_0.md section 3.5): what it answered, and its reason.
+    RegisterRefused {
+        kind: frame::RegisterKind,
+        reason: String,
+    },
     /// A stream ended by a STREAM_ERROR: the peer's, the station's relay
     /// error (`relay`), or this side's own abort.
     Stream {
@@ -189,6 +188,9 @@ impl fmt::Display for LinkError {
             LinkError::Record(e) => write!(f, "record: {e}"),
             LinkError::Issuer(e) => write!(f, "{e}"),
             LinkError::Goodbye(reason) => write!(f, "the station said goodbye: {reason}"),
+            LinkError::RegisterRefused { kind, reason } => {
+                write!(f, "the station refused the {kind:?}: {reason}")
+            }
             LinkError::Confidentiality(e) => write!(f, "{e}"),
             LinkError::SealedRefused { named: Some(id) } => write!(
                 f,
@@ -299,17 +301,12 @@ struct Inner {
     self_id: [u8; 32],
     station: Station,
     station_capabilities: u64,
-    connection_hash: [u8; 48],
-    /// The handshake version the link completed: 4 or 5.
-    version: i64,
-    /// v5 liveness answers, for the probe.
+    /// Liveness answers, for the probe.
     pongs: tokio::sync::mpsc::Sender<[u8; frame::LIVENESS_NONCE_SIZE]>,
     /// A liveness_pong is being written (macula-rust#9): at most one is in
     /// flight, so a station's pings cannot pile up tasks on this link.
     pong_in_flight: AtomicBool,
     pongs_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<[u8; frame::LIVENESS_NONCE_SIZE]>>,
-    /// Orders a neighbour signature's seq with its write.
-    send_seq: tokio::sync::Mutex<u64>,
     status_deadline: AtomicI64,
     publication_seq: Arc<PublicationSeq>,
     admission: Arc<Admission>,
@@ -336,11 +333,7 @@ struct State {
 
 impl Link {
     /// Dials `cfg.target`, runs the handshake as a client, and returns the
-    /// link once the station's HELLO accepts it. It dials with version 5
-    /// unless the station refused v5 in the last 10 minutes; a station never
-    /// seen on v5 that refuses v5 with `unsupported_version` is dialled once
-    /// more, on a new connection, with v4. A station seen on v5 that answers
-    /// v4 is [`LinkError::V5DowngradeRefused`]. Each handshake is bounded by
+    /// link once the station's HELLO accepts it, within
     /// [`HANDSHAKE_TIMEOUT`].
     pub async fn dial(cfg: Config) -> Result<Link, LinkError> {
         if cfg.identity.profile() != cfg.target.profile {
@@ -365,27 +358,12 @@ impl Link {
                 "kem_advertise names a key: it needs a keyring".into(),
             ));
         }
-        let node_id = cfg.target.expected_node_id;
-        let version = versions::dial_version(&node_id, std::time::Instant::now());
-        let linked = dial_once(&cfg, version).await;
-        let v5_refused = matches!(
-            linked,
-            Err(LinkError::Handshake(HandshakeError::Refused(
-                RefusalCode::UnsupportedVersion
-            )))
-        ) && version == VERSION_5;
-        if !v5_refused {
-            return linked;
-        }
-        if !versions::unsupported_version(&node_id, std::time::Instant::now()) {
-            return Err(LinkError::V5DowngradeRefused);
-        }
-        dial_once(&cfg, VERSION).await
+        dial_once(&cfg, VERSION_5).await
     }
 
-    /// The handshake version the link completed: 4 or 5.
+    /// The handshake version the link completed.
     pub fn handshake_version(&self) -> i64 {
-        self.inner.version
+        self.inner.station.version
     }
 
     /// The node_id of the station the link reached.
@@ -502,17 +480,7 @@ async fn handshaken(
         .issuer
         .subscribe(&material.binding)
         .map_err(LinkError::Issuer)?;
-    let inner = new_inner(
-        cfg,
-        dialed,
-        control,
-        station,
-        capabilities,
-        &challenge,
-        self_id,
-    );
-    let station_node_id = inner.station.node_id;
-    versions::completed(&station_node_id, &inner)?;
+    let inner = new_inner(cfg, dialed, control, station, capabilities, self_id);
     spawn_link_tasks(&inner, statements, recv);
     Ok(Link { inner })
 }
@@ -565,7 +533,6 @@ fn new_inner(
     control: FrameWriter,
     station: Station,
     capabilities: u64,
-    challenge: &[u8],
     self_id: [u8; 32],
 ) -> Arc<Inner> {
     let (done_tx, done_rx) = watch::channel(false);
@@ -585,13 +552,10 @@ fn new_inner(
         self_id,
         status_deadline: AtomicI64::new(station.status_expires_at + STATUS_GRACE_MS),
         station_capabilities: capabilities,
-        connection_hash: Sha384::digest(challenge).into(),
-        version: station.version,
         pongs,
         pong_in_flight: AtomicBool::new(false),
         pongs_rx: tokio::sync::Mutex::new(pongs_rx),
         station,
-        send_seq: tokio::sync::Mutex::new(0),
         publication_seq: cfg.publication_seq.clone().unwrap_or_default(),
         admission: cfg
             .admission
@@ -653,30 +617,8 @@ impl Inner {
         true
     }
 
-    /// A version-2 frame on the control stream: on v5 as it is, on v4
-    /// neighbour-signed with the next seq when the profile signs its type.
+    /// A frame on the control stream, as it is.
     async fn send_control(&self, v: &Value) -> Result<(), LinkError> {
-        if self.version == VERSION_5 {
-            return self.write_control(v).await;
-        }
-        let mut seq = self.send_seq.lock().await;
-        let signed = frame::sign_neighbour(
-            v,
-            &self.key,
-            &NeighbourLink {
-                connection: self.connection_hash,
-                seq: *seq,
-            },
-        )?;
-        if frame::neighbour_signed(self.profile, &frame_type_of(v)) {
-            *seq += 1;
-        }
-        self.write_control(&signed).await
-    }
-
-    /// A frame on the control stream as it is: a data frame, which carries
-    /// its own end-to-end signature and no neighbour signature.
-    async fn write_control(&self, v: &Value) -> Result<(), LinkError> {
         let encoded =
             cbor::encode(v).map_err(|e| LinkError::Frame(FrameError::Payload(e.to_string())))?;
         self.control.write(&encoded, MAX_FRAME_BYTES).await
@@ -705,9 +647,6 @@ impl Inner {
             stream::StreamInner::end(&s, Some(err.clone()));
         }
         self.connection.close(0u32.into(), b"link ended");
-        if self.version == VERSION {
-            versions::v4_ended(&self.station.node_id, self.serial);
-        }
         let _ = self.done_tx.send_replace(true);
     }
 }
@@ -752,9 +691,22 @@ async fn send_statements(link: std::sync::Weak<Inner>, mut statements: Statement
     }
 }
 
+/// The frame types the link acts on from the station's control stream; any
+/// other is read past, counted.
+const CONTROL_FRAME_TYPES: &[&str] = &[
+    "status",
+    "liveness_ping",
+    "liveness_pong",
+    "event",
+    "result",
+    "error",
+    "call",
+    "goodbye",
+    "register_ack",
+];
+
 /// Reads the station's frames until the link ends.
 async fn read_control(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
-    let mut recv_seq = 0u64;
     let mut done = inner.done_rx.clone();
     loop {
         let payload = tokio::select! {
@@ -762,7 +714,7 @@ async fn read_control(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
             payload = read_frame(&mut recv, MAX_FRAME_BYTES) => payload,
         };
         let outcome = match payload {
-            Ok(payload) => received(&inner, &payload, &mut recv_seq),
+            Ok(payload) => received(&inner, &payload),
             Err(e) => Err(e),
         };
         if let Err(e) = outcome {
@@ -772,90 +724,110 @@ async fn read_control(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
     }
 }
 
-/// One frame from the station: a STATUS renews the station's statement, a
-/// liveness frame is answered or handed to the probe, every other frame is
-/// opened (on v4 from its neighbour signature at the next seq), and a GOODBYE
-/// ends the link.
-fn received(inner: &Arc<Inner>, payload: &[u8], recv_seq: &mut u64) -> Result<(), LinkError> {
-    let v = cbor::decode(payload).map_err(|_| LinkError::Frame(FrameError::Malformed))?;
-    let frame_type = frame_type_of(&v);
-    if frame_type == "status" {
-        let expires_at = handshake::read_status(
-            payload,
-            &Peer {
-                profile: inner.profile,
-                identity_key: inner.station.identity_key.clone(),
-                binding: inner.station.tls_binding.clone(),
-                now_ms: now_ms(),
-            },
-        )?;
-        inner
-            .status_deadline
-            .store(expires_at + STATUS_GRACE_MS, Ordering::SeqCst);
-        return Ok(());
+/// A frame from the station's control stream as wire 1.0 reads it
+/// (WIRE_1_0.md section 3): its envelope, and the frame through its type's
+/// table when it is a control frame; `None` for a type the link does not act
+/// on, counted as `wire_unknown_frame_type`.
+fn control_frame(payload: &[u8]) -> Result<Option<Envelope>, FrameError> {
+    let v = cbor::decode(payload).map_err(|_| FrameError::Malformed)?;
+    let envelope = frame::read_envelope(&v)?;
+    if frame::unknown_frame_type(&envelope, CONTROL_FRAME_TYPES).is_some() {
+        return Ok(None);
     }
-    if let Some((kind, nonce)) = liveness_frame(inner.version, &v)? {
-        return liveness(inner, kind, nonce);
+    if frame::is_control_frame(&envelope.frame_type) {
+        frame::read_control(&envelope.frame)?;
     }
-    let opened = opened(inner, &v, &frame_type, recv_seq)?;
-    match frame_type.as_str() {
-        "event" => pubsub::evented(inner, &opened),
-        "result" | "error" => call::replied(inner, &opened),
-        "call" => serve::called(inner, &opened),
+    Ok(Some(envelope))
+}
+
+/// One frame from the station, read by [`control_frame`]: one of a type the
+/// link does not act on, or with an unknown critical extension, is dropped
+/// and counted with the link left up; one that does not read ends the link.
+/// Then a STATUS renews the station's statement, a liveness frame is
+/// answered or handed to the probe, and a GOODBYE ends the link.
+fn received(inner: &Arc<Inner>, payload: &[u8]) -> Result<(), LinkError> {
+    let envelope = match control_frame(payload) {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => {
+            inner.count("unknown_frame_type");
+            return Ok(());
+        }
+        Err(FrameError::ExtensionUnsupported(_)) => {
+            inner.count("extension_unsupported");
+            return Ok(());
+        }
+        Err(e) => return Err(LinkError::Frame(e)),
+    };
+    let v = envelope.frame;
+    match envelope.frame_type.as_str() {
+        "status" => {
+            let expires_at = handshake::read_status(
+                payload,
+                &Peer {
+                    profile: inner.profile,
+                    identity_key: inner.station.identity_key.clone(),
+                    binding: inner.station.tls_binding.clone(),
+                    now_ms: now_ms(),
+                },
+            )?;
+            inner
+                .status_deadline
+                .store(expires_at + STATUS_GRACE_MS, Ordering::SeqCst);
+        }
+        "liveness_ping" | "liveness_pong" => {
+            if let Some((kind, nonce)) = frame::liveness_nonce(&v) {
+                return liveness(inner, kind, nonce);
+            }
+        }
+        "event" => pubsub::evented(inner, &v),
+        "result" | "error" => call::replied(inner, &v),
+        "call" => serve::called(inner, &v),
+        "register_ack" => registered(inner, &v)?,
         "goodbye" => {
-            let reason = match opened.get("reason") {
+            let reason = match v.get("reason") {
                 Some(Value::Text(r)) => r.clone(),
                 _ => String::new(),
             };
             return Err(LinkError::Goodbye(reason));
         }
-        _ => inner.count(&frame_type),
+        other => inner.count(other),
     }
     Ok(())
 }
 
-/// A received frame as the link reads it: on v5 with no neighbour signature,
-/// on v4 opened from its neighbour signature at the next seq.
-fn opened(
-    inner: &Inner,
-    v: &Value,
-    frame_type: &str,
-    recv_seq: &mut u64,
-) -> Result<Value, LinkError> {
-    if inner.version == VERSION_5 {
-        return Ok(frame::verify_session_frame(v)?);
-    }
-    let opened = frame::verify_neighbour(
-        v,
-        &NeighbourPeer {
-            profile: inner.profile,
-            peer_key: inner.station.identity_key.clone(),
-            connection: inner.connection_hash,
-            seq: *recv_seq,
-        },
-    )?;
-    if frame::neighbour_signed(inner.profile, frame_type) {
-        *recv_seq += 1;
-    }
-    Ok(opened)
-}
-
-/// A liveness frame as a link of `version` reads it: its kind and nonce, or
-/// `None` for any other frame. It exists only on v5, and there it is read as
-/// every v5 frame is, so one that carries a neighbour signature ends the link
-/// as malformed, as on v4 any liveness frame does.
-fn liveness_frame(
-    version: i64,
-    v: &Value,
-) -> Result<Option<(Liveness, [u8; frame::LIVENESS_NONCE_SIZE])>, LinkError> {
-    let Some(found) = frame::liveness_nonce(v) else {
-        return Ok(None);
+/// The station's REGISTER_ACK: a refused ADVERTISE of the served
+/// procedure's current record ends that serving, a refused SUBSCRIBE ends the
+/// subscription, and every ack is counted by its kind and outcome. One of a
+/// kind this crate does not know is read past, counted.
+fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
+    let Some(ack) = frame::read_register_ack(v)? else {
+        inner.count("register_ack_unknown_kind");
+        return Ok(());
     };
-    if version != VERSION_5 {
-        return Err(LinkError::Frame(FrameError::Malformed));
+    let outcome = ack.refusal.as_deref().unwrap_or("accepted");
+    inner.count(&format!("register_ack_{:?}_{outcome}", ack.kind).to_lowercase());
+    let Some(reason) = ack.refusal.clone() else {
+        return Ok(());
+    };
+    let refused = LinkError::RegisterRefused {
+        kind: ack.kind,
+        reason,
+    };
+    match (ack.kind, &ack.answered) {
+        (frame::RegisterKind::Advertise, frame::Answered::Advertisement { record_version }) => {
+            serve::advertise_refused(
+                inner,
+                &(ack.realm, ack.name.clone()),
+                record_version,
+                refused,
+            )
+        }
+        (frame::RegisterKind::Subscribe, _) => {
+            pubsub::subscribe_refused(inner, &(ack.realm, ack.name.clone()))
+        }
+        _ => {}
     }
-    frame::verify_session_frame(v)?;
-    Ok(Some(found))
+    Ok(())
 }
 
 /// Answers the station's liveness_ping with a liveness_pong of the same
@@ -933,13 +905,6 @@ async fn watch_connection(link: std::sync::Weak<Inner>) {
     }
 }
 
-fn frame_type_of(v: &Value) -> String {
-    match v.get("frame_type") {
-        Some(Value::Text(t)) => t.clone(),
-        _ => String::new(),
-    }
-}
-
 fn now_ms() -> i64 {
     crate::uuid_v7::now_ms() as i64
 }
@@ -947,14 +912,6 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn with_neighbour(v: Value) -> Value {
-        let Value::Map(mut pairs) = v else {
-            panic!("a frame is a map");
-        };
-        pairs.push((Value::text("neighbour"), Value::Map(Vec::new())));
-        Value::Map(pairs)
-    }
 
     /// macula-rust#9: a burst of pings takes one pong slot until its pong is
     /// written.
@@ -967,32 +924,69 @@ mod tests {
         assert!(pong_slot(&in_flight), "free again once the pong is written");
     }
 
-    /// macula-go 2294f25: liveness frames are read after the session-mode
-    /// check, so a neighbour-signed one ends a v5 link.
+    /// The wire 1.0 envelope vectors (macula#99): what the link does with each
+    /// frame after HELLO, on the control stream or a dedicated stream, and
+    /// with a length header alone.
     #[test]
-    fn a_liveness_frame_is_read_as_every_v5_frame_and_exists_only_on_v5() {
-        let nonce = [9; frame::LIVENESS_NONCE_SIZE];
-        let ping = frame::liveness_ping_frame(&nonce);
-        let pong = frame::liveness_pong_frame(&nonce);
-        assert_eq!(
-            liveness_frame(VERSION_5, &ping),
-            Ok(Some((Liveness::Ping, nonce)))
-        );
-        assert_eq!(
-            liveness_frame(VERSION_5, &pong),
-            Ok(Some((Liveness::Pong, nonce)))
-        );
-        for signed in [with_neighbour(ping.clone()), with_neighbour(pong.clone())] {
-            assert_eq!(
-                liveness_frame(VERSION_5, &signed),
-                Err(LinkError::Frame(FrameError::Malformed))
+    fn the_wire_1_0_envelope_vectors() {
+        let file = crate::wire_vectors::load("envelope");
+        for c in &file.cases {
+            let before = frame::wire_counters();
+            let (outcome, reason, quic_code) = envelope_verdict(c);
+            let after = frame::wire_counters();
+            assert_eq!((outcome, reason), (c.outcome(), c.reason()), "{}", c.id);
+            let code = c.expect_int("quic_code");
+            assert!(
+                code.is_none() || code == quic_code.map(i64::from),
+                "{}",
+                c.id
+            );
+            assert!(
+                counted(c.expect_text("count"), &before, &after),
+                "{}: not counted",
+                c.id
             );
         }
-        assert_eq!(
-            liveness_frame(VERSION, &ping),
-            Err(LinkError::Frame(FrameError::Malformed))
-        );
-        let goodbye = frame::goodbye_frame("bye", None).unwrap();
-        assert_eq!(liveness_frame(VERSION_5, &goodbye), Ok(None));
+    }
+
+    /// Whether the counter a case names went up; a case that names none
+    /// passes.
+    fn counted(name: &str, before: &frame::WireCounts, after: &frame::WireCounts) -> bool {
+        let ext = |w: &frame::WireCounts| w.ext_ignored.values().sum::<u64>();
+        match name {
+            "wire_unknown_frame_type" => after.unknown_frame_type > before.unknown_frame_type,
+            "wire_ext_ignored" => ext(after) > ext(before),
+            "wire_ext_refused" => {
+                let refused = |w: &frame::WireCounts| w.ext_refused.values().sum::<u64>();
+                refused(after) > refused(before)
+            }
+            _ => true,
+        }
+    }
+
+    /// The link's verdict on one envelope case, in the vectors' terms.
+    fn envelope_verdict(
+        c: &crate::wire_vectors::Case,
+    ) -> (&'static str, &'static str, Option<u32>) {
+        if c.has("length_header") {
+            let length = u32::from_be_bytes(c.hex("length_header").try_into().unwrap());
+            return match framing::length_within(length as usize, MAX_FRAME_BYTES) {
+                Ok(()) => ("accept", "", None),
+                Err(_) => ("refuse", "frame_too_large", None),
+            };
+        }
+        let payload = c.hex("frame");
+        if c.text("position") == "dedicated_stream" {
+            return match stream::unknown_on_stream(&payload) {
+                Some(code) => ("abort_stream", "", Some(code)),
+                None => ("accept", "", None),
+            };
+        }
+        match control_frame(&payload) {
+            Ok(Some(_)) => ("accept", "", None),
+            Ok(None) => ("ignore", "", None),
+            Err(FrameError::ExtensionUnsupported(_)) => ("refuse", "extension_unsupported", None),
+            Err(_) => ("refuse", "malformed_frame", None),
+        }
     }
 }

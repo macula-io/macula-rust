@@ -101,6 +101,20 @@ const PUBLICATION_TABLE: &[(&str, Rule)] = &[
     ("payload", Rule::Any),
 ];
 
+/// How a received EVENT says its publication reached this node, a per-hop
+/// enum (WIRE_1_0.md section 3.4): `plumtree` or `direct`, and any value this
+/// crate does not know reads as `direct`, counted as `wire_enum_fallback`.
+pub fn delivered_via(event: &Value) -> &'static str {
+    match event.get("delivered_via") {
+        Some(Value::Text(t)) if t == "plumtree" => "plumtree",
+        Some(Value::Text(t)) if t == "direct" => "direct",
+        _ => {
+            super::wire_counters::count_enum_fallback("delivered_via");
+            "direct"
+        }
+    }
+}
+
 /// Verifies the publication a received PUBLISH, EVENT or GOSSIP carries,
 /// under the connection's `profile` and the verifier's clock `now_ms`: the
 /// frame is exactly version, frame_type and publication, with an EVENT's
@@ -115,10 +129,7 @@ pub fn verify_publication(
     let frame_type = frame.get("frame_type").map(text_of).unwrap_or_default();
     let (extra, types): (&[(&str, Rule)], &'static [&'static str]) = match frame_type.as_str() {
         PUBLISH => (&[], &[PUBLISH]),
-        EVENT => (
-            &[("delivered_via", Rule::TextIn(&["plumtree", "direct"]))],
-            &[EVENT],
-        ),
+        EVENT => (&[("delivered_via", Rule::EnumText)], &[EVENT]),
         PLUMTREE_GOSSIP => (&[("round", Rule::ProtocolUint)], &[PLUMTREE_GOSSIP]),
         _ => return Err(FrameError::Malformed),
     };

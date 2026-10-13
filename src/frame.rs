@@ -9,22 +9,34 @@
 //! and, in pq_hybrid, a control frame's neighbour signature.
 
 mod check_payload;
-mod neighbour;
+mod control;
+mod envelope;
 mod publication;
+mod register_ack;
 mod reply;
 mod request;
 mod sealed;
 mod session;
 mod stream;
+#[cfg(test)]
+mod wire_1_0_tests;
+mod wire_counters;
 
 pub use check_payload::{
     check_frame, check_payload, FRAME_RESERVED_ELEMENTS, MAX_PAYLOAD_ELEMENTS, MAX_PAYLOAD_NESTING,
 };
-pub use neighbour::{
-    advertise_frame, goodbye_frame, neighbour_signed, sign_neighbour, subscribe_frame,
-    unadvertise_frame, unsubscribe_frame, verify_neighbour, NeighbourLink, NeighbourPeer,
+pub use control::{
+    advertise_frame, goodbye_frame, is_control_frame, read_control, subscribe_frame,
+    unadvertise_frame, unsubscribe_frame,
 };
-pub use publication::{sign_publish, verify_publication, PublicationSpec, VerifiedPublication};
+pub use envelope::{
+    act_on_ext, check_ext, read_envelope, unknown_frame_type, Envelope, MAX_EXTENSIONS,
+    MAX_EXTENSION_NAME_BYTES, MAX_FRAME_TYPE_BYTES, QUIC_CODE_UNKNOWN_FRAME_TYPE,
+};
+pub use publication::{
+    delivered_via, sign_publish, verify_publication, PublicationSpec, VerifiedPublication,
+};
+pub use register_ack::{read_register_ack, Answered, RegisterAck, RegisterKind};
 pub use reply::{
     claimed_reply_ids, sign_provider_error, sign_relay_error, sign_result,
     sign_sealed_provider_error, sign_sealed_result, verify_relay_error, verify_reply,
@@ -36,14 +48,14 @@ pub use request::{
 };
 pub use sealed::{Sealed, SEALED_SCHEME};
 pub use session::{
-    liveness_nonce, liveness_ping_frame, liveness_pong_frame, verify_session_frame, Liveness,
-    LIVENESS_NONCE_SIZE,
+    liveness_nonce, liveness_ping_frame, liveness_pong_frame, Liveness, LIVENESS_NONCE_SIZE,
 };
 pub use stream::{
     open_stream, sign_caller_stream, sign_provider_stream, verify_caller_stream,
     verify_provider_stream, StreamEncoding, StreamFields, StreamMode, StreamRole, StreamState,
     VerifiedStreamFrame,
 };
+pub use wire_counters::{wire_counters, WireCounts};
 
 use std::fmt;
 
@@ -51,8 +63,9 @@ use crate::cbor::{self, Value};
 use crate::node_key::{KeyError, NodeKey, Purpose};
 use crate::signed_object::ObjectError;
 
-/// The version field every frame carries.
-pub const PROTOCOL_VERSION: i64 = 2;
+/// The version field every frame carries: wire 1.0's frame version is its
+/// handshake version, 5 (WIRE_1_0.md section 2).
+pub const PROTOCOL_VERSION: i64 = 5;
 
 /// The CBOR payload size cap: 16 MiB minus one byte, as macula's.
 pub const MAX_FRAME_BYTES: usize = 0x00FF_FFFF;
@@ -72,6 +85,8 @@ const MAX_PROCEDURE_BYTES: usize = 512;
 const MAX_ERROR_CODE_BYTES: usize = 64;
 const MAX_ERROR_TEXT_BYTES: usize = 256;
 const MAX_TOPIC_BYTES: usize = 512;
+/// An enum value on the wire, known or not, is text of 1 to 64 bytes.
+const MAX_ENUM_VALUE_BYTES: usize = 64;
 
 /// The refusals of a frame, named as macula_frame names them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,14 +132,18 @@ pub enum FrameError {
     SeqMismatch,
     /// A stream frame after its side's STREAM_END.
     StreamEnded,
-    /// A frame given to sign that already carries a neighbour signature.
-    NeighbourSigned,
     /// A publication published too far ahead, by how many milliseconds.
     NotYetValid(i64),
     /// A publication past its expiry, by how many milliseconds.
     Expired(i64),
     /// A signed object's signature that does not verify.
     SignatureInvalid,
+    /// A frame or signed object carrying a critical extension this node does
+    /// not know, by name (`extension_unsupported`).
+    ExtensionUnsupported(String),
+    /// A signed object carrying an enum value this node does not know, naming
+    /// the field (`enum_unknown`).
+    EnumUnknown(String),
     /// A key that could not sign.
     Key(KeyError),
 }
@@ -164,13 +183,16 @@ impl fmt::Display for FrameError {
             }
             FrameError::SeqMismatch => f.write_str("a stream frame out of its side's order"),
             FrameError::StreamEnded => f.write_str("a stream frame after its side's STREAM_END"),
-            FrameError::NeighbourSigned => {
-                f.write_str("the frame already carries a neighbour signature")
-            }
             FrameError::NotYetValid(ms) => write!(f, "a publication not yet valid, by {ms} ms"),
             FrameError::Expired(ms) => write!(f, "a publication past its expiry, by {ms} ms"),
             FrameError::SignatureInvalid => {
                 f.write_str("the signed object's signature does not verify")
+            }
+            FrameError::ExtensionUnsupported(name) => {
+                write!(f, "a critical extension this node does not know: {name}")
+            }
+            FrameError::EnumUnknown(field) => {
+                write!(f, "an enum value this node does not know, in {field}")
             }
             FrameError::Key(e) => write!(f, "{e}"),
         }
@@ -246,6 +268,11 @@ enum Rule {
     StreamObject,
     Proofs,
     Sealed(sealed::SealedContext),
+    /// An enum value's shape, known or not: text of 1 to 64 bytes. Whether
+    /// the value is known is its reader's next check (WIRE_1_0.md 3.4).
+    EnumText,
+    /// The unsigned 0 or 1.
+    ZeroOrOne,
 }
 
 impl Rule {
@@ -265,6 +292,10 @@ impl Rule {
             Rule::StreamObject => Rule::CarriedObject.accepts(v) || Rule::HeldObject.accepts(v),
             Rule::Proofs => request::proofs_within_bound(v),
             Rule::Sealed(context) => sealed::read_sealed(v, context).is_some(),
+            Rule::ZeroOrOne => matches!(v, Value::Int(0 | 1)),
+            Rule::EnumText => {
+                matches!(v, Value::Text(t) if !t.is_empty() && t.len() <= MAX_ENUM_VALUE_BYTES)
+            }
         }
     }
 }
@@ -293,6 +324,19 @@ fn read_fields(v: &Value, table: &[(&str, Rule)]) -> Option<Fields> {
     Some(fields)
 }
 
+/// Refuses a signed object whose `field` holds an enum value outside `known`
+/// as [`FrameError::EnumUnknown`] naming the field (WIRE_1_0.md section 3.4):
+/// inside a tbs an unknown value refuses that object, never the link. An
+/// absent field is not judged here.
+fn tbs_enum(fields: &Fields, field: &str, known: &[&str]) -> Result<(), FrameError> {
+    match fields.get(field) {
+        Some(Value::Text(t)) if !known.contains(&t.as_str()) => {
+            Err(FrameError::EnumUnknown(field.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn has_fields(fields: &Fields, names: &[&str]) -> bool {
     names.iter().all(|n| fields.contains_key(*n))
 }
@@ -311,6 +355,8 @@ fn received_frame(
     let mut table = vec![
         ("version", Rule::ProtocolVersion),
         ("frame_type", Rule::TextIn(types)),
+        ("frame_id", Rule::BytesOf(16)),
+        ("sent_at_ms", Rule::ProtocolUint),
         (object_name, object_rule),
     ];
     table.extend_from_slice(routes);
@@ -390,19 +436,15 @@ fn names_request(fields: &Fields, request: &VerifiedRequest) -> bool {
         && fields.get("request_hash") == Some(&Value::Bytes(request.request_hash.to_vec()))
 }
 
-/// The envelope a control frame carries, as macula_frame's base/2: version,
-/// frame_type, a fresh frame_id (UUID v7), sent_at_ms, capabilities, and the
-/// null realm, call_id and source_route.
+/// The envelope a control frame carries (WIRE_1_0.md section 3.1): version,
+/// frame_type, a fresh frame_id (UUID v7) and sent_at_ms. A key the frame has
+/// no value for is left out, so one frame has one encoding.
 fn base(frame_type: &str) -> Vec<(Value, Value)> {
     vec![
         entry("version", Value::Int(i128::from(PROTOCOL_VERSION))),
         entry("frame_type", Value::text(frame_type)),
         entry("frame_id", Value::Bytes(crate::uuid_v7::new().to_vec())),
         entry("sent_at_ms", uint(crate::uuid_v7::now_ms())),
-        entry("capabilities", uint(0)),
-        entry("realm", Value::Null),
-        entry("call_id", Value::Null),
-        entry("source_route", Value::Null),
     ]
 }
 

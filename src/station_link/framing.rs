@@ -7,8 +7,8 @@ use super::LinkError;
 /// A handshake frame (OPENER, CHALLENGE, CONNECT, HELLO) is at most 64 KiB.
 pub(super) const HANDSHAKE_FRAME_BYTES: usize = 64 * 1024;
 
-/// Every frame after HELLO is at most 16 MiB.
-pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Every frame after HELLO is at most 16 MiB minus one byte.
+pub(super) const MAX_FRAME_BYTES: usize = crate::frame::MAX_FRAME_BYTES;
 
 /// The next frame's CBOR bytes, refusing a length header over `max`.
 pub(super) async fn read_frame(
@@ -20,14 +20,20 @@ pub(super) async fn read_frame(
         .await
         .map_err(|e| LinkError::Io(e.to_string()))?;
     let length = u32::from_be_bytes(header) as usize;
-    if length > max {
-        return Err(LinkError::FrameTooLarge(length));
-    }
+    length_within(length, max)?;
     let mut payload = vec![0u8; length];
     recv.read_exact(&mut payload)
         .await
         .map_err(|e| LinkError::Io(e.to_string()))?;
     Ok(payload)
+}
+
+/// Refuses a length header over `max`, read from the four header bytes alone.
+pub(super) fn length_within(length: usize, max: usize) -> Result<(), LinkError> {
+    if length > max {
+        return Err(LinkError::FrameTooLarge(length));
+    }
+    Ok(())
 }
 
 /// A stream's sending side, writing one frame at a time.
@@ -65,6 +71,11 @@ impl FrameWriter {
 
     /// Resets the sending side, dropping what it still holds.
     pub(super) async fn reset(&self) {
-        let _ = self.send.lock().await.reset(0u32.into());
+        self.reset_with(0).await;
+    }
+
+    /// Resets the sending side with the QUIC application code `code`.
+    pub(super) async fn reset_with(&self, code: u32) {
+        let _ = self.send.lock().await.reset(code.into());
     }
 }

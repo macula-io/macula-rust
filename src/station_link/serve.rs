@@ -442,6 +442,28 @@ impl ServedInner {
     }
 }
 
+/// Ends the serving of `key` with `refused` when the station refused the
+/// ADVERTISE of its current record, `record_version`; an ack for an older
+/// record is not this serving's.
+pub(super) fn advertise_refused(
+    inner: &Inner,
+    key: &([u8; 32], String),
+    record_version: &[u8; 16],
+    refused: LinkError,
+) {
+    let Some(served) = inner.lock().served.get(key).cloned() else {
+        return;
+    };
+    let current = served
+        .latest
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .version;
+    if &current == record_version {
+        served.end(refused);
+    }
+}
+
 /// Sends a fresh advertisement at half the current one's lifetime. A renewal
 /// that fails is tried again every [`REFRESH_RETRY`] while the current one
 /// lives; when it lapses unrenewed, the procedure is no longer served and its
@@ -827,7 +849,7 @@ fn provider_error(
 }
 
 async fn send_reply(inner: &Inner, reply: Value) {
-    let _ = inner.write_control(&reply).await;
+    let _ = inner.send_control(&reply).await;
 }
 
 /// `text` cut to 256 bytes on a character boundary.

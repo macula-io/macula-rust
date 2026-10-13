@@ -203,7 +203,10 @@ fn request_frame(frame_type: RequestType, spec: &RequestSpec, request: Value) ->
     Value::Map(frame)
 }
 
-const REQUEST_ROUTES: &[(&str, Rule)] = &[
+/// The stream modes a STREAM_OPEN names.
+const STREAM_MODES: &[&str] = &["server_stream", "client_stream", "bidi"];
+
+pub(super) const REQUEST_ROUTES: &[(&str, Rule)] = &[
     ("source_route", Rule::AnyBytes),
     ("retry_budget", Rule::ProtocolUint),
 ];
@@ -247,6 +250,7 @@ pub fn verify_request(frame: &Value, profile: Profile) -> Result<VerifiedRequest
     {
         return Err(FrameError::Malformed);
     }
+    super::tbs_enum(&fields, "mode", STREAM_MODES)?;
     let request = VerifiedRequest {
         frame_type,
         request_hash: Sha384::digest(&verified.tbs).into(),
@@ -292,10 +296,7 @@ fn request_table(frame_type: RequestType) -> Vec<(&'static str, Rule)> {
         ("deadline", Rule::ProtocolUint),
         ("payload", Rule::Any),
         ("sealed", Rule::Sealed(SealedContext::Request)),
-        (
-            "mode",
-            Rule::TextIn(&["server_stream", "client_stream", "bidi"]),
-        ),
+        ("mode", Rule::EnumText),
         ("token", Rule::AnyBytes),
         ("proofs", Rule::Proofs),
     ]

@@ -23,3 +23,5 @@ pub mod station_link;
 pub mod transport;
 pub mod ucan;
 mod uuid_v7;
+#[cfg(test)]
+mod wire_vectors;

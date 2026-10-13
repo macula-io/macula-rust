@@ -11,7 +11,6 @@ use tokio::sync::oneshot;
 
 use crate::cbor::Value;
 use crate::frame::{self, RequestSpec, VerifiedRequest};
-use crate::handshake::VERSION_5;
 
 use super::confidential::{reply_outcome, sealed_request, stated, CallSeal, Seal};
 use super::{now_ms, Inner, Link, LinkError};
@@ -24,7 +23,6 @@ pub const MAX_CALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 const LIVENESS_EVERY: Duration = Duration::from_secs(30);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
-const LIVENESS_PROCEDURE: &str = "_macula.ping";
 
 /// One request: the realm and procedure, the node it targets (the station
 /// itself when zero, as for `_dht.*`; the provider's node_id otherwise), its
@@ -123,7 +121,7 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     let forget = || {
         inner.lock().pending.remove(&request_id);
     };
-    if let Err(e) = inner.write_control(&signed).await {
+    if let Err(e) = inner.send_control(&signed).await {
         forget();
         return Err(e);
     }
@@ -233,19 +231,7 @@ pub(super) async fn probe(link: Weak<Inner>) {
             _ = tokio::time::sleep(LIVENESS_EVERY) => {}
         }
         let Some(inner) = link.upgrade() else { return };
-        let outcome = match inner.version {
-            VERSION_5 => probe_v5(&inner).await,
-            _ => call(
-                &inner,
-                Call {
-                    procedure: LIVENESS_PROCEDURE.to_string(),
-                    timeout: LIVENESS_TIMEOUT,
-                    ..Call::default()
-                },
-            )
-            .await
-            .map(|_| ()),
-        };
+        let outcome = probe_once(&inner).await;
         misses = if matches!(outcome, Err(LinkError::CallTimeout)) {
             misses + 1
         } else {
@@ -258,9 +244,9 @@ pub(super) async fn probe(link: Weak<Inner>) {
     }
 }
 
-/// One v5 liveness probe: answered when a liveness_pong of its nonce arrives
+/// One liveness probe: answered when a liveness_pong of its nonce arrives
 /// within [`LIVENESS_TIMEOUT`], [`LinkError::CallTimeout`] when none does.
-async fn probe_v5(inner: &Inner) -> Result<(), LinkError> {
+async fn probe_once(inner: &Inner) -> Result<(), LinkError> {
     let mut nonce = [0u8; frame::LIVENESS_NONCE_SIZE];
     aws_lc_rs::rand::fill(&mut nonce).map_err(|_| LinkError::Io("no randomness".into()))?;
     let mut pongs = inner.pongs_rx.lock().await;
