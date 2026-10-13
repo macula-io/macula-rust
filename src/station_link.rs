@@ -119,6 +119,11 @@ pub enum LinkError {
     Relay { reported_by: [u8; 32], code: String },
     /// A find_record the station answered not_found.
     RecordNotFound,
+    /// A put_record the station refused, by the custodian's refusal name.
+    RecordRefused(String),
+    /// A `_dht.*` reply of a version this crate does not read
+    /// (`reply_version_unsupported`).
+    ReplyVersionUnsupported,
     /// A station reply to a DHT call in a shape that call never answers with.
     UnexpectedReply(String),
     /// An offer without exactly one handler, or an org procedure's without
