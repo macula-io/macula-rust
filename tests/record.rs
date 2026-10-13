@@ -287,9 +287,6 @@ fn own_namespace_fixtures_reach_macula_s_verdicts() {
         ))
         .unwrap();
         let now_ms = v["now_ms"].as_i64().unwrap();
-        if refused_as_pre_1_0(&wire, profile, now_ms) {
-            continue;
-        }
         let record = verify(&wire, profile, now_ms).unwrap();
         assert_eq!(
             read_procedure_advertisement(record.record())
@@ -313,26 +310,6 @@ fn own_namespace_fixtures_reach_macula_s_verdicts() {
             "{file} verify_authorization"
         );
     }
-}
-
-/// Whether `wire` is a record macula signed before wire 1.0, no schema in
-/// its tbs, which a wire 1.0 reader refuses as malformed. The shared fixtures
-/// replayed here are still pre-1.0 until macula regenerates them (reported on
-/// macula#97); each such record must be refused, and once a fixture is
-/// regenerated it is held to its verdicts again.
-fn refused_as_pre_1_0(wire: &[u8], profile: Profile, now_ms: i64) -> bool {
-    let object = cbor::decode(wire).unwrap();
-    let Some(Value::Bytes(tbs)) = object.get("tbs") else {
-        return false;
-    };
-    if cbor::decode(tbs).unwrap().get("schema").is_some() {
-        return false;
-    }
-    assert!(matches!(
-        verify(wire, profile, now_ms),
-        Err(RecordError::Malformed(_))
-    ));
-    true
 }
 
 /// A record signed by hand, as the realm and org sign theirs: a signed object
@@ -736,9 +713,6 @@ fn macula_s_keyed_advertisements_verify_as_macula_rules() {
 fn keyed_advertisement_case(name: &str, profile: Profile, now_ms: i64, case: &serde_json::Value) {
     let what = format!("{name} {}", case["name"]);
     let wire = hex::decode(case["record"].as_str().unwrap()).unwrap();
-    if refused_as_pre_1_0(&wire, profile, now_ms) {
-        return;
-    }
     let verified = verify(&wire, profile, now_ms);
     match case["verdict"].as_str().unwrap() {
         "accepted" => {
