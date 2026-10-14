@@ -49,7 +49,11 @@ impl TryFrom<Event> for FfiEvent {
                 return Err(FfiError::UnrepresentableValue {
                     message: format!(
                         "a sealed group event under epoch {} (the FFI has no group API)",
-                        sealed.key_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                        sealed
+                            .key_id
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
                     ),
                 })
             }

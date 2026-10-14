@@ -242,17 +242,34 @@ impl Held {
     fn spend(&mut self, publisher: [u8; 32], now: i64) -> bool {
         match self.budget.get(&publisher).copied() {
             None => {
-                self.budget.insert(publisher, Budget { since: now, count: 1 });
+                self.budget.insert(
+                    publisher,
+                    Budget {
+                        since: now,
+                        count: 1,
+                    },
+                );
                 true
             }
             Some(b) if now - b.since >= self.rotation => {
-                self.budget.insert(publisher, Budget { since: now, count: 1 });
+                self.budget.insert(
+                    publisher,
+                    Budget {
+                        since: now,
+                        count: 1,
+                    },
+                );
                 true
             }
             Some(b) if b.count >= UNKNOWN_IDS_PER_PUBLISHER => false,
             Some(b) => {
-                self.budget
-                    .insert(publisher, Budget { since: b.since, count: b.count + 1 });
+                self.budget.insert(
+                    publisher,
+                    Budget {
+                        since: b.since,
+                        count: b.count + 1,
+                    },
+                );
                 true
             }
         }
@@ -328,11 +345,7 @@ impl Keyring {
     /// The epoch a publisher seals under now: the newest held epoch that has
     /// started and has not stopped publishing. With none, the group is pulled
     /// at once, and the publish fails closed with that pull's error.
-    pub async fn publish_epoch(
-        &self,
-        realm: [u8; 32],
-        prefix: &str,
-    ) -> Result<Epoch, GroupError> {
+    pub async fn publish_epoch(&self, realm: [u8; 32], prefix: &str) -> Result<Epoch, GroupError> {
         self.inner.publish_epoch(realm, prefix).await
     }
 
@@ -385,7 +398,10 @@ impl Inner {
         if state.closed {
             return Err(GroupError::NotJoined);
         }
-        state.groups.entry(key.clone()).or_insert_with(|| Joined::new(held));
+        state
+            .groups
+            .entry(key.clone())
+            .or_insert_with(|| Joined::new(held));
         drop(state);
         self.schedule(&key);
         Ok(policy)
@@ -404,9 +420,7 @@ impl Inner {
             .iter()
             .filter(|((r, prefix), _)| *r == realm && under(topic, prefix))
             .max_by_key(|((_, prefix), _)| prefix.len())
-            .and_then(|((_, prefix), joined)| {
-                joined.held.policy.map(|p| (prefix.clone(), p))
-            })
+            .and_then(|((_, prefix), joined)| joined.held.policy.map(|p| (prefix.clone(), p)))
     }
 
     async fn publish_epoch(
@@ -476,7 +490,11 @@ impl Inner {
         let now = (self.opts.now)();
         let mut state = self.lock();
         let joined = state.groups.get_mut(key).ok_or(GroupError::NotJoined)?;
-        let remembered = joined.held.unknown.get(&id).is_some_and(|until| *until > now);
+        let remembered = joined
+            .held
+            .unknown
+            .get(&id)
+            .is_some_and(|until| *until > now);
         if remembered || !joined.held.spend(publisher, now) {
             return Err(GroupError::of(Reason::UnknownEpoch));
         }
@@ -550,23 +568,20 @@ impl Inner {
         let now = (self.opts.now)();
         let state = self.lock();
         let joined = state.groups.get(key).ok_or(GroupError::NotJoined)?;
-        Ok(match joined.held.epochs.iter().find(|epoch| epoch.id == id) {
-            Some(epoch) if epoch.acceptable(now) => Known::Held(epoch.clone()),
-            Some(_) => Known::Expired,
-            None => Known::Unknown,
-        })
+        Ok(
+            match joined.held.epochs.iter().find(|epoch| epoch.id == id) {
+                Some(epoch) if epoch.acceptable(now) => Known::Held(epoch.clone()),
+                Some(_) => Known::Expired,
+                None => Known::Unknown,
+            },
+        )
     }
 
     /// Makes one pull: under the group's grant, at its pinned distributor when
     /// it has one, within the pull timeout. The group is not touched here; the
     /// caller applies what comes back, under the lock, so the group and the
     /// policy it carries stay where they are for the whole of the pull.
-    async fn pull(
-        self: &Arc<Self>,
-        key: &GroupKey,
-        request: &Request,
-        payload: Value,
-    ) -> Outcome {
+    async fn pull(self: &Arc<Self>, key: &GroupKey, request: &Request, payload: Value) -> Outcome {
         let pull = Pull {
             realm: key.0,
             procedure: procedure(&request.org),
@@ -574,14 +589,13 @@ impl Inner {
             token: request.ucan.clone(),
             provider: request.provider,
         };
-        let answer = match tokio::time::timeout(self.opts.pull_timeout, (self.opts.pull)(pull))
-            .await
-        {
-            Ok(answer) => answer,
-            Err(_) => {
-                return Outcome::Failed(GroupError::caused_by(Reason::NoDistributor, Elapsed))
-            }
-        };
+        let answer =
+            match tokio::time::timeout(self.opts.pull_timeout, (self.opts.pull)(pull)).await {
+                Ok(answer) => answer,
+                Err(_) => {
+                    return Outcome::Failed(GroupError::caused_by(Reason::NoDistributor, Elapsed))
+                }
+            };
         match answer {
             Ok((mut result, provider)) => {
                 // A reply that is not the protocol's is no distributor's, as
@@ -595,12 +609,10 @@ impl Inner {
                     Err(e) => Outcome::Failed(GroupError::caused_by(Reason::NoDistributor, e)),
                 }
             }
-            Err(PullError::NotAdvertised(cause)) => {
-                Outcome::NotAdvertised(GroupError::Refused {
-                    reason: Reason::NoDistributor,
-                    cause: Some(cause),
-                })
-            }
+            Err(PullError::NotAdvertised(cause)) => Outcome::NotAdvertised(GroupError::Refused {
+                reason: Reason::NoDistributor,
+                cause: Some(cause),
+            }),
             Err(PullError::Refused { reason, cause }) => {
                 Outcome::Failed(GroupError::Refused { reason, cause })
             }
@@ -633,7 +645,11 @@ impl Inner {
     /// and the keyring is open.
     fn current_generation(&self, key: &GroupKey, generation: u64) -> bool {
         let state = self.lock();
-        !state.closed && state.groups.get(key).is_some_and(|j| j.generation == generation)
+        !state.closed
+            && state
+                .groups
+                .get(key)
+                .is_some_and(|j| j.generation == generation)
     }
 
     /// Sets the group's one re-pull, at a random instant in its newest
@@ -979,7 +995,9 @@ mod tests {
 
         // The policy reads without a pull, and covers every topic under the
         // prefix and no other.
-        let (prefix, policy) = keyring.policy([7; 32], &format!("{PREFIX}/room/said_v1")).unwrap();
+        let (prefix, policy) = keyring
+            .policy([7; 32], &format!("{PREFIX}/room/said_v1"))
+            .unwrap();
         assert_eq!((prefix.as_str(), policy), (PREFIX, Policy::Required));
         assert!(keyring.policy([7; 32], "io.macula/acme/chatter").is_none());
         assert!(keyring.policy([8; 32], PREFIX).is_none());
@@ -995,7 +1013,10 @@ mod tests {
             answered(Policy::Required, vec![epoch(2, 0)]),
         ]);
         let keyring = keyring(&fake, &clock());
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
         let epoch = keyring.publish_epoch([7; 32], PREFIX).await.unwrap();
         assert_eq!(epoch.id, [1; ID_SIZE]);
         assert_eq!(fake.asked(), 1, "a held epoch is published under at once");
@@ -1012,7 +1033,10 @@ mod tests {
         }
         let fake = Fake::with(answers);
         let keyring = keyring(&fake, &clock());
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
 
         for id in [4u8, 5, 6] {
             assert_eq!(opened(&keyring, id).await.id, [id; ID_SIZE]);
@@ -1040,7 +1064,10 @@ mod tests {
             }),
         ]);
         let keyring = keyring(&fake, &clock());
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
 
         let refused = keyring
             .open_epoch([7; 32], PREFIX, [4; ID_SIZE], PUBLISHER)
@@ -1164,7 +1191,10 @@ mod tests {
             }),
         ]);
         let keyring = keyring(&fake, &now);
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
 
         let refused = keyring
             .open_epoch([7; 32], PREFIX, [1; ID_SIZE], PUBLISHER)
@@ -1212,7 +1242,10 @@ mod tests {
             answered(Policy::Required, vec![epoch(2, 0)]),
         ]);
         let keyring = keyring(&fake, &clock());
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
 
         run_scheduled_repull(&keyring).await;
         assert_eq!(backoff(&keyring), 2_000, "the first backoff doubles");
@@ -1243,7 +1276,10 @@ mod tests {
             Err(PullError::NotAdvertised(Box::new(NoAnswer))),
         ]);
         let keyring = keyring(&fake, &now);
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
         assert_eq!(
             fake.last_asked().provider,
             None,
@@ -1268,7 +1304,10 @@ mod tests {
     async fn leaving_a_group_erases_its_keys() {
         let fake = Fake::with(vec![answered(Policy::Required, vec![epoch(1, 60_000)])]);
         let keyring = keyring(&fake, &clock());
-        keyring.join([7; 32], PREFIX, joined(Vec::new())).await.unwrap();
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
         keyring.leave([7; 32], PREFIX);
         assert!(keyring.policy([7; 32], PREFIX).is_none());
         assert!(matches!(

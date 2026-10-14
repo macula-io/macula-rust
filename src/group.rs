@@ -24,9 +24,10 @@ pub use epoch::{
     EVENT_LIFE_MS, ID_SIZE, KEY_SIZE, TOLERANCE_MS,
 };
 pub use event::{open_event, seal_event, Fields};
-pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};pub use wire::{by_id_request, current_request, parse_reply, procedure, Policy, Reply};
+pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};
 #[cfg(test)]
 pub(crate) use wire::reply_value;
+pub use wire::{by_id_request, current_request, parse_reply, procedure, Policy, Reply};
 
 /// The sealed group a publish or a subscribe is under: its prefix, which the
 /// topic must be under and whose second segment is its org; the org's grant,
@@ -148,7 +149,10 @@ pub enum GroupError {
     /// a subscription the station refused.
     Pool(Cause),
     /// A refusal or a failure by its reason, with whatever caused it.
-    Refused { reason: Reason, cause: Option<Cause> },
+    Refused {
+        reason: Reason,
+        cause: Option<Cause>,
+    },
 }
 
 /// What caused a group error, when something did.
@@ -263,7 +267,10 @@ mod tests {
             "unknown_epoch",
             "epoch_expired",
         ] {
-            assert_eq!(Reason::from_refusal(refusal).map(Reason::name), Some(refusal));
+            assert_eq!(
+                Reason::from_refusal(refusal).map(Reason::name),
+                Some(refusal)
+            );
         }
         assert_eq!(
             Reason::from_refusal("unknown_group"),

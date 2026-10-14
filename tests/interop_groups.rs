@@ -57,7 +57,10 @@ async fn pool() -> (Pool, [u8; 32]) {
     let key = Arc::new(NodeKey::generate_identity(profile, PUZZLE_DIFFICULTY).unwrap());
     let mut opts = Opts::new(key);
     opts.connect_timeout = Duration::from_secs(60);
-    opts.realm_trust = HashMap::from([(realm, hex::decode(var("MACULA_RUST_GROUPS_REALM_KEY")).unwrap())]);
+    opts.realm_trust = HashMap::from([(
+        realm,
+        hex::decode(var("MACULA_RUST_GROUPS_REALM_KEY")).unwrap(),
+    )]);
     let pool = Pool::connect(
         vec![Seed {
             host: host.to_string(),

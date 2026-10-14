@@ -23,8 +23,8 @@ mod pubsub;
 mod serve;
 
 pub use crate::station_link::Confidentiality;
-pub use crate::station_link::{ConfidentialityError, ConfidentialityReason, Report, ReportError};
 use crate::station_link::SignedPublication;
+pub use crate::station_link::{ConfidentialityError, ConfidentialityReason, Report, ReportError};
 pub use call::{Call, Provider, StreamCall};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;
@@ -383,7 +383,13 @@ impl Pool {
             return;
         };
         self.inner.ticks.abort();
-        if let Some(groups) = self.inner.groups.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        if let Some(groups) = self
+            .inner
+            .groups
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             groups.close();
         }
         for m in &members {

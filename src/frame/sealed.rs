@@ -79,7 +79,11 @@ impl Sealed {
             (SealedContext::Request, Some(kem_ct), None) => {
                 kem_ct.len() == KEM_CT_PURE_SIZE || kem_ct.len() == KEM_CT_HYBRID_SIZE
             }
-            (SealedContext::Reply | SealedContext::ProviderStream | SealedContext::GroupEvent, None, Some(_)) => true,
+            (
+                SealedContext::Reply | SealedContext::ProviderStream | SealedContext::GroupEvent,
+                None,
+                Some(_),
+            ) => true,
             (SealedContext::CallerStream, None, None) => true,
             _ => false,
         }
@@ -202,7 +206,8 @@ mod tests {
     }
 
     #[test]
-    fn a_sealed_map_with_a_key_the_table_cannot_name_is_not_one() {        let Value::Map(mut extra) = sealed(None, Some(12)).value() else {
+    fn a_sealed_map_with_a_key_the_table_cannot_name_is_not_one() {
+        let Value::Map(mut extra) = sealed(None, Some(12)).value() else {
             unreachable!()
         };
         extra.push(entry("payload", Value::Null));

@@ -165,6 +165,9 @@ fn the_refusals_are_the_closed_set() {
     for r in refusals {
         let name = r.as_str().unwrap();
         let reason = Reason::from_refusal(name).unwrap_or_else(|| panic!("no reason {name}"));
-        assert_eq!(reason.name(), name.replace("unknown_group", "no_distributor"));
+        assert_eq!(
+            reason.name(),
+            name.replace("unknown_group", "no_distributor")
+        );
     }
 }

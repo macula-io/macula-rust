@@ -5,7 +5,7 @@
 
 use crate::cbor::Value;
 
-use super::{Epoch, GroupError, ID_SIZE, KEY_SIZE, EVENT_LIFE_MS};
+use super::{Epoch, GroupError, EVENT_LIFE_MS, ID_SIZE, KEY_SIZE};
 
 /// A group's policy as its distributor answers it: required refuses clear
 /// events under the prefix, preferred seals and accepts clear ones, off
@@ -124,7 +124,10 @@ pub(crate) fn reply_value(r: &Reply) -> Value {
             Value::Map(vec![
                 (Value::text("id"), Value::Bytes(e.id.to_vec())),
                 (Value::text("key"), Value::Bytes(e.key().to_vec())),
-                (Value::text("issued_at"), Value::Int(i128::from(e.issued_at))),
+                (
+                    Value::text("issued_at"),
+                    Value::Int(i128::from(e.issued_at)),
+                ),
                 (
                     Value::text("publish_until"),
                     Value::Int(i128::from(e.publish_until)),
@@ -155,13 +158,7 @@ fn epoch_of(v: &Value) -> Option<Epoch> {
     if issued_at >= publish_until || accept_until != publish_until + EVENT_LIFE_MS {
         return None;
     }
-    Some(Epoch::new(
-        id,
-        key,
-        issued_at,
-        publish_until,
-        accept_until,
-    ))
+    Some(Epoch::new(id, key, issued_at, publish_until, accept_until))
 }
 
 /// Wipes every byte string a reply carries: an epoch key travels as one, and
@@ -245,10 +242,7 @@ mod tests {
     }
 
     fn is_malformed(reply: &Value) -> bool {
-        matches!(
-            parse_reply(PREFIX, reply),
-            Err(GroupError::MalformedReply)
-        )
+        matches!(parse_reply(PREFIX, reply), Err(GroupError::MalformedReply))
     }
 
     /// A reply of the protocol's reads back, and re-encodes to the same
@@ -313,7 +307,11 @@ mod tests {
             let mut epoch_pairs = pairs_of(&an_epoch);
             set(&mut epoch_pairs, field, value.clone());
             let mut pairs = pairs_of(&base);
-            set(&mut pairs, "epochs", Value::List(vec![Value::Map(epoch_pairs)]));
+            set(
+                &mut pairs,
+                "epochs",
+                Value::List(vec![Value::Map(epoch_pairs)]),
+            );
             assert!(
                 is_malformed(&Value::Map(pairs)),
                 "a reply whose epoch's {field} is {value:?}"

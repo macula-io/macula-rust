@@ -57,7 +57,10 @@ impl PoolInner {
 
     /// The pool's keyring, `None` while no group was ever joined.
     pub(super) fn held_groups(&self) -> Option<Keyring> {
-        self.groups.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.groups
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// One key pull: a call sealed to the distributor's own KEM key, never in
@@ -105,10 +108,7 @@ fn group_puller(inner: &Arc<PoolInner>) -> group::Puller {
 }
 
 /// One pull, and `PoolClosed` when the pool went while it was in flight.
-async fn pull_through(
-    pool: Weak<PoolInner>,
-    pull: Pull,
-) -> Result<(Value, [u8; 32]), PullError> {
+async fn pull_through(pool: Weak<PoolInner>, pull: Pull) -> Result<(Value, [u8; 32]), PullError> {
     let pool = pool
         .upgrade()
         .ok_or_else(|| PullError::Failed(Box::new(PoolClosed)))?;
@@ -391,7 +391,9 @@ mod tests {
     }
 
     /// The one answer a test distributor gives.
-    async fn canned(reply: crate::cbor::Value) -> Result<(crate::cbor::Value, [u8; 32]), PullError> {
+    async fn canned(
+        reply: crate::cbor::Value,
+    ) -> Result<(crate::cbor::Value, [u8; 32]), PullError> {
         Ok((reply, PROVIDER))
     }
 
@@ -470,13 +472,9 @@ mod tests {
         assert_eq!(turns.load(Ordering::SeqCst), 2, "the by-id pull went out");
 
         assert!(
-            open_delivered(
-                &keyring,
-                None,
-                event(Payload::Clear(Value::text("forged")))
-            )
-            .await
-            .is_none(),
+            open_delivered(&keyring, None, event(Payload::Clear(Value::text("forged"))))
+                .await
+                .is_none(),
             "a plain subscription refuses it while the pull is out too"
         );
 
@@ -529,13 +527,9 @@ mod tests {
     async fn a_required_group_refuses_a_clear_event_on_a_plain_subscription() {
         let keyring = keyring(Policy::Required).await;
         assert!(
-            open_delivered(
-                &keyring,
-                None,
-                event(Payload::Clear(Value::text("forged")))
-            )
-            .await
-            .is_none(),
+            open_delivered(&keyring, None, event(Payload::Clear(Value::text("forged"))))
+                .await
+                .is_none(),
             "a plain subscription refuses a clear event under the held prefix"
         );
 
@@ -552,13 +546,9 @@ mod tests {
     #[tokio::test]
     async fn a_plain_subscription_takes_a_clear_event_under_a_preferred_group() {
         let keyring = keyring(Policy::Preferred).await;
-        let delivered = open_delivered(
-            &keyring,
-            None,
-            event(Payload::Clear(Value::text("clear"))),
-        )
-        .await
-        .expect("a preferred group does not refuse it");
+        let delivered = open_delivered(&keyring, None, event(Payload::Clear(Value::text("clear"))))
+            .await
+            .expect("a preferred group does not refuse it");
         assert_eq!(delivered.payload, Payload::Clear(Value::text("clear")));
         assert_eq!(delivered.unopened, None);
     }
@@ -599,13 +589,19 @@ mod tests {
     async fn a_sealed_event_that_does_not_open_is_delivered_unopened() {
         let keyring = keyring(Policy::Required).await;
         // Sealed under another topic's AAD, so it cannot open under this one.
-        let sealed =
-            seal_event(&our_epoch(), &fields("io.macula/acme/chat/other_v1"), &Value::text("x"))
-                .unwrap();
-        let delivered =
-            open_delivered(&keyring, Some(PREFIX), event(Payload::Sealed(sealed.clone())))
-                .await
-                .expect("an event that does not open is still delivered");
+        let sealed = seal_event(
+            &our_epoch(),
+            &fields("io.macula/acme/chat/other_v1"),
+            &Value::text("x"),
+        )
+        .unwrap();
+        let delivered = open_delivered(
+            &keyring,
+            Some(PREFIX),
+            event(Payload::Sealed(sealed.clone())),
+        )
+        .await
+        .expect("an event that does not open is still delivered");
         assert_eq!(delivered.unopened, Some(Reason::TagInvalid));
         assert_eq!(
             delivered.seal_key_id,

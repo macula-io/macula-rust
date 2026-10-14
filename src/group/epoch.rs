@@ -67,10 +67,7 @@ impl Epoch {
     /// publishing stretch, when a pull is also handed the next epoch and every
     /// holder re-pulls.
     pub fn ahead_window(&self) -> (i64, i64) {
-        (
-            self.publish_until - self.rotation() / 3,
-            self.publish_until,
-        )
+        (self.publish_until - self.rotation() / 3, self.publish_until)
     }
 
     /// The instant a holder re-pulls: `fraction` of the way through the ahead
@@ -172,7 +169,13 @@ mod tests {
     use super::*;
 
     fn epoch() -> Epoch {
-        Epoch::new([7; ID_SIZE], [9; KEY_SIZE], 1_000, 1_000 + DEFAULT_ROTATE_AFTER_MS, 1_000 + EVENT_LIFE_MS)
+        Epoch::new(
+            [7; ID_SIZE],
+            [9; KEY_SIZE],
+            1_000,
+            1_000 + DEFAULT_ROTATE_AFTER_MS,
+            1_000 + EVENT_LIFE_MS,
+        )
     }
 
     /// The ahead window is the last third of the publishing stretch, and a
@@ -203,7 +206,13 @@ mod tests {
     #[test]
     fn publishing_picks_the_newest_live_epoch() {
         let older = Epoch::new([1; ID_SIZE], [1; KEY_SIZE], 0, 3_000, 3_000 + EVENT_LIFE_MS);
-        let newer = Epoch::new([2; ID_SIZE], [2; KEY_SIZE], 2_000, 9_000, 9_000 + EVENT_LIFE_MS);
+        let newer = Epoch::new(
+            [2; ID_SIZE],
+            [2; KEY_SIZE],
+            2_000,
+            9_000,
+            9_000 + EVENT_LIFE_MS,
+        );
         let held = vec![older, newer];
         assert_eq!(for_publish(&held, 2_500).unwrap().id, [2; ID_SIZE]);
         assert_eq!(for_publish(&held, 1_500).unwrap().id, [1; ID_SIZE]);
@@ -222,7 +231,10 @@ mod tests {
         assert_eq!(org_of(""), Err(NotAGroup));
 
         assert!(under("io.macula/acme/chat", "io.macula/acme/chat"));
-        assert!(under("io.macula/acme/chat/room/said_v1", "io.macula/acme/chat"));
+        assert!(under(
+            "io.macula/acme/chat/room/said_v1",
+            "io.macula/acme/chat"
+        ));
         assert!(!under("io.macula/acme/chatter", "io.macula/acme/chat"));
         assert!(!under("io.macula/acme", "io.macula/acme/chat"));
     }
