@@ -112,8 +112,11 @@ pub fn parse_reply(prefix: &str, v: &Value) -> Result<Reply, GroupError> {
 }
 
 /// The RESULT payload for `r`, as a distributor answers it and as the vectors
-/// pin it.
-pub fn reply_value(r: &Reply) -> Value {
+/// pin it. Only a distributor builds one, and this crate serves none: it is
+/// here for the vectors and the tests that hold this crate to them, which is
+/// why it is not public.
+#[cfg(test)]
+pub(crate) fn reply_value(r: &Reply) -> Value {
     let epochs = r
         .epochs
         .iter()
@@ -159,6 +162,20 @@ fn epoch_of(v: &Value) -> Option<Epoch> {
         publish_until,
         accept_until,
     ))
+}
+
+/// Wipes every byte string a reply carries: an epoch key travels as one, and
+/// the value the reply arrived in outlives the epochs read out of it.
+pub(crate) fn zeroize_reply(v: &mut Value) {
+    match v {
+        Value::Bytes(bytes) => bytes.fill(0),
+        Value::List(items) => items.iter_mut().for_each(zeroize_reply),
+        Value::Map(pairs) => pairs.iter_mut().for_each(|(key, value)| {
+            zeroize_reply(key);
+            zeroize_reply(value);
+        }),
+        _ => {}
+    }
 }
 
 fn text(v: &Value, name: &str) -> Option<String> {

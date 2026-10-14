@@ -191,14 +191,19 @@ impl SubInner {
 
     /// The event as this subscription delivers it, or `None` when it is
     /// refused outright.
+    ///
+    /// Every subscription goes through the groups this node holds, not only a
+    /// subscription under one: a prefix this node holds at `required` refuses
+    /// a clear event on any subscription covering it, which is what stops a
+    /// plain subscription from delivering a forged clear event under a group
+    /// the node holds.
     async fn delivered(self: &Arc<Self>, event: Event) -> Option<Event> {
-        let Some(prefix) = self.group.as_deref() else {
-            return Some(event);
-        };
         let groups = self.pool.upgrade().and_then(|pool| pool.held_groups());
         match groups {
-            Some(groups) => super::group::open_delivered(&groups, Some(prefix), event).await,
-            None => Some(super::group::unopened_no_group(event)),
+            Some(groups) => {
+                super::group::open_delivered(&groups, self.group.as_deref(), event).await
+            }
+            None => Some(super::group::without_a_group(event)),
         }
     }
 

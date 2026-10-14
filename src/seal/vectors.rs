@@ -295,7 +295,7 @@ fn the_event_key_and_aad_reach_macula_s_bytes() {
         );
         let subkey: [u8; 32] = fixed(&e["k_pub"]);
         assert_eq!(
-            event_key(&group_key, &publisher),
+            *event_key(&group_key, &publisher),
             subkey,
             "k_pub: a publisher's subkey of the group key"
         );

@@ -231,3 +231,99 @@ pub fn verify_publication(
     }
     Ok(publication)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::node_key::NodeKey;
+    use crate::profile::Profile;
+
+    const NOW: i64 = 1_790_000_000_000;
+
+    fn key() -> NodeKey {
+        NodeKey::generate_identity(Profile::PqPure, 0).unwrap()
+    }
+
+    /// A sealed group event: a nonce and no kem_ct, as a group event carries.
+    fn sealed() -> Sealed {
+        Sealed {
+            scheme: sealed::SEALED_SCHEME,
+            key_id: [4; 8],
+            kem_ct: None,
+            nonce: Some(vec![7; 12]),
+            ct: vec![9; 40],
+        }
+    }
+
+    fn spec(payload: Payload) -> PublicationSpec {
+        PublicationSpec {
+            realm: [3; 32],
+            topic: "acme/demo/said_v1".to_string(),
+            seq: 1,
+            published_at: NOW as u64,
+            payload,
+            ttl_ms: None,
+        }
+    }
+
+    /// A sealed group event signs and verifies, and is still the sealed map it
+    /// was: every station relaying it carries the ciphertext, not a payload.
+    #[test]
+    fn a_sealed_publication_signs_and_verifies_as_one() {
+        let frame = sign_publish(&spec(Payload::Sealed(sealed())), &key()).unwrap();
+        let arrived = crate::cbor::decode(&crate::cbor::encode(&frame).unwrap()).unwrap();
+        let publication = verify_publication(&arrived, Profile::PqPure, NOW).unwrap();
+        let Payload::Sealed(carried) = &publication.payload else {
+            panic!("a sealed publication verifies as a sealed one");
+        };
+        assert_eq!(carried.key_id, [4; 8], "the epoch it was sealed under");
+        assert_eq!(carried.nonce.as_deref(), Some(&[7u8; 12][..]));
+        assert_eq!(carried.ct, vec![9; 40]);
+        assert_eq!(publication.topic, "acme/demo/said_v1");
+    }
+
+    /// A publication carries a clear payload or a sealed one, exactly one of
+    /// the two: both, or neither, is not a publication.
+    #[test]
+    fn a_publication_carries_exactly_one_of_the_two() {
+        let mut clear: Fields = HashMap::new();
+        clear.insert("payload".into(), Value::text("clear"));
+        assert_eq!(
+            payload_of(&clear),
+            Some(Payload::Clear(Value::text("clear")))
+        );
+
+        let mut both = clear.clone();
+        both.insert("sealed".into(), sealed().value());
+        assert_eq!(payload_of(&both), None, "both at once");
+
+        let mut neither: Fields = HashMap::new();
+        neither.insert("topic".into(), Value::text("acme/demo/said_v1"));
+        assert_eq!(payload_of(&neither), None, "neither");
+    }
+
+    /// A sealed map of another scheme, or of a shape no event carries, is
+    /// refused before anything is signed.
+    #[test]
+    fn a_sealed_publication_of_the_wrong_shape_is_refused() {
+        let other_scheme = Sealed {
+            scheme: 2,
+            ..sealed()
+        };
+        assert_eq!(
+            sign_publish(&spec(Payload::Sealed(other_scheme)), &key()).unwrap_err(),
+            FrameError::SealedShape
+        );
+        let with_kem_ct = Sealed {
+            kem_ct: Some(vec![0; 1568]),
+            ..sealed()
+        };
+        assert_eq!(
+            sign_publish(&spec(Payload::Sealed(with_kem_ct)), &key()).unwrap_err(),
+            FrameError::SealedShape,
+            "a request-shaped map is not an event"
+        );
+    }
+}

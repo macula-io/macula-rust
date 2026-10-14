@@ -26,7 +26,7 @@ pub const KEY_SIZE: usize = 32;
 /// The key is erased when the epoch is dropped and is never printed: the same
 /// rule macula 14.10.0 holds, that no group's epoch key appears in a process
 /// state or a crash report.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Epoch {
     pub id: [u8; ID_SIZE],
     key: Zeroizing<[u8; KEY_SIZE]>,
@@ -86,6 +86,22 @@ impl Epoch {
         now <= self.accept_until + TOLERANCE_MS
     }
 }
+
+impl PartialEq for Epoch {
+    /// Equal when their ids and times are equal and their keys are equal in
+    /// constant time: these are keys, and a comparison that stopped at the
+    /// first differing byte would say where they differ.
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.issued_at == other.issued_at
+            && self.publish_until == other.publish_until
+            && self.accept_until == other.accept_until
+            && aws_lc_rs::constant_time::verify_slices_are_equal(&self.key[..], &other.key[..])
+                .is_ok()
+    }
+}
+
+impl Eq for Epoch {}
 
 impl fmt::Debug for Epoch {
     /// Its id and times, never its key.

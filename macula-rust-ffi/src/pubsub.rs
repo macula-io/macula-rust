@@ -31,6 +31,14 @@ impl TryFrom<Event> for FfiEvent {
     type Error = FfiError;
 
     fn try_from(e: Event) -> Result<Self, FfiError> {
+        // An event that could not be opened carries no payload and the reason
+        // it could not be: this boundary carries neither, so it refuses one
+        // by name rather than hand the app an empty event.
+        if let Some(reason) = e.unopened {
+            return Err(FfiError::UnrepresentableValue {
+                message: format!("an event that could not be opened: {}", reason.name()),
+            });
+        }
         let payload = match e.payload {
             Payload::Clear(payload) => payload.try_into()?,
             // A sealed group event. This boundary models no group, so it

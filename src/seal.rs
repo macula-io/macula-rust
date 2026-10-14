@@ -21,6 +21,8 @@ use aws_lc_rs::hmac;
 use aws_lc_rs::kem::{Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_1024};
 use sha2::{Digest, Sha384};
 
+use macula_mldsa::Zeroizing;
+
 use crate::cbor::{self, Value};
 use crate::profile::Profile;
 
@@ -436,7 +438,7 @@ pub fn call_keys(
     frame_type: &str,
     p: &Parties,
 ) -> ([u8; 32], [u8; 32]) {
-    halves(expand(
+    halves(&expand(
         secret,
         &encode(vec![
             Value::text(LABEL_CALL),
@@ -450,7 +452,7 @@ pub fn call_keys(
 
 /// The caller-to-provider and provider-to-caller keys of one stream.
 pub fn stream_keys(secret: &[u8; KEY_HASH_SIZE], p: &Parties) -> ([u8; 32], [u8; 32]) {
-    halves(expand(
+    halves(&expand(
         secret,
         &encode(vec![
             Value::text(LABEL_STREAM),
@@ -461,7 +463,7 @@ pub fn stream_keys(secret: &[u8; KEY_HASH_SIZE], p: &Parties) -> ([u8; 32], [u8;
     ))
 }
 
-fn halves(okm: [u8; 64]) -> ([u8; 32], [u8; 32]) {
+fn halves(okm: &[u8; 64]) -> ([u8; 32], [u8; 32]) {
     let mut a = [0; 32];
     let mut b = [0; 32];
     a.copy_from_slice(&okm[..32]);
@@ -547,18 +549,21 @@ pub fn stream_nonce(seq: u64) -> [u8; NONCE_SIZE] {
 /// A publisher's subkey of a group epoch key: every publisher seals under its
 /// own, so no two ever share a key, and a group key is never used directly.
 /// macula's `macula_group_event` calls this on every seal and every open.
-pub fn event_key(group_key: &[u8; 32], publisher: &[u8; 32]) -> [u8; 32] {
+///
+/// What it answers is wiped when it is dropped: it is a key, and so is the
+/// PRK it is expanded from.
+pub fn event_key(group_key: &[u8; 32], publisher: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let info = encode(vec![Value::text(LABEL_EVENT), bytes(publisher)]);
     let okm = expand(&event_prk(group_key), &info);
-    let mut key = [0; 32];
+    let mut key = Zeroizing::new([0; 32]);
     key.copy_from_slice(&okm[..32]);
     key
 }
 
 /// The group key is 32 bytes and HKDF-Expand wants a PRK of the hash's 48,
 /// so it is extracted first, under the event label.
-fn event_prk(group_key: &[u8; 32]) -> [u8; KEY_HASH_SIZE] {
-    extract(LABEL_EVENT.as_bytes(), group_key)
+fn event_prk(group_key: &[u8; 32]) -> Zeroizing<[u8; KEY_HASH_SIZE]> {
+    Zeroizing::new(extract(LABEL_EVENT.as_bytes(), group_key))
 }
 
 /// An event's AAD: the routing fields its seal is bound to. The group and the
@@ -659,17 +664,20 @@ fn extract(salt: &[u8], ikm: &[u8]) -> [u8; KEY_HASH_SIZE] {
 }
 
 /// HKDF-Expand to 64 bytes: two HMAC-SHA-384 blocks, of which the second is
-/// cut to 16.
-fn expand(prk: &[u8; KEY_HASH_SIZE], info: &[u8]) -> [u8; 64] {
+/// cut to 16. Both the output and the block it carries between rounds are
+/// wiped when they are dropped, or reused rather than allocated.
+fn expand(prk: &[u8; KEY_HASH_SIZE], info: &[u8]) -> Zeroizing<[u8; 64]> {
     let key = hmac::Key::new(hmac::HMAC_SHA384, prk);
-    let mut okm = [0; 64];
-    let mut previous: Vec<u8> = Vec::new();
+    let mut okm = Zeroizing::new([0; 64]);
+    let mut previous = Zeroizing::new([0; KEY_HASH_SIZE]);
     for (counter, chunk) in (1u8..).zip(okm.chunks_mut(KEY_HASH_SIZE)) {
         let mut ctx = hmac::Context::with_key(&key);
-        ctx.update(&previous);
+        if counter > 1 {
+            ctx.update(&previous[..]);
+        }
         ctx.update(info);
         ctx.update(&[counter]);
-        previous = ctx.sign().as_ref().to_vec();
+        previous.copy_from_slice(ctx.sign().as_ref());
         chunk.copy_from_slice(&previous[..chunk.len()]);
     }
     okm

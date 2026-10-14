@@ -24,9 +24,9 @@ pub use epoch::{
     EVENT_LIFE_MS, ID_SIZE, KEY_SIZE, TOLERANCE_MS,
 };
 pub use event::{open_event, seal_event, Fields};
-pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};pub use wire::{
-    by_id_request, current_request, parse_reply, procedure, reply_value, Policy, Reply,
-};
+pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};pub use wire::{by_id_request, current_request, parse_reply, procedure, Policy, Reply};
+#[cfg(test)]
+pub(crate) use wire::reply_value;
 
 /// The sealed group a publish or a subscribe is under: its prefix, which the
 /// topic must be under and whose second segment is its org; the org's grant,
@@ -135,8 +135,6 @@ pub enum GroupError {
     /// A publish, an open or a policy read under a group this keyring does
     /// not hold.
     NotJoined,
-    /// No trusted distributor advertises the group's procedure.
-    NotAdvertised(Option<Cause>),
     /// The distributor's reply is not `group_keys_v1`'s. Nothing of it is
     /// held.
     MalformedReply,
@@ -192,9 +190,6 @@ impl fmt::Display for GroupError {
         match self {
             GroupError::NotAGroup => write!(f, "group: not a group prefix"),
             GroupError::NotJoined => f.write_str("group: the group is not joined"),
-            GroupError::NotAdvertised(_) => {
-                f.write_str("group: no trusted distributor advertises the group's procedure")
-            }
             GroupError::MalformedReply => {
                 f.write_str("group: the distributor's reply is not group_keys_v1's")
             }
@@ -214,7 +209,6 @@ impl fmt::Display for GroupError {
 impl Error for GroupError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            GroupError::NotAdvertised(cause) => cause.as_deref().map(|c| c as &dyn Error),
             GroupError::NotSealed(cause) | GroupError::Pool(cause) => Some(cause.as_ref()),
             GroupError::Refused {
                 cause: Some(cause), ..

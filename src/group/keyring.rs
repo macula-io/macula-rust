@@ -21,7 +21,9 @@ use crate::cbor::Value;
 use crate::seal::Clock;
 
 use super::epoch::{for_publish, org_of, retain_live, under};
-use super::wire::{by_id_request, current_request, parse_reply, procedure, Policy, Reply};
+use super::wire::{
+    by_id_request, current_request, parse_reply, procedure, zeroize_reply, Policy, Reply,
+};
 use super::{Cause, Epoch, GroupError, Reason, EVENT_LIFE_MS, ID_SIZE};
 
 /// The default time a pull is given before it is abandoned.
@@ -407,7 +409,9 @@ impl Inner {
             Known::Unknown => {}
         }
         let mut joined = self.take(&key)?;
-        if !joined.held.spend(publisher, (self.opts.now)()) || self.unknown_already(&joined.held, id) {
+        if self.unknown_already(&joined.held, id)
+            || !joined.held.spend(publisher, (self.opts.now)())
+        {
             self.put(&key, joined);
             return Err(GroupError::of(Reason::UnknownEpoch));
         }
@@ -427,7 +431,7 @@ impl Inner {
             .iter()
             .find(|epoch| epoch.id == id)
             .cloned();
-        self.put(&key, joined);
+        self.put_pruned(&key, joined);
         answer_epoch(found, (self.opts.now)())
     }
 
@@ -454,7 +458,7 @@ impl Inner {
                 .unknown
                 .insert(id, (self.opts.now)() + EVENT_LIFE_MS);
         }
-        self.put(key, joined);
+        self.put_pruned(key, joined);
     }
 
     fn close(&self) {
@@ -507,6 +511,13 @@ impl Inner {
         epoch.ok_or_else(|| GroupError::of(Reason::NoDistributor))
     }
 
+    /// Puts a group back after a pull, erasing the epochs no longer of use
+    /// and scheduling nothing.
+    fn put_pruned(&self, key: &GroupKey, mut joined: Joined) {
+        retain_live(&mut joined.held.epochs, (self.opts.now)());
+        self.put(key, joined);
+    }
+
     /// Puts a group back as it is, scheduling nothing.
     fn put(&self, key: &GroupKey, joined: Joined) {
         let mut state = self.lock();
@@ -542,8 +553,15 @@ impl Inner {
             Err(_) => return Err(GroupError::caused_by(Reason::NoDistributor, Elapsed)),
         };
         match answer {
-            Ok((result, provider)) => {
-                let reply = parse_reply(&key.1, &result)?;
+            Ok((mut result, provider)) => {
+                // A reply that is not the protocol's is no distributor's, as
+                // macula holds it: the parse failure stays as the cause.
+                let parsed = parse_reply(&key.1, &result);
+                // The reply carried every epoch key as bytes: wipe them
+                // whether or not it parsed.
+                zeroize_reply(&mut result);
+                let reply =
+                    parsed.map_err(|e| GroupError::caused_by(Reason::NoDistributor, e))?;
                 held.pin_answered(provider);
                 Ok(reply)
             }
@@ -754,6 +772,7 @@ impl std::error::Error for Elapsed {}
 #[allow(clippy::excessive_nesting)]
 mod tests {
     use std::collections::VecDeque;
+    use std::error::Error;
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use super::*;
@@ -983,6 +1002,25 @@ mod tests {
         assert_eq!(fake.asked(), 2, "the id is remembered as unknown");
     }
 
+    /// A reply that is not the protocol's is refused `no_distributor`, the
+    /// reason the closed set has for it, with the parse failure left as the
+    /// cause: a caller never gets an error with no reason at all.
+    #[tokio::test]
+    async fn a_malformed_reply_is_no_distributor() {
+        let fake = Fake::with(vec![Ok((
+            Value::Map(vec![(Value::text("policy"), Value::text("sometimes"))]),
+            PROVIDER,
+        ))]);
+        let keyring = keyring(&fake, &clock());
+        let refused = keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap_err();
+        assert!(refused.is(Reason::NoDistributor), "{refused}");
+        assert_eq!(refused.reason(), Some(Reason::NoDistributor));
+        assert!(refused.source().is_some(), "the parse failure is the cause");
+    }
+
     /// A distributor that refuses with one of the design's reasons reaches the
     /// caller as that reason, on a join and on a publish alike.
     #[tokio::test]
@@ -1031,9 +1069,10 @@ mod tests {
         assert!(refused.is(Reason::EpochExpired), "{refused}");
 
         // The stale epoch is dropped on the next pull, so the group holds no
-        // epoch to publish under and nothing to open.
+        // epoch to publish under, and the pull that follows is refused by the
+        // distributor that does not know the id.
         let refused = keyring.publish_epoch([7; 32], PREFIX).await.unwrap_err();
-        assert!(refused.is(Reason::UnknownEpoch) || refused.is(Reason::NoDistributor));
+        assert!(refused.is(Reason::UnknownEpoch), "{refused}");
         let state = keyring.inner.lock();
         let held = state.groups.get(&([7; 32], PREFIX.to_string())).unwrap();
         assert!(held.held.epochs.iter().all(|e| e.id != [1; ID_SIZE]));

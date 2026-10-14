@@ -28,8 +28,10 @@ usually touches both, but their version numbers don't move in lockstep.
   the ahead window (the design's sections 4, 6 and 7), a failed pull backs
   off until one succeeds, the policy is monotonic, and at most three unknown
   epoch ids are pulled per publisher per rotation. Epoch keys are held in
-  memory only, erased once no event under them can be accepted, and never
-  reach a `Debug` rendering.
+  memory only, never reach a `Debug` rendering, and are wiped rather than
+  merely dropped: the epoch itself when it is erased, the publisher subkey and
+  the PRK and expander buffers it is derived through, and the distributor's
+  reply, which carries every epoch key as bytes.
 
   Held to macula's own vectors: the `group_keys_v1` CALL payloads and the
   RESULT byte for byte, the org's grant reaching macula's verdict on all

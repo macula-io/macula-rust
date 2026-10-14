@@ -315,9 +315,14 @@ fn fields_of(event: &station_link::Event) -> group::Fields {
     }
 }
 
-/// An event under a subscription whose group holds nothing to open it with.
-pub(super) fn unopened_no_group(event: station_link::Event) -> station_link::Event {
-    unopened(event, Reason::NoGroup)
+/// An event under a pool that holds no group at all: a sealed one is marked
+/// unopened `no_group`, since nothing here can open it, and a clear one is
+/// delivered as it arrives, there being no policy to refuse it.
+pub(super) fn without_a_group(event: station_link::Event) -> station_link::Event {
+    match event.payload {
+        Payload::Sealed(_) => unopened(event, Reason::NoGroup),
+        Payload::Clear(_) => event,
+    }
 }
 
 // The test scaffolding here builds canned replies and canned events, which
@@ -437,6 +442,63 @@ mod tests {
         )
         .await
         .is_none());
+    }
+
+    /// The policy holds on a subscription that is not under the group too: a
+    /// plain subscription covering a prefix this node holds at `required`
+    /// refuses a clear event as well, so no forged clear event under a held
+    /// group is delivered to anyone, and a sealed event on it is delivered
+    /// unopened, `no_group`, since nothing on that subscription can open it.
+    #[tokio::test]
+    async fn a_required_group_refuses_a_clear_event_on_a_plain_subscription() {
+        let keyring = keyring(Policy::Required).await;
+        assert!(
+            open_delivered(
+                &keyring,
+                None,
+                event(Payload::Clear(Value::text("forged")))
+            )
+            .await
+            .is_none(),
+            "a plain subscription refuses a clear event under the held prefix"
+        );
+
+        let sealed = seal_event(&our_epoch(), &fields(&topic()), &Value::text("sealed")).unwrap();
+        let delivered = open_delivered(&keyring, None, event(Payload::Sealed(sealed)))
+            .await
+            .expect("a sealed event is delivered");
+        assert_eq!(delivered.unopened, Some(Reason::NoGroup));
+        assert_eq!(delivered.payload, Payload::Clear(Value::Null));
+    }
+
+    /// A clear event under a group that is not required reaches a plain
+    /// subscription as it is: only `required` refuses one.
+    #[tokio::test]
+    async fn a_plain_subscription_takes_a_clear_event_under_a_preferred_group() {
+        let keyring = keyring(Policy::Preferred).await;
+        let delivered = open_delivered(
+            &keyring,
+            None,
+            event(Payload::Clear(Value::text("clear"))),
+        )
+        .await
+        .expect("a preferred group does not refuse it");
+        assert_eq!(delivered.payload, Payload::Clear(Value::text("clear")));
+        assert_eq!(delivered.unopened, None);
+    }
+
+    /// A pool that holds no group at all delivers a clear event as it arrives
+    /// and marks a sealed one unopened, there being nothing here to open it.
+    #[test]
+    fn a_pool_without_a_group_marks_a_sealed_event_only() {
+        let clear = without_a_group(event(Payload::Clear(Value::text("clear"))));
+        assert_eq!(clear.payload, Payload::Clear(Value::text("clear")));
+        assert_eq!(clear.unopened, None);
+
+        let sealed = seal_event(&our_epoch(), &fields(&topic()), &Value::text("sealed")).unwrap();
+        let sealed = without_a_group(event(Payload::Sealed(sealed)));
+        assert_eq!(sealed.unopened, Some(Reason::NoGroup));
+        assert_eq!(sealed.payload, Payload::Clear(Value::Null));
     }
 
     /// A sealed event under a held epoch is opened and delivered in the shape
