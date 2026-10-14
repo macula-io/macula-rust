@@ -59,6 +59,8 @@ const LABEL_CALL: &str = "MACULA-E2E-CALL-V1";
 const LABEL_STREAM: &str = "MACULA-E2E-STREAM-V1";
 const LABEL_AAD: &str = "MACULA-E2E-AAD-V1";
 const LABEL_STREAM_AAD: &str = "MACULA-E2E-STREAM-AAD-V1";
+const LABEL_EVENT: &str = "MACULA-E2E-EVENT-V1";
+const LABEL_EVENT_AAD: &str = "MACULA-E2E-EVENT-AAD-V1";
 
 /// An opened ERROR's code and detail are bounded as a clear ERROR's are, as
 /// macula_frame's error_read/1 bounds them.
@@ -540,6 +542,43 @@ pub fn stream_nonce(seq: u64) -> [u8; NONCE_SIZE] {
     let mut nonce = [0; NONCE_SIZE];
     nonce[4..].copy_from_slice(&seq.to_be_bytes());
     nonce
+}
+
+/// A publisher's subkey of a group epoch key: every publisher seals under its
+/// own, so no two ever share a key, and a group key is never used directly.
+/// macula's `macula_group_event` calls this on every seal and every open.
+pub fn event_key(group_key: &[u8; 32], publisher: &[u8; 32]) -> [u8; 32] {
+    let info = encode(vec![Value::text(LABEL_EVENT), bytes(publisher)]);
+    let okm = expand(&event_prk(group_key), &info);
+    let mut key = [0; 32];
+    key.copy_from_slice(&okm[..32]);
+    key
+}
+
+/// The group key is 32 bytes and HKDF-Expand wants a PRK of the hash's 48,
+/// so it is extracted first, under the event label.
+fn event_prk(group_key: &[u8; 32]) -> [u8; KEY_HASH_SIZE] {
+    extract(LABEL_EVENT.as_bytes(), group_key)
+}
+
+/// An event's AAD: the routing fields its seal is bound to. The group and the
+/// epoch are not in it; the derived key binds the group, and the envelope's
+/// key id names the epoch.
+pub fn event_aad(
+    realm: &[u8; 32],
+    topic: &str,
+    publisher: &[u8; 32],
+    seq: u64,
+    published_at: u64,
+) -> Vec<u8> {
+    encode(vec![
+        Value::text(LABEL_EVENT_AAD),
+        bytes(realm),
+        Value::text(topic),
+        bytes(publisher),
+        Value::Int(i128::from(seq)),
+        Value::Int(i128::from(published_at)),
+    ])
 }
 
 /// A fresh nonce, for a reply, a provider stream frame or an event, which

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use common::TestStations;
 use macula_rust::cbor::Value;
-use macula_rust::frame::{StreamEncoding, StreamMode, StreamRole};
+use macula_rust::frame::{Payload, StreamEncoding, StreamMode, StreamRole};
 use macula_rust::handshake::HandshakeError;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::profile::Profile;
@@ -145,7 +145,7 @@ async fn a_publication_is_heard_once_by_each_subscriber() {
         .publish(Publication {
             realm: env.realm_id,
             topic: topic.to_string(),
-            payload: Value::text("hi"),
+            payload: Payload::Clear(Value::text("hi")),
             ttl_ms: None,
         })
         .await
@@ -154,7 +154,7 @@ async fn a_publication_is_heard_once_by_each_subscriber() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(event.payload, Value::text("hi"));
+    assert_eq!(event.payload, Payload::Clear(Value::text("hi")));
     assert_eq!(event.publisher, publisher.node_id());
     assert_eq!(event.topic, topic);
     assert!(tokio::time::timeout(Duration::from_millis(300), sub.recv())

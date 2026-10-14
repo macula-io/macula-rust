@@ -275,6 +275,45 @@ fn a_sender_s_secret_is_the_one_its_recipient_recovers() {
     }
 }
 
+/// Sealed groups: a publisher's subkey of a group epoch key, the event AAD,
+/// and the event's own seal and open, all exactly macula's. The same event
+/// vector the group's keyring is held to, so a group event sealed here opens
+/// under macula and the reverse.
+#[test]
+fn the_event_key_and_aad_reach_macula_s_bytes() {
+    let v = vectors();
+    let events = v["events"].as_array().unwrap();
+    assert!(!events.is_empty());
+    for e in events {
+        let group_key: [u8; 32] = fixed(&e["k_g"]);
+        let publisher: [u8; 32] = fixed(&e["publisher"]);
+        let realm: [u8; 32] = fixed(&e["realm"]);
+        assert_eq!(
+            event_prk(&group_key).to_vec(),
+            b(&e["prk_g"]),
+            "prk_g: the group key is extracted under the event label"
+        );
+        let subkey: [u8; 32] = fixed(&e["k_pub"]);
+        assert_eq!(
+            event_key(&group_key, &publisher),
+            subkey,
+            "k_pub: a publisher's subkey of the group key"
+        );
+        assert_eq!(
+            event_aad(
+                &realm,
+                e["topic"].as_str().unwrap(),
+                &publisher,
+                e["seq"].as_u64().unwrap(),
+                e["published_at"].as_u64().unwrap(),
+            ),
+            b(&e["aad"]),
+            "the event AAD"
+        );
+        sealed_and_opened(&subkey, e, "the event");
+    }
+}
+
 /// Every refusal is refused: the ephemeral point that makes the recipient's
 /// ECDH output 48 zero bytes, which the primitives under every stack return
 /// without an error.

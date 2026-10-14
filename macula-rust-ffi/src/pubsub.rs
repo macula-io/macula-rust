@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use macula_rust::frame::Payload;
 use macula_rust::pool::Subscription;
 use macula_rust::station_link::{Event, Publication};
 use tokio::sync::Mutex;
@@ -30,13 +31,28 @@ impl TryFrom<Event> for FfiEvent {
     type Error = FfiError;
 
     fn try_from(e: Event) -> Result<Self, FfiError> {
+        let payload = match e.payload {
+            Payload::Clear(payload) => payload.try_into()?,
+            // A sealed group event. This boundary models no group, so it
+            // carries no way to name the epoch or open one. Named here rather
+            // than dropped silently, so a subscriber is told why it heard
+            // nothing.
+            Payload::Sealed(sealed) => {
+                return Err(FfiError::UnrepresentableValue {
+                    message: format!(
+                        "a sealed group event under epoch {} (the FFI has no group API)",
+                        sealed.key_id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    ),
+                })
+            }
+        };
         Ok(FfiEvent {
             publisher: e.publisher.to_vec(),
             realm: e.realm.to_vec(),
             topic: e.topic,
             seq: e.seq,
             published_at: e.published_at,
-            payload: e.payload.try_into()?,
+            payload,
             delivered_via: e.delivered_via,
         })
     }
@@ -63,7 +79,7 @@ impl FfiPool {
             .publish(Publication {
                 realm: to_32(realm)?,
                 topic,
-                payload: payload.into(),
+                payload: Payload::Clear(payload.into()),
                 ttl_ms,
             })
             .await?)

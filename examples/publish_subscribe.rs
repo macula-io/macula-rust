@@ -10,6 +10,7 @@ mod common;
 use std::time::Duration;
 
 use macula_rust::cbor::Value;
+use macula_rust::frame::Payload;
 use macula_rust::station_link::Publication;
 
 const TOPIC: &str = "acme/demo/greeting_sent_v1";
@@ -22,10 +23,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pool.publish(Publication {
         realm: common::realm(),
         topic: TOPIC.into(),
-        payload: Value::Map(vec![
+        payload: Payload::Clear(Value::Map(vec![
             (Value::text("text"), Value::text("hi")),
             (Value::text("urgent"), Value::Int(0)),
-        ]),
+        ])),
         ttl_ms: None,
     })
     .await?;

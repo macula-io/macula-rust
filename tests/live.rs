@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use macula_rust::cbor::Value;
+use macula_rust::frame::Payload;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::pool::{Call, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
@@ -123,7 +124,7 @@ async fn the_pool_hears_its_own_publication() {
     pool.publish(Publication {
         realm,
         topic,
-        payload: Value::text("heard"),
+        payload: Payload::Clear(Value::text("heard")),
         ttl_ms: None,
     })
     .await
@@ -131,5 +132,8 @@ async fn the_pool_hears_its_own_publication() {
     let event = tokio::time::timeout(Duration::from_secs(10), sub.recv()).await;
     let _ = sub.unsubscribe().await;
     pool.close().await;
-    assert_eq!(event.unwrap().unwrap().payload, Value::text("heard"));
+    assert_eq!(
+        event.unwrap().unwrap().payload,
+        Payload::Clear(Value::text("heard"))
+    );
 }

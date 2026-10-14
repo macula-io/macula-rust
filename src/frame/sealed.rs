@@ -37,6 +37,10 @@ pub enum SealedContext {
     Reply,
     ProviderStream,
     CallerStream,
+    /// A sealed group event riding in a PUBLISH in place of its payload. Its
+    /// shape is a reply's, a carried nonce and no kem_ct: the epoch key it
+    /// names was pulled over a sealed call, not agreed per event.
+    GroupEvent,
 }
 
 impl Sealed {
@@ -75,7 +79,7 @@ impl Sealed {
             (SealedContext::Request, Some(kem_ct), None) => {
                 kem_ct.len() == KEM_CT_PURE_SIZE || kem_ct.len() == KEM_CT_HYBRID_SIZE
             }
-            (SealedContext::Reply | SealedContext::ProviderStream, None, Some(_)) => true,
+            (SealedContext::Reply | SealedContext::ProviderStream | SealedContext::GroupEvent, None, Some(_)) => true,
             (SealedContext::CallerStream, None, None) => true,
             _ => false,
         }
@@ -181,9 +185,24 @@ mod tests {
         }
     }
 
+    /// A group event carries a nonce and no kem_ct, so a PUBLISH's sealed map
+    /// can never be read as a call's, and a map of another shape is not one.
     #[test]
-    fn a_sealed_map_with_a_key_the_table_cannot_name_is_not_one() {
-        let Value::Map(mut extra) = sealed(None, Some(12)).value() else {
+    fn a_group_event_takes_a_carried_nonce_and_no_kem_ct() {
+        let event = sealed(None, Some(12));
+        assert!(event.shaped(SealedContext::GroupEvent));
+        assert_eq!(
+            read_sealed(&event.value(), SealedContext::GroupEvent),
+            Some(event)
+        );
+        assert!(!sealed(None, None).shaped(SealedContext::GroupEvent));
+        assert!(!sealed(None, Some(11)).shaped(SealedContext::GroupEvent));
+        assert!(!sealed(Some(1568), None).shaped(SealedContext::GroupEvent));
+        assert!(!sealed(Some(1568), Some(12)).shaped(SealedContext::GroupEvent));
+    }
+
+    #[test]
+    fn a_sealed_map_with_a_key_the_table_cannot_name_is_not_one() {        let Value::Map(mut extra) = sealed(None, Some(12)).value() else {
             unreachable!()
         };
         extra.push(entry("payload", Value::Null));

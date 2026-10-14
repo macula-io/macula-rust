@@ -15,6 +15,7 @@ pub const WIRE_VERSION: &str = "1.0";
 pub mod binding;
 pub mod cbor;
 pub mod frame;
+pub mod group;
 pub mod handshake;
 pub mod keystore;
 pub mod manifest;

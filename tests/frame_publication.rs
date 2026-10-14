@@ -3,7 +3,7 @@
 
 use macula_rust::cbor::{self, Value};
 use macula_rust::frame::{
-    sign_publish, subscribe_frame, unsubscribe_frame, verify_publication, FrameError,
+    sign_publish, subscribe_frame, unsubscribe_frame, verify_publication, FrameError, Payload,
     PublicationSpec,
 };
 use macula_rust::node_key::{NodeKey, Purpose};
@@ -18,7 +18,7 @@ fn spec() -> PublicationSpec {
         topic: "acme/demo/greeting_sent_v1".to_string(),
         seq: 1,
         published_at: NOW,
-        payload: Value::text("hi"),
+        payload: Payload::Clear(Value::text("hi")),
         ttl_ms: None,
     }
 }
@@ -36,7 +36,7 @@ fn a_publication_verifies_for_its_publisher_within_its_time() {
         assert_eq!(publication.publisher, key.key_id());
         assert_eq!(publication.topic, "acme/demo/greeting_sent_v1");
         assert_eq!(publication.seq, 1);
-        assert_eq!(publication.payload, Value::text("hi"));
+        assert_eq!(publication.payload, Payload::Clear(Value::text("hi")));
         assert_eq!(publication.expires_at, NOW + 15 * MINUTE);
 
         assert_eq!(

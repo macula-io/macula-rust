@@ -14,9 +14,11 @@ use crate::signed_object::{sign_object, verify_object};
 
 use super::{
     bounded_text, check_payload, entry, fixed, has_fields, identity_signer, object_refusal,
-    protocol_uint, read_fields, received_frame, text_of, uint, FrameError, Rule, MAX_PROTOCOL_INT,
-    MAX_TOPIC_BYTES, PROTOCOL_VERSION, PUBLICATION_LABEL,
+    protocol_uint, read_fields, received_frame, sealed, text_of, uint, Fields, FrameError, Rule,
+    MAX_PROTOCOL_INT, MAX_TOPIC_BYTES, PROTOCOL_VERSION, PUBLICATION_LABEL,
 };
+
+use sealed::{Sealed, SealedContext};
 
 const PUBLISH: &str = "publish";
 const EVENT: &str = "event";
@@ -24,6 +26,29 @@ const PLUMTREE_GOSSIP: &str = "plumtree_gossip";
 const TOLERANCE_MS: u64 = 5 * 60_000;
 const DEFAULT_TTL_MS: u64 = 10 * 60_000;
 const MAX_TTL_MS: u64 = 60 * 60_000;
+
+/// What a publication carries: a payload in the clear, or a sealed group
+/// event's, exactly one of the two, as the wire's payload_or_sealed holds it
+/// (DESIGN_E2E_SEALED_PUBSUB.md). A station relaying a sealed event carries
+/// the ciphertext and cannot read it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Payload {
+    /// A payload in the clear.
+    Clear(Value),
+    /// A sealed group event: the ciphertext, its nonce, and the id of the
+    /// epoch key it was sealed under.
+    Sealed(Sealed),
+}
+
+impl Payload {
+    /// The sealed map, `None` for a clear payload.
+    pub fn sealed(&self) -> Option<&Sealed> {
+        match self {
+            Payload::Clear(_) => None,
+            Payload::Sealed(sealed) => Some(sealed),
+        }
+    }
+}
 
 /// A publication as its publisher gives it: a realm, a topic, the publisher's
 /// own seq, when it was published in Unix milliseconds, a payload, and a
@@ -34,7 +59,7 @@ pub struct PublicationSpec {
     pub topic: String,
     pub seq: u64,
     pub published_at: u64,
-    pub payload: Value,
+    pub payload: Payload,
     pub ttl_ms: Option<u64>,
 }
 
@@ -49,7 +74,7 @@ pub struct VerifiedPublication {
     pub seq: u64,
     pub published_at: u64,
     pub ttl_ms: Option<u64>,
-    pub payload: Value,
+    pub payload: Payload,
     pub key: Vec<u8>,
     pub publication_hash: [u8; 48],
     pub expires_at: u64,
@@ -67,7 +92,18 @@ pub fn sign_publish(spec: &PublicationSpec, key: &NodeKey) -> Result<Value, Fram
         ));
     }
     bounded_text("topic", spec.topic.as_bytes(), MAX_TOPIC_BYTES)?;
-    check_payload(&spec.payload)?;
+    match &spec.payload {
+        // A sealed map of another scheme, or of a shape no event carries, is
+        // refused before anything is signed, where a clear payload the wire
+        // cannot carry is.
+        Payload::Sealed(sealed)
+            if !sealed.known_scheme() || !sealed.shaped(SealedContext::GroupEvent) =>
+        {
+            return Err(FrameError::SealedShape);
+        }
+        Payload::Clear(payload) => check_payload(payload)?,
+        Payload::Sealed(_) => {}
+    }
     if spec.ttl_ms.is_some_and(|t| t > MAX_TTL_MS) {
         return Err(FrameError::OutOfRange("a ttl_ms over one hour".into()));
     }
@@ -77,8 +113,11 @@ pub fn sign_publish(spec: &PublicationSpec, key: &NodeKey) -> Result<Value, Fram
         entry("topic", Value::text(spec.topic.clone())),
         entry("seq", uint(spec.seq)),
         entry("published_at", uint(spec.published_at)),
-        entry("payload", spec.payload.clone()),
     ];
+    fields.push(match &spec.payload {
+        Payload::Clear(payload) => entry("payload", payload.clone()),
+        Payload::Sealed(sealed) => entry("sealed", sealed.value()),
+    });
     if let Some(ttl) = spec.ttl_ms {
         fields.push(entry("ttl_ms", uint(ttl)));
     }
@@ -99,8 +138,22 @@ const PUBLICATION_TABLE: &[(&str, Rule)] = &[
     ("published_at", Rule::ProtocolUint),
     ("ttl_ms", Rule::ProtocolUint),
     ("payload", Rule::Any),
+    ("sealed", Rule::Sealed(SealedContext::GroupEvent)),
     ("ext", Rule::Ext),
 ];
+
+/// The payload `fields` carry: the clear one or the sealed one, exactly one
+/// of the two, `None` when they carry neither or both.
+fn payload_of(fields: &Fields) -> Option<Payload> {
+    match (
+        fields.get("payload"),
+        sealed::sealed_field(fields, SealedContext::GroupEvent),
+    ) {
+        (Some(payload), None) => Some(Payload::Clear(payload.clone())),
+        (None, Some(sealed)) => Some(Payload::Sealed(sealed)),
+        _ => None,
+    }
+}
 
 /// How a received EVENT says its publication reached this node, a per-hop
 /// enum (WIRE_1_0.md section 3.4): `plumtree` or `direct`, and any value this
@@ -143,17 +196,11 @@ pub fn verify_publication(
     let fields = read_fields(&verified.fields, PUBLICATION_TABLE).ok_or(FrameError::Malformed)?;
     if !has_fields(
         &fields,
-        &[
-            "publisher",
-            "realm",
-            "topic",
-            "seq",
-            "published_at",
-            "payload",
-        ],
+        &["publisher", "realm", "topic", "seq", "published_at"],
     ) {
         return Err(FrameError::Malformed);
     }
+    let payload = payload_of(&fields).ok_or(FrameError::Malformed)?;
     super::signed_ext(&fields)?;
     let ttl_ms = fields.get("ttl_ms").and_then(protocol_uint);
     let published_at = protocol_uint(&fields["published_at"]).unwrap_or(0);
@@ -164,7 +211,7 @@ pub fn verify_publication(
         seq: protocol_uint(&fields["seq"]).unwrap_or(0),
         published_at,
         ttl_ms,
-        payload: fields["payload"].clone(),
+        payload,
         publication_hash: Sha384::digest(&verified.tbs).into(),
         expires_at: published_at + ttl_ms.unwrap_or(DEFAULT_TTL_MS) + TOLERANCE_MS,
         key: verified.key,

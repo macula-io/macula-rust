@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::mpsc;
 
 use crate::cbor::Value;
-use crate::frame::{self, PublicationSpec};
+use crate::frame::{self, Payload, PublicationSpec};
 use crate::node_key::NodeKey;
 
 use super::{now_ms, Inner, Link, LinkError};
@@ -27,13 +27,14 @@ const EVENT_BUFFER: usize = 64;
 pub struct Publication {
     pub realm: [u8; 32],
     pub topic: String,
-    pub payload: Value,
+    pub payload: Payload,
     pub ttl_ms: Option<u64>,
 }
 
 /// A publication a subscription heard, verified: who published it (the key
 /// id its signature verified under), where, its seq and time, the payload,
-/// and how it arrived (direct or plumtree).
+/// and how it arrived (direct or plumtree). A sealed group event's payload is
+/// the ciphertext: opening it is [`crate::group`]'s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub publisher: [u8; 32],
@@ -41,7 +42,7 @@ pub struct Event {
     pub topic: String,
     pub seq: u64,
     pub published_at: u64,
-    pub payload: Value,
+    pub payload: Payload,
     pub delivered_via: String,
 }
 

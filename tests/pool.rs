@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::lab::{Lab, LabRealm, LabStation};
 use macula_rust::cbor::Value;
-use macula_rust::frame::StreamMode;
+use macula_rust::frame::{Payload, StreamMode};
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::pool::{
     Call, Confidentiality, ConfidentialityError, ConfidentialityReason, Offer, Opts, Pool,
@@ -175,7 +175,7 @@ async fn heard(
         .publish(Publication {
             realm,
             topic: TOPIC.to_string(),
-            payload: Value::text(text),
+            payload: Payload::Clear(Value::text(text)),
             ttl_ms: None,
         })
         .await
@@ -183,7 +183,7 @@ async fn heard(
     let mut n = 0;
     let until = tokio::time::Instant::now() + Duration::from_secs(1);
     while let Ok(Some(event)) = tokio::time::timeout_at(until, sub.recv()).await {
-        if event.payload == Value::text(text) {
+        if event.payload == Payload::Clear(Value::text(text)) {
             n += 1;
         }
     }
