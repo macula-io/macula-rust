@@ -15,6 +15,42 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Added
+
+- **Sealed groups: the member side** (`group`, and `join_group`,
+  `publish_group` and `subscribe_group` on the pool; macula-rust#32). A group
+  is a topic prefix whose events are sealed once under the group's current
+  epoch key, so a station relaying them carries a ciphertext it cannot read.
+  A member joins by pulling the epoch from the org's distributor over a
+  sealed call with the org's grant, publishes under the publisher's own
+  subkey of the epoch key, and opens what it hears; a removed node's join is
+  refused `not_a_member`. Epochs are re-pulled at a uniform random instant in
+  the ahead window (the design's sections 4, 6 and 7), a failed pull backs
+  off until one succeeds, the policy is monotonic, and at most three unknown
+  epoch ids are pulled per publisher per rotation. Epoch keys are held in
+  memory only, erased once no event under them can be accepted, and never
+  reach a `Debug` rendering.
+
+  Held to macula's own vectors: the `group_keys_v1` CALL payloads and the
+  RESULT byte for byte, the org's grant reaching macula's verdict on all
+  twelve cases, the E2E seal `events` vector for the event key and AAD, and
+  the distributor's refusals as the closed set. A cross-test with macula's
+  own `macula_group_keys` distributor, an Erlang member and a Rust member
+  each opening the other's sealed event under one epoch, runs with
+  `scripts/interop/groups.sh`. Member side only: this crate serves no
+  distributor.
+
+#### Changed
+
+- A publication's payload is either a clear value or a sealed group event,
+  exactly one of the two (`frame::Payload`): a station relaying a sealed
+  event carries the ciphertext. Every clear publication, and the wire 1.0
+  vector suites, encode exactly as before. A clear publish under a prefix
+  whose group this node holds is refused `PoolError::GroupHeld` rather than
+  sent in the clear. A subscription under a group delivers an event it could
+  not open once, as `Event::unopened` with the reason and a null payload, and
+  refuses a clear event under a required group.
+
 ### [0.10.0-rc.1] - 2026-10-13
 
 Wire 1.0 (macula `docs/design/WIRE_1_0.md`, macula#83; macula-rust#27). A
@@ -773,6 +809,14 @@ did, but the two have moved at different paces ever since).
 - `wire_version()` (`wireVersion` in Kotlin): the wire the library speaks,
   "1.0". Built on the wire 1.0 `macula-rust`, which reaches wire 1.0
   stations only.
+
+#### Changed
+
+- A subscription's event now carries `seal_key_id` (`sealKeyId`), the epoch a
+  sealed event names, and the FFI refuses a sealed group event with
+  `UnrepresentableValue` naming its epoch: this boundary models no group yet,
+  so it has no way to name one or open an event. Named rather than dropped
+  silently, so a subscriber is told why it heard nothing.
 
 ### [ffi-0.9.0] - 2026-10-08
 

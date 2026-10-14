@@ -45,6 +45,10 @@ pub struct Event {
     pub published_at: u64,
     pub payload: Payload,
     pub delivered_via: String,
+    /// The epoch a sealed event names, as the delivery metadata reports it:
+    /// `Some` on every event that arrived sealed, opened or not, and `None`
+    /// on one that arrived clear.
+    pub seal_key_id: Option<[u8; 8]>,
     /// Why a sealed event was not opened, on a subscription under a group.
     /// `None` on every event that arrived clear, and on one that opened.
     pub unopened: Option<crate::group::Reason>,
@@ -316,6 +320,7 @@ pub(super) fn evented(inner: &Arc<Inner>, v: &Value) {
         topic: publication.topic.clone(),
         seq: publication.seq,
         published_at: publication.published_at,
+        seal_key_id: publication.payload.sealed().map(|s| s.key_id),
         payload: publication.payload,
         delivered_via,
         unopened: None,

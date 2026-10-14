@@ -224,8 +224,19 @@ impl Pool {
     /// Subscribes to `topic` in `realm` under `g`: it joins the group first,
     /// failing with the join's refusal, and each sealed event is then opened
     /// under the group and delivered once, or delivered once unopened with
-    /// the reason it could not be opened. A clear event under a required
-    /// group this node holds is refused, and counted.
+    /// the reason it could not be opened.
+    ///
+    /// An event that could not be opened arrives once with `unopened` set to
+    /// the reason and a null payload, so an application that reads a payload
+    /// without checking `unopened` is handed nothing rather than a
+    /// ciphertext; `seal_key_id` still names the epoch it was sealed under.
+    ///
+    /// A clear event under a required group this node holds is refused, and
+    /// counted. Under any other policy (preferred or off) a clear event is
+    /// delivered as it arrives, so **a subscriber that needs every event
+    /// under the group sealed must check the event itself**: its
+    /// `seal_key_id` is `None`, or its payload `Payload::Clear`, exactly when
+    /// the event arrived in the clear. Only a required policy refuses one.
     pub async fn subscribe_group(
         &self,
         realm: &[u8; 32],
@@ -282,10 +293,14 @@ pub(super) async fn open_delivered(
     }
 }
 
-/// The event marked unopened, with the reason it could not be opened. Its
-/// payload stays the ciphertext, so nothing was read.
+/// The event marked unopened, with the reason it could not be opened and no
+/// payload: the same shape the other SDKs deliver, so an application that
+/// reads a payload without checking `unopened` is handed nothing rather than
+/// a ciphertext that looks like one. `seal_key_id` stays, which names the
+/// epoch it could not be opened under.
 fn unopened(mut event: station_link::Event, reason: Reason) -> station_link::Event {
     event.unopened = Some(reason);
+    event.payload = Payload::Clear(Value::Null);
     event
 }
 
@@ -303,4 +318,177 @@ fn fields_of(event: &station_link::Event) -> group::Fields {
 /// An event under a subscription whose group holds nothing to open it with.
 pub(super) fn unopened_no_group(event: station_link::Event) -> station_link::Event {
     unopened(event, Reason::NoGroup)
+}
+
+// The test scaffolding here builds canned replies and canned events, which
+// nests a block or two deeper than the gate allows. The gate still holds the
+// crate's own code to its limit.
+#[cfg(test)]
+#[allow(clippy::excessive_nesting)]
+mod tests {
+    use super::*;
+    use crate::group::{
+        seal_event, Epoch, Fields, JoinOptions, Keyring, Options as KeyringOptions, Policy, Puller,
+        Reply, EVENT_LIFE_MS, ID_SIZE, KEY_SIZE,
+    };
+
+    const PREFIX: &str = "io.macula/acme/chat";
+    const NOW: i64 = 1_790_000_000_000;
+    const PROVIDER: [u8; 32] = [9; 32];
+    const PUBLISHER: [u8; 32] = [3; 32];
+    const REALM: [u8; 32] = [7; 32];
+
+    fn our_epoch() -> Epoch {
+        let issued_at = NOW - 60_000;
+        let publish_until = issued_at + 15 * 60_000;
+        Epoch::new(
+            [1; ID_SIZE],
+            [2; KEY_SIZE],
+            issued_at,
+            publish_until,
+            publish_until + EVENT_LIFE_MS,
+        )
+    }
+
+    /// What an event's seal is bound to, as the delivered event carries it.
+    fn fields(topic: &str) -> Fields {
+        Fields {
+            realm: REALM,
+            topic: topic.to_string(),
+            publisher: PUBLISHER,
+            seq: 1,
+            published_at: NOW as u64,
+        }
+    }
+
+    /// A pool-free keyring holding `PREFIX` under `policy`, joined with a
+    /// distributor that answers the one canned reply.
+    async fn keyring(policy: Policy) -> Keyring {
+        let reply = crate::group::reply_value(&Reply {
+            prefix: PREFIX.into(),
+            policy,
+            epochs: vec![our_epoch()],
+        });
+        let puller: Puller = Arc::new(move |_pull| Box::pin(canned(reply.clone())));
+        let mut opts = KeyringOptions::new(puller);
+        opts.now = Arc::new(|| NOW);
+        let keyring = Keyring::new(opts);
+        keyring
+            .join(REALM, PREFIX, JoinOptions::default())
+            .await
+            .expect("the join is answered");
+        keyring
+    }
+
+    /// The one answer a test distributor gives.
+    async fn canned(reply: crate::cbor::Value) -> Result<(crate::cbor::Value, [u8; 32]), PullError> {
+        Ok((reply, PROVIDER))
+    }
+
+    fn topic() -> String {
+        format!("{PREFIX}/said_v1")
+    }
+
+    fn event(payload: Payload) -> station_link::Event {
+        station_link::Event {
+            publisher: PUBLISHER,
+            realm: REALM,
+            topic: topic(),
+            seq: 1,
+            published_at: NOW as u64,
+            seal_key_id: payload.sealed().map(|s| s.key_id),
+            payload,
+            delivered_via: "direct".into(),
+            unopened: None,
+        }
+    }
+
+    /// A group that is not required delivers a clear event as it arrives, so
+    /// a subscriber that needs every event sealed has to check it itself.
+    #[tokio::test]
+    async fn a_clear_event_is_delivered_under_a_preferred_group() {
+        for policy in [Policy::Preferred, Policy::Off] {
+            let keyring = keyring(policy).await;
+            let delivered = open_delivered(
+                &keyring,
+                Some(PREFIX),
+                event(Payload::Clear(Value::text("clear"))),
+            )
+            .await
+            .expect("a group that is not required delivers a clear event");
+            assert_eq!(delivered.unopened, None);
+            assert_eq!(
+                delivered.seal_key_id, None,
+                "a clear event names no epoch, which is how a subscriber tells"
+            );
+            assert_eq!(delivered.payload, Payload::Clear(Value::text("clear")));
+        }
+    }
+
+    /// A required group refuses a clear event outright: it is never
+    /// delivered, and the subscription counts it.
+    #[tokio::test]
+    async fn a_clear_event_is_refused_under_a_required_group() {
+        let keyring = keyring(Policy::Required).await;
+        assert!(open_delivered(
+            &keyring,
+            Some(PREFIX),
+            event(Payload::Clear(Value::text("clear")))
+        )
+        .await
+        .is_none());
+    }
+
+    /// A sealed event under a held epoch is opened and delivered in the shape
+    /// a clear one arrives in, still naming the epoch it was sealed under.
+    #[tokio::test]
+    async fn a_sealed_event_is_opened_and_names_its_epoch() {
+        let keyring = keyring(Policy::Required).await;
+        let sealed = seal_event(&our_epoch(), &fields(&topic()), &Value::text("sealed")).unwrap();
+        let delivered = open_delivered(&keyring, Some(PREFIX), event(Payload::Sealed(sealed)))
+            .await
+            .expect("a sealed event is delivered");
+        assert_eq!(delivered.unopened, None);
+        assert_eq!(delivered.seal_key_id, Some([1; ID_SIZE]));
+        assert_eq!(delivered.payload, Payload::Clear(Value::text("sealed")));
+    }
+
+    /// A sealed event that does not open under the epoch it names is still
+    /// delivered once, unopened, with the reason, and with no payload: an
+    /// application that reads a payload without checking `unopened` is handed
+    /// nothing rather than a ciphertext.
+    #[tokio::test]
+    async fn a_sealed_event_that_does_not_open_is_delivered_unopened() {
+        let keyring = keyring(Policy::Required).await;
+        // Sealed under another topic's AAD, so it cannot open under this one.
+        let sealed =
+            seal_event(&our_epoch(), &fields("io.macula/acme/chat/other_v1"), &Value::text("x"))
+                .unwrap();
+        let delivered =
+            open_delivered(&keyring, Some(PREFIX), event(Payload::Sealed(sealed.clone())))
+                .await
+                .expect("an event that does not open is still delivered");
+        assert_eq!(delivered.unopened, Some(Reason::TagInvalid));
+        assert_eq!(
+            delivered.seal_key_id,
+            Some([1; ID_SIZE]),
+            "the epoch it could not be opened under is still named"
+        );
+        assert_eq!(delivered.payload, Payload::Clear(Value::Null));
+
+        // And under an epoch the group does not hold, which the keyring pulls
+        // by id and the distributor does not answer with.
+        let elsewhere = Epoch::new(
+            [4; ID_SIZE],
+            [5; KEY_SIZE],
+            NOW - 60_000,
+            NOW + 15 * 60_000,
+            NOW + 15 * 60_000 + EVENT_LIFE_MS,
+        );
+        let sealed = seal_event(&elsewhere, &fields(&topic()), &Value::text("x")).unwrap();
+        let delivered = open_delivered(&keyring, Some(PREFIX), event(Payload::Sealed(sealed)))
+            .await
+            .expect("an event under an unknown epoch is still delivered");
+        assert_eq!(delivered.unopened, Some(Reason::NoDistributor));
+    }
 }

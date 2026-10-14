@@ -43,7 +43,11 @@
 > an open presents a UCAN, and a procedure served under a UCAN policy answers
 > only what it authorizes, every verdict held to macula's UCAN_V1 vectors and
 > every minted token authorized by macula's own `macula_ucan`
-> (`scripts/interop/ucan.sh`). Releases before 0.4.0 speak
+> (`scripts/interop/ucan.sh`). A group's events are published and read sealed
+> under the group's current epoch key, which the org's distributor hands out
+> over a sealed call under the org's grant, and an Erlang member and this
+> crate's member open each other's sealed event
+> (`scripts/interop/groups.sh`). Releases before 0.4.0 speak
 > the retired 10.x wire and cannot reach the current fleet.
 
 ## What is this?
@@ -170,6 +174,7 @@ compatibility layer.
 | Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links |
 | End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; `call_report` and `Stream::report` give the caller's seal report |
 | UCAN (`ucan`, `Call::token`, `Offer::policy`) | ✅ | ✅ | macula 12's tokens (D7) in the node's profile: `ucan::create` mints, a call or open presents a token and its chain's proofs, and an `Offer` gated on `Policy::UcanRequired` or `RealmMemberRequired` refuses what `ucan::authorize` does not accept `unauthorized` (a stray proof `malformed_frame`) before its handler runs; held to macula v13.6.0's `ucan_v1.json` |
+| Sealed groups (`group`, `join_group`, `publish_group`, `subscribe_group`) | ✅ | — | The member side of sealed pubsub (macula 13.2, `DESIGN_E2E_SEALED_PUBSUB.md`): a group is a topic prefix whose events are sealed once under its current epoch key, which the org's distributor hands out over a sealed call to a member holding the org's grant; epochs are re-pulled at a random instant in the ahead window and erased once no event under them is accepted, and keys never touch disk. Held to macula's `group_keys_v1` payloads byte for byte, the org's grant to macula's own verdicts, and a cross-test with macula's `macula_group_keys` distributor. This crate serves no distributor. A clear event under a *required* group is refused; under any other policy it is delivered as it arrives, so a subscriber that needs every event sealed checks `Event::seal_key_id` itself |
 | Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |
 | DHT (`find_record`, `find_records`, `find_records_by_type`, `put_record`) | ✅ | — | The versioned `_dht.*` forms; every record found verified as a reader verifies it before it is handed on; `record::check_as_custodian` runs the checks a station stores any record by |
 | Mobile bindings (Kotlin, Swift) | ✅ | ✅ | `macula-rust-ffi`, below |
@@ -271,6 +276,20 @@ With a key generated for the run and never saved, it reads the DHT, calls
 `mcl-echo/echo` by direct dial and hears its own publication.
 `scripts/cross-verify-macula.sh` renews the pq_hybrid signatures that crossed
 both ways with macula (`tests/vectors/identity/macula_12_cross`).
+
+`tests/interop_groups.rs` runs against macula's own distributor
+(`macula_group_keys`) in an Erlang peer, and is ignored unless asked:
+
+```bash
+MACULA_BUILD=<a compiled macula 15.0.0-rc.1 or later> \
+scripts/interop/groups.sh [pq_hybrid|pq_pure]
+```
+
+An Erlang member and the Rust member here subscribe under one group, each
+pulling the epoch from that distributor over a sealed call with the org's
+grant, and each publishes sealed under it; each must open the other's event.
+Then a node the distributor's removed set names must be refused
+`not_a_member` at this crate's public subscribe.
 
 ## Sibling SDKs
 
