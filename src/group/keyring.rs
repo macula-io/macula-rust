@@ -229,7 +229,9 @@ struct State {
     closed: bool,
 }
 
-/// The sealed groups one node holds. It is safe to share between tasks.
+/// The sealed groups one node holds. It is safe to share between tasks, and
+/// a clone shares the same groups.
+#[derive(Clone)]
 pub struct Keyring {
     inner: Arc<Inner>,
 }

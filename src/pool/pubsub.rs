@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::frame::Payload;
 use crate::station_link::{self, Event, Link, LinkError, Publication, SignedPublication};
 
 use super::{Pool, PoolError, PoolInner};
@@ -33,8 +34,12 @@ pub(super) struct SubInner {
     pool: Weak<PoolInner>,
     realm: [u8; 32],
     topic: String,
+    /// The sealed group's prefix this subscription opens under, `None` for a
+    /// plain subscription, which delivers payloads as they arrive.
+    group: Option<String>,
     held: Mutex<Held>,
     dropped: AtomicU64,
+    refused: AtomicU64,
 }
 
 struct Held {
@@ -57,12 +62,25 @@ impl Pool {
         realm: &[u8; 32],
         topic: &str,
     ) -> Result<Subscription, PoolError> {
+        self.subscribe_under(realm, topic, None).await
+    }
+
+    /// Subscribes the node to `topic` in `realm`, opening each event under
+    /// `group` when there is one.
+    pub(super) async fn subscribe_under(
+        &self,
+        realm: &[u8; 32],
+        topic: &str,
+        group: Option<String>,
+    ) -> Result<Subscription, PoolError> {
         let (events_tx, events) = mpsc::channel(SUBSCRIPTION_BUFFER);
         let sub = Arc::new(SubInner {
             id: NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed),
             pool: Arc::downgrade(&self.inner),
             realm: *realm,
             topic: topic.to_string(),
+            group,
+            refused: AtomicU64::new(0),
             held: Mutex::new(Held {
                 events: Some(events_tx),
                 on_links: HashMap::new(),
@@ -84,24 +102,18 @@ impl Pool {
     /// the pool's selection order, succeeding when one of them takes it.
     /// Every copy is the same publication, so a subscriber delivers it once.
     pub async fn publish(&self, p: Publication) -> Result<(), PoolError> {
-        let links = self.inner.links();
-        if links.is_empty() {
-            return Err(PoolError::NoLink(Vec::new()));
+        // A clear publish under a prefix whose sealed group this node holds is
+        // refused rather than sent in the clear or silently sealed.
+        let held = match p.payload {
+            Payload::Clear(_) => self.inner.held_prefix(&p.realm, &p.topic),
+            Payload::Sealed(_) => None,
+        };
+        if let Some(prefix) = held {
+            return Err(PoolError::GroupHeld(prefix));
         }
         let signed =
             SignedPublication::sign(&self.inner.opts.identity, &self.inner.publication_seq, p)?;
-        let mut errors = Vec::new();
-        let mut sent = 0;
-        for link in links.iter().take(self.inner.opts.replication_factor) {
-            match link.publish_signed(&signed).await {
-                Ok(()) => sent += 1,
-                Err(e) => errors.push(e),
-            }
-        }
-        if sent == 0 {
-            return Err(PoolError::NoLink(errors));
-        }
-        Ok(())
+        self.inner.send_signed(&signed).await
     }
 }
 
@@ -115,6 +127,12 @@ impl Subscription {
     /// How many events arrived while the subscription was full.
     pub fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
+    }
+
+    /// How many events a required group this node holds refused because they
+    /// arrived in the clear.
+    pub fn refused(&self) -> u64 {
+        self.inner.refused.load(Ordering::Relaxed)
     }
 
     /// Ends the subscription on every link.
@@ -158,6 +176,32 @@ fn register(pool: &PoolInner, sub: &Arc<SubInner>) -> Result<(), PoolError> {
 }
 
 impl SubInner {
+    /// Delivers one event: opened under the subscription's group when it has
+    /// one, counted refused when the group refuses it, and counted dropped
+    /// when the subscription is full.
+    async fn deliver(self: &Arc<Self>, events: &mpsc::Sender<Event>, event: Event) {
+        let Some(event) = self.delivered(event).await else {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if events.try_send(event).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The event as this subscription delivers it, or `None` when it is
+    /// refused outright.
+    async fn delivered(self: &Arc<Self>, event: Event) -> Option<Event> {
+        let Some(prefix) = self.group.as_deref() else {
+            return Some(event);
+        };
+        let groups = self.pool.upgrade().and_then(|pool| pool.held_groups());
+        match groups {
+            Some(groups) => super::group::open_delivered(&groups, Some(prefix), event).await,
+            None => Some(super::group::unopened_no_group(event)),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, Held> {
         self.held.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -249,11 +293,7 @@ async fn forward(
                 return;
             }
             event = on_link.recv() => match event {
-                Some(event) => {
-                    if events.try_send(event).is_err() {
-                        sub.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                Some(event) => sub.deliver(&events, event).await,
                 None => break,
             },
         }

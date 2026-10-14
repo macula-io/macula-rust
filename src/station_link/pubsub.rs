@@ -34,7 +34,8 @@ pub struct Publication {
 /// A publication a subscription heard, verified: who published it (the key
 /// id its signature verified under), where, its seq and time, the payload,
 /// and how it arrived (direct or plumtree). A sealed group event's payload is
-/// the ciphertext: opening it is [`crate::group`]'s.
+/// the ciphertext: opening it is [`crate::group`]'s, and an event that could
+/// not be opened is delivered once with the reason it could not be.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub publisher: [u8; 32],
@@ -44,6 +45,9 @@ pub struct Event {
     pub published_at: u64,
     pub payload: Payload,
     pub delivered_via: String,
+    /// Why a sealed event was not opened, on a subscription under a group.
+    /// `None` on every event that arrived clear, and on one that opened.
+    pub unopened: Option<crate::group::Reason>,
 }
 
 /// Numbers one publisher's publications: the first is the wall clock in
@@ -104,12 +108,25 @@ impl SignedPublication {
         seq: &PublicationSeq,
         p: Publication,
     ) -> Result<SignedPublication, LinkError> {
+        Self::sign_at(key, seq.next(), now_ms() as u64, p)
+    }
+
+    /// Signs `p` with `key` at a seq and time the caller fixed, which is what
+    /// a sealed group event needs: the event AAD binds the publication's seq
+    /// and published_at, so both are fixed before the payload is sealed, and
+    /// the seal and the publication carry the same two.
+    pub(crate) fn sign_at(
+        key: &NodeKey,
+        seq: u64,
+        published_at: u64,
+        p: Publication,
+    ) -> Result<SignedPublication, LinkError> {
         let frame = frame::sign_publish(
             &PublicationSpec {
                 realm: p.realm,
                 topic: p.topic,
-                seq: seq.next(),
-                published_at: now_ms() as u64,
+                seq,
+                published_at,
                 payload: p.payload,
                 ttl_ms: p.ttl_ms,
             },
@@ -301,6 +318,7 @@ pub(super) fn evented(inner: &Arc<Inner>, v: &Value) {
         published_at: publication.published_at,
         payload: publication.payload,
         delivered_via,
+        unopened: None,
     };
     let mut state = inner.lock();
     let Some(slots) = state.subs.get(&(publication.realm, publication.topic)) else {

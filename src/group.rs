@@ -24,10 +24,44 @@ pub use epoch::{
     EVENT_LIFE_MS, ID_SIZE, KEY_SIZE, TOLERANCE_MS,
 };
 pub use event::{open_event, seal_event, Fields};
-pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};
-pub use wire::{
+pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};pub use wire::{
     by_id_request, current_request, parse_reply, procedure, reply_value, Policy, Reply,
 };
+
+/// The sealed group a publish or a subscribe is under: its prefix, which the
+/// topic must be under and whose second segment is its org; the org's grant,
+/// a UCAN carrying `can` `group_keys`, presented on every key pull; and the
+/// distributor's node id when it must be that node.
+#[derive(Debug, Clone, Default)]
+pub struct Group {
+    pub prefix: String,
+    pub ucan: Vec<u8>,
+    pub distributor: Option<[u8; 32]>,
+}
+
+impl Group {
+    /// The join this group is made with.
+    pub fn join_options(&self) -> JoinOptions {
+        JoinOptions {
+            ucan: self.ucan.clone(),
+            distributor: self.distributor,
+        }
+    }
+
+    /// Checks the group against its topic before anything is sent: a prefix
+    /// that is not a group's, or a topic not under it, is refused here rather
+    /// than sealed under the wrong group.
+    pub fn covering(&self, topic: &str) -> Result<(), GroupError> {
+        org_of(&self.prefix)?;
+        if !under(topic, &self.prefix) {
+            return Err(GroupError::TopicNotUnder {
+                topic: topic.to_string(),
+                prefix: self.prefix.clone(),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Why a group's key could not be had, or an event could not be opened: the
 /// closed set every SDK names (DESIGN_E2E_SEALED_PUBSUB.md section 7).
@@ -109,6 +143,12 @@ pub enum GroupError {
     /// An event could not be sealed: a payload the wire cannot carry, or a
     /// primitive that failed. Nothing was published.
     NotSealed(Cause),
+    /// A topic that is not under the group's prefix, or a prefix that is not
+    /// a group's.
+    TopicNotUnder { topic: String, prefix: String },
+    /// The pool could not carry it: no link to publish on, a closed pool, or
+    /// a subscription the station refused.
+    Pool(Cause),
     /// A refusal or a failure by its reason, with whatever caused it.
     Refused { reason: Reason, cause: Option<Cause> },
 }
@@ -159,6 +199,10 @@ impl fmt::Display for GroupError {
                 f.write_str("group: the distributor's reply is not group_keys_v1's")
             }
             GroupError::NotSealed(cause) => write!(f, "group: the event was not sealed: {cause}"),
+            GroupError::TopicNotUnder { topic, prefix } => {
+                write!(f, "group: the topic {topic:?} is not under {prefix:?}")
+            }
+            GroupError::Pool(cause) => write!(f, "group: {cause}"),
             GroupError::Refused { reason, cause } => match cause {
                 Some(cause) => write!(f, "group: {reason}: {cause}"),
                 None => write!(f, "group: {reason}"),
@@ -171,7 +215,7 @@ impl Error for GroupError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             GroupError::NotAdvertised(cause) => cause.as_deref().map(|c| c as &dyn Error),
-            GroupError::NotSealed(cause) => Some(cause.as_ref()),
+            GroupError::NotSealed(cause) | GroupError::Pool(cause) => Some(cause.as_ref()),
             GroupError::Refused {
                 cause: Some(cause), ..
             } => Some(cause.as_ref()),

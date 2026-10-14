@@ -923,7 +923,7 @@ async fn watch_connection(link: std::sync::Weak<Inner>) {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     crate::uuid_v7::now_ms() as i64
 }
 

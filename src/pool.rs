@@ -17,12 +17,14 @@
 
 mod call;
 mod content;
+mod group;
 mod member;
 mod pubsub;
 mod serve;
 
 pub use crate::station_link::Confidentiality;
 pub use crate::station_link::{ConfidentialityError, ConfidentialityReason, Report, ReportError};
+use crate::station_link::SignedPublication;
 pub use call::{Call, Provider, StreamCall};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use pubsub::Subscription;
@@ -106,6 +108,9 @@ pub enum PoolError {
     /// A call or an open that could not be kept confidential, so nothing
     /// was sent.
     Confidentiality(ConfidentialityError),
+    /// A publish in the clear under a prefix whose sealed group this node
+    /// holds, and that prefix.
+    GroupHeld(String),
 }
 
 impl fmt::Display for PoolError {
@@ -257,6 +262,9 @@ pub(crate) struct PoolInner {
     dedup: Arc<EventDedup>,
     /// One node identity, one keyring, shared by every link.
     keyring: Option<Arc<Keyring>>,
+    /// The sealed groups this node holds, made on the first join and pulling
+    /// over this pool's own sealed calls.
+    groups: Mutex<Option<crate::group::Keyring>>,
     state: Mutex<State>,
     ticks: tokio::task::JoinHandle<()>,
     content: content::Sharer,
@@ -315,6 +323,7 @@ impl Pool {
             admission: Arc::new(Admission::new(admission)),
             dedup: Arc::default(),
             keyring,
+            groups: Mutex::new(None),
             state: Mutex::new(State {
                 members: Vec::new(),
                 subs: HashMap::new(),
@@ -374,6 +383,9 @@ impl Pool {
             return;
         };
         self.inner.ticks.abort();
+        if let Some(groups) = self.inner.groups.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            groups.close();
+        }
         for m in &members {
             m.retire();
         }
@@ -416,6 +428,27 @@ impl PoolInner {
     }
 
     /// The links up now, in the pool's selection order.
+    /// Sends a signed publication on the first `replication_factor` links, in
+    /// the pool's selection order, succeeding when one of them takes it.
+    pub(super) async fn send_signed(&self, signed: &SignedPublication) -> Result<(), PoolError> {
+        let links = self.links();
+        if links.is_empty() {
+            return Err(PoolError::NoLink(Vec::new()));
+        }
+        let mut errors = Vec::new();
+        let mut sent = 0;
+        for link in links.iter().take(self.opts.replication_factor) {
+            match link.publish_signed(signed).await {
+                Ok(()) => sent += 1,
+                Err(e) => errors.push(e),
+            }
+        }
+        if sent == 0 {
+            return Err(PoolError::NoLink(errors));
+        }
+        Ok(())
+    }
+
     fn links(&self) -> Vec<Link> {
         let members = self.lock().members.clone();
         let mut up: Vec<Link> = members.iter().filter_map(|m| m.current()).collect();
