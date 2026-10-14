@@ -15,6 +15,8 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.11.0-rc.1] - 2026-10-14
+
 #### Added
 
 - **Sealed groups: the member side** (`group`, and `join_group`,
@@ -807,6 +809,8 @@ did, but the two have moved at different paces ever since).
 
 
 ### [Unreleased]
+
+### [ffi-0.10.0] - 2026-10-14
 
 #### Added
 
