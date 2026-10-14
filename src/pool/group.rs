@@ -331,6 +331,11 @@ pub(super) fn without_a_group(event: station_link::Event) -> station_link::Event
 #[cfg(test)]
 #[allow(clippy::excessive_nesting)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    use tokio::sync::Semaphore;
+
     use super::*;
     use crate::group::{
         seal_event, Epoch, Fields, JoinOptions, Keyring, Options as KeyringOptions, Policy, Puller,
@@ -406,6 +411,77 @@ mod tests {
             delivered_via: "direct".into(),
             unopened: None,
         }
+    }
+
+    /// A keyring holding `PREFIX` at required, whose pulls after the first
+    /// wait on `gate`, so a test can leave one in flight.
+    fn gated_keyring(gate: Arc<Semaphore>, turns: &Arc<AtomicUsize>) -> Keyring {
+        let reply = crate::group::reply_value(&Reply {
+            prefix: PREFIX.into(),
+            policy: Policy::Required,
+            epochs: vec![our_epoch()],
+        });
+        let turns = Arc::clone(turns);
+        let puller: Puller = Arc::new(move |_pull| {
+            let reply = reply.clone();
+            let turns = Arc::clone(&turns);
+            let gate = Arc::clone(&gate);
+            Box::pin(async move {
+                if turns.fetch_add(1, Ordering::SeqCst) > 0 {
+                    let _turned = Arc::clone(&gate).acquire_owned().await;
+                }
+                Ok((reply, PROVIDER))
+            })
+        });
+        Keyring::new(KeyringOptions {
+            pull: puller,
+            pull_timeout: Duration::from_secs(30),
+            now: Arc::new(|| NOW),
+            uniform: Arc::new(|| 0.5),
+        })
+    }
+
+    /// A pull in flight does not lift the policy on a plain subscription
+    /// either: while the group's epoch is being pulled by id, a clear event
+    /// under its prefix is still refused, which is what stops a forged one
+    /// being delivered behind a pull an attacker can make take its timeout.
+    #[tokio::test]
+    async fn a_pull_in_flight_does_not_let_a_clear_event_through_a_plain_subscription() {
+        let gate = Arc::new(Semaphore::new(0));
+        let turns = Arc::new(AtomicUsize::new(0));
+        let keyring = gated_keyring(Arc::clone(&gate), &turns);
+        keyring
+            .join(REALM, PREFIX, JoinOptions::default())
+            .await
+            .expect("the join is answered");
+
+        let pulling = {
+            let keyring = keyring.clone();
+            tokio::spawn(async move {
+                keyring
+                    .open_epoch(REALM, PREFIX, [9; ID_SIZE], PUBLISHER)
+                    .await
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while turns.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(turns.load(Ordering::SeqCst), 2, "the by-id pull went out");
+
+        assert!(
+            open_delivered(
+                &keyring,
+                None,
+                event(Payload::Clear(Value::text("forged")))
+            )
+            .await
+            .is_none(),
+            "a plain subscription refuses it while the pull is out too"
+        );
+
+        gate.add_permits(1);
+        let _ = pulling.await;
     }
 
     /// A group that is not required delivers a clear event as it arrives, so

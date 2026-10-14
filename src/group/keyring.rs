@@ -127,6 +127,41 @@ enum Known {
     Unknown,
 }
 
+/// What one pull needs from its group, taken under the lock and owned by the
+/// pull. The group itself stays in the keyring for the whole of the pull, so
+/// the policy it enforces does not lapse while the network is slow: a pull is
+/// up to fifteen seconds, and an attacker who can make one take that long
+/// must not thereby lift a required policy.
+struct Request {
+    org: String,
+    ucan: Vec<u8>,
+    provider: Option<[u8; 32]>,
+}
+
+impl Request {
+    fn of(held: &Held) -> Request {
+        Request {
+            org: held.org.clone(),
+            ucan: held.ucan.clone(),
+            provider: match held.pin_kind {
+                PinKind::None => None,
+                PinKind::User | PinKind::Auto => Some(held.pin),
+            },
+        }
+    }
+}
+
+/// What a pull came back with, to be applied to its group under the lock.
+enum Outcome {
+    /// The distributor answered, and its reply is the protocol's.
+    Answered { reply: Reply, provider: [u8; 32] },
+    /// No trusted distributor advertises the procedure, so an auto-pin this
+    /// node took from an earlier answer is dropped.
+    NotAdvertised(GroupError),
+    /// The pull failed, by the reason it is held as.
+    Failed(GroupError),
+}
+
 /// A held group's epochs and policy, without its timer.
 struct Held {
     org: String,
@@ -162,13 +197,13 @@ impl Held {
 
     /// Takes a reply into the group: its policy monotonically, its rotation,
     /// and its epochs the group does not hold yet, oldest first.
-    fn merge(&mut self, reply: Reply) {
+    fn merge(&mut self, reply: &Reply) {
         self.policy = Some(reply.policy.following(self.policy));
         if let Some(first) = reply.epochs.first() {
             self.rotation = first.rotation();
         }
-        for epoch in reply.epochs {
-            self.keep(epoch);
+        for epoch in &reply.epochs {
+            self.keep(epoch.clone());
         }
         self.epochs.sort_by_key(|e| e.issued_at);
     }
@@ -195,6 +230,12 @@ impl Held {
         if self.pin_kind == PinKind::Auto {
             self.pin_kind = PinKind::None;
         }
+    }
+
+    /// Remembers an id the distributor said it does not know, until a moment
+    /// past which it could no longer be accepted anyway.
+    fn forgot(&mut self, id: [u8; ID_SIZE], until: i64) {
+        self.unknown.insert(id, until);
     }
 
     /// Charges one unknown-id pull to `publisher`, at most three per rotation.
@@ -331,14 +372,20 @@ impl Inner {
             return Ok(policy);
         }
         let mut held = Held::new(org, &opts);
-        let reply = self.pull(&key, &mut held, current_request(prefix)).await?;
-        held.merge(reply);
+        let request = Request::of(&held);
+        match self.pull(&key, &request, current_request(prefix)).await {
+            Outcome::Answered { reply, provider } => {
+                held.pin_answered(provider);
+                held.merge(&reply);
+            }
+            Outcome::NotAdvertised(e) | Outcome::Failed(e) => return Err(e),
+        }
         let policy = held.policy.unwrap_or(Policy::Off);
         let mut state = self.lock();
         if state.closed {
             return Err(GroupError::NotJoined);
         }
-        state.groups.insert(key.clone(), Joined::new(held));
+        state.groups.entry(key.clone()).or_insert_with(|| Joined::new(held));
         drop(state);
         self.schedule(&key);
         Ok(policy)
@@ -375,18 +422,15 @@ impl Inner {
         if let Some(epoch) = self.publishable(&key) {
             return Ok(epoch);
         }
-        let mut joined = self.take(&key)?;
-        let reply = self
-            .pull(&key, &mut joined.held, current_request(prefix))
-            .await;
-        match reply {
-            Ok(reply) => joined.held.merge(reply),
-            Err(e) => {
-                self.back_off(&key, joined);
-                return Err(e);
-            }
+        let request = self.request_of(&key)?;
+        let outcome = self.pull(&key, &request, current_request(prefix)).await;
+        if let Err(e) = self.applied(&key, outcome, None) {
+            self.back_off(&key);
+            return Err(e);
         }
-        self.store(&key, joined)
+        self.schedule(&key);
+        self.publishable(&key)
+            .ok_or_else(|| GroupError::of(Reason::NoDistributor))
     }
 
     async fn open_epoch(
@@ -408,57 +452,77 @@ impl Inner {
             Known::Expired => return Err(GroupError::of(Reason::EpochExpired)),
             Known::Unknown => {}
         }
-        let mut joined = self.take(&key)?;
-        if self.unknown_already(&joined.held, id)
-            || !joined.held.spend(publisher, (self.opts.now)())
-        {
-            self.put(&key, joined);
-            return Err(GroupError::of(Reason::UnknownEpoch));
+        self.charge(&key, id, publisher)?;
+        let request = self.request_of(&key)?;
+        let outcome = self.pull(&key, &request, by_id_request(prefix, &id)).await;
+        self.applied(&key, outcome, Some(id))?;
+        match self.known(&key, id)? {
+            Known::Held(epoch) => Ok(epoch),
+            Known::Expired => Err(GroupError::of(Reason::EpochExpired)),
+            Known::Unknown => Err(GroupError::of(Reason::NoDistributor)),
         }
-        let reply = self
-            .pull(&key, &mut joined.held, by_id_request(prefix, &id))
-            .await;
-        match reply {
-            Ok(reply) => joined.held.merge(reply),
-            Err(e) => {
-                self.put_after_failed_pull(&key, joined, id, &e);
-                return Err(e);
-            }
-        }
-        let found = joined
-            .held
-            .epochs
-            .iter()
-            .find(|epoch| epoch.id == id)
-            .cloned();
-        self.put_pruned(&key, joined);
-        answer_epoch(found, (self.opts.now)())
     }
 
-    /// Whether the distributor has already said it does not know this id, so
-    /// it is not asked again until the id could no longer be accepted anyway.
-    fn unknown_already(&self, held: &Held, id: [u8; ID_SIZE]) -> bool {
-        let now = (self.opts.now)();
-        held.unknown.get(&id).is_some_and(|until| *until > now)
-    }
-
-    /// Puts a group back after a failed by-id pull, remembering an
-    /// `unknown_epoch` answer so the id is not asked for again while it could
-    /// still be accepted.
-    fn put_after_failed_pull(
+    /// Charges one unknown-id pull to `publisher`, at most three a rotation,
+    /// and nothing at all for an id the distributor has already said it does
+    /// not know, which is remembered until the id could no longer be accepted
+    /// anyway.
+    fn charge(
         &self,
         key: &GroupKey,
-        mut joined: Joined,
         id: [u8; ID_SIZE],
-        e: &GroupError,
-    ) {
-        if e.is(Reason::UnknownEpoch) {
-            joined
-                .held
-                .unknown
-                .insert(id, (self.opts.now)() + EVENT_LIFE_MS);
+        publisher: [u8; 32],
+    ) -> Result<(), GroupError> {
+        let now = (self.opts.now)();
+        let mut state = self.lock();
+        let joined = state.groups.get_mut(key).ok_or(GroupError::NotJoined)?;
+        let remembered = joined.held.unknown.get(&id).is_some_and(|until| *until > now);
+        if remembered || !joined.held.spend(publisher, now) {
+            return Err(GroupError::of(Reason::UnknownEpoch));
         }
-        self.put_pruned(key, joined);
+        Ok(())
+    }
+
+    /// Applies a pull's outcome to the group it was made for, which stayed in
+    /// the keyring throughout: its policy and epochs, the distributor that
+    /// answered, an auto-pin no advertisement holds any more, and an id the
+    /// distributor said it does not know. The epochs no longer of use are
+    /// erased here too.
+    fn applied(
+        &self,
+        key: &GroupKey,
+        outcome: Outcome,
+        unknown_id: Option<[u8; ID_SIZE]>,
+    ) -> Result<Reply, GroupError> {
+        let now = (self.opts.now)();
+        let mut state = self.lock();
+        let joined = state.groups.get_mut(key).ok_or(GroupError::NotJoined)?;
+        match outcome {
+            Outcome::Answered { reply, provider } => {
+                joined.held.pin_answered(provider);
+                joined.held.merge(&reply);
+                retain_live(&mut joined.held.epochs, now);
+                Ok(reply)
+            }
+            Outcome::NotAdvertised(e) => {
+                joined.held.unpin_auto();
+                Err(e)
+            }
+            Outcome::Failed(e) => {
+                let forgotten = e.is(Reason::UnknownEpoch).then_some(unknown_id).flatten();
+                forgotten
+                    .into_iter()
+                    .for_each(|id| joined.held.forgot(id, now + EVENT_LIFE_MS));
+                Err(e)
+            }
+        }
+    }
+
+    /// What a pull needs from the group, taken under the lock.
+    fn request_of(&self, key: &GroupKey) -> Result<Request, GroupError> {
+        let state = self.lock();
+        let joined = state.groups.get(key).ok_or(GroupError::NotJoined)?;
+        Ok(Request::of(&joined.held))
     }
 
     fn close(&self) {
@@ -493,64 +557,30 @@ impl Inner {
         })
     }
 
-    /// Takes a group out of the keyring for a pull, so the lock is not held
-    /// across the network.
-    fn take(&self, key: &GroupKey) -> Result<Joined, GroupError> {
-        self.lock().groups.remove(key).ok_or(GroupError::NotJoined)
-    }
-
-    /// Puts a group back after a pull, erasing the epochs no longer of use,
-    /// and schedules its re-pull. It answers the epoch to publish under now,
-    /// when the group holds one.
-    fn store(self: &Arc<Self>, key: &GroupKey, mut joined: Joined) -> Result<Epoch, GroupError> {
-        let now = (self.opts.now)();
-        retain_live(&mut joined.held.epochs, now);
-        let epoch = for_publish(&joined.held.epochs, now).cloned();
-        self.put(key, joined);
-        self.schedule(key);
-        epoch.ok_or_else(|| GroupError::of(Reason::NoDistributor))
-    }
-
-    /// Puts a group back after a pull, erasing the epochs no longer of use
-    /// and scheduling nothing.
-    fn put_pruned(&self, key: &GroupKey, mut joined: Joined) {
-        retain_live(&mut joined.held.epochs, (self.opts.now)());
-        self.put(key, joined);
-    }
-
-    /// Puts a group back as it is, scheduling nothing.
-    fn put(&self, key: &GroupKey, joined: Joined) {
-        let mut state = self.lock();
-        if !state.closed {
-            state.groups.insert(key.clone(), joined);
-        }
-    }
-
-    /// Makes one pull for `held`: under the group's grant, at its pinned
-    /// distributor when it has one, within the pull timeout. An answer that
-    /// parses keeps the answering node as the group's distributor when none
-    /// is pinned; anything else answers the reason it is held as.
+    /// Makes one pull: under the group's grant, at its pinned distributor when
+    /// it has one, within the pull timeout. The group is not touched here; the
+    /// caller applies what comes back, under the lock, so the group and the
+    /// policy it carries stay where they are for the whole of the pull.
     async fn pull(
         self: &Arc<Self>,
         key: &GroupKey,
-        held: &mut Held,
+        request: &Request,
         payload: Value,
-    ) -> Result<Reply, GroupError> {
+    ) -> Outcome {
         let pull = Pull {
             realm: key.0,
-            procedure: procedure(&held.org),
+            procedure: procedure(&request.org),
             payload,
-            token: held.ucan.clone(),
-            provider: match held.pin_kind {
-                PinKind::None => None,
-                PinKind::User | PinKind::Auto => Some(held.pin),
-            },
+            token: request.ucan.clone(),
+            provider: request.provider,
         };
         let answer = match tokio::time::timeout(self.opts.pull_timeout, (self.opts.pull)(pull))
             .await
         {
             Ok(answer) => answer,
-            Err(_) => return Err(GroupError::caused_by(Reason::NoDistributor, Elapsed)),
+            Err(_) => {
+                return Outcome::Failed(GroupError::caused_by(Reason::NoDistributor, Elapsed))
+            }
         };
         match answer {
             Ok((mut result, provider)) => {
@@ -560,22 +590,21 @@ impl Inner {
                 // The reply carried every epoch key as bytes: wipe them
                 // whether or not it parsed.
                 zeroize_reply(&mut result);
-                let reply =
-                    parsed.map_err(|e| GroupError::caused_by(Reason::NoDistributor, e))?;
-                held.pin_answered(provider);
-                Ok(reply)
+                match parsed {
+                    Ok(reply) => Outcome::Answered { reply, provider },
+                    Err(e) => Outcome::Failed(GroupError::caused_by(Reason::NoDistributor, e)),
+                }
             }
             Err(PullError::NotAdvertised(cause)) => {
-                held.unpin_auto();
-                Err(GroupError::Refused {
+                Outcome::NotAdvertised(GroupError::Refused {
                     reason: Reason::NoDistributor,
                     cause: Some(cause),
                 })
             }
             Err(PullError::Refused { reason, cause }) => {
-                Err(GroupError::Refused { reason, cause })
+                Outcome::Failed(GroupError::Refused { reason, cause })
             }
-            Err(PullError::Failed(cause)) => Err(GroupError::Refused {
+            Err(PullError::Failed(cause)) => Outcome::Failed(GroupError::Refused {
                 reason: Reason::NoDistributor,
                 cause: Some(cause),
             }),
@@ -587,32 +616,24 @@ impl Inner {
     /// group that has been left or erased.
     async fn repull(self: Arc<Self>, key: GroupKey, generation: u64) {
         let _gate = self.pulls.lock().await;
-        let Some(mut joined) = self.take_for_wake(&key, generation) else {
+        if !self.current_generation(&key, generation) {
+            return;
+        }
+        let Ok(request) = self.request_of(&key) else {
             return;
         };
-        let reply = self
-            .pull(&key, &mut joined.held, current_request(&key.1))
-            .await;
-        match reply {
-            Ok(reply) => {
-                joined.held.merge(reply);
-                let _ = self.store(&key, joined);
-            }
-            Err(_) => self.back_off(&key, joined),
+        let outcome = self.pull(&key, &request, current_request(&key.1)).await;
+        match self.applied(&key, outcome, None) {
+            Ok(_) => self.schedule(&key),
+            Err(_) => self.back_off(&key),
         }
     }
 
-    /// Takes the group out for a scheduled re-pull, unless the wake-up names
-    /// an older generation than the group's, or the keyring is closed: either
-    /// way the group is put back and the wake-up does nothing.
-    fn take_for_wake(&self, key: &GroupKey, generation: u64) -> Option<Joined> {
-        let mut state = self.lock();
-        let joined = state.groups.remove(key)?;
-        if joined.generation != generation || state.closed {
-            state.groups.insert(key.clone(), joined);
-            return None;
-        }
-        Some(joined)
+    /// Whether the group is still held under the generation a wake-up names,
+    /// and the keyring is open.
+    fn current_generation(&self, key: &GroupKey, generation: u64) -> bool {
+        let state = self.lock();
+        !state.closed && state.groups.get(key).is_some_and(|j| j.generation == generation)
     }
 
     /// Sets the group's one re-pull, at a random instant in its newest
@@ -629,15 +650,25 @@ impl Inner {
 
     /// Retries a failed pull after the group's backoff, then doubles it, up
     /// to a third of an epoch.
-    fn back_off(self: &Arc<Self>, key: &GroupKey, mut joined: Joined) {
+    fn back_off(self: &Arc<Self>, key: &GroupKey) {
+        if let Some((generation, delay)) = self.schedule_back_off(key) {
+            self.spawn_wake_for(key, generation, delay);
+        }
+    }
+
+    /// Doubles the group's backoff, erases the epochs no longer of use, and
+    /// answers the generation its next attempt must name, and how long until
+    /// then. `None` when the group is gone.
+    fn schedule_back_off(&self, key: &GroupKey) -> Option<(u64, i64)> {
+        let now = (self.opts.now)();
+        let mut state = self.lock();
+        let joined = state.groups.get_mut(key)?;
         let delay = joined.held.backoff;
         let capped = (joined.held.rotation / 3).max(FIRST_BACKOFF_MS);
         joined.held.backoff = (joined.held.backoff * 2).min(capped);
-        retain_live(&mut joined.held.epochs, (self.opts.now)());
-        let generation = self.put_rescheduled(key, joined);
-        if let Some(generation) = generation {
-            self.spawn_wake_for(key, generation, delay);
-        }
+        retain_live(&mut joined.held.epochs, now);
+        joined.generation += 1;
+        Some((joined.generation, delay))
     }
 
     /// Bumps the group's generation and answers how long until its next
@@ -654,18 +685,6 @@ impl Inner {
         joined.held.backoff = FIRST_BACKOFF_MS;
         joined.generation += 1;
         Some(delay)
-    }
-
-    /// Puts a group back and answers the generation its re-pull must name.
-    fn put_rescheduled(self: &Arc<Self>, key: &GroupKey, mut joined: Joined) -> Option<u64> {
-        joined.generation += 1;
-        let generation = joined.generation;
-        let mut state = self.lock();
-        if state.closed {
-            return None;
-        }
-        state.groups.insert(key.clone(), joined);
-        Some(generation)
     }
 
     fn spawn_wake(self: &Arc<Self>, key: &GroupKey, delay: i64) {
@@ -710,17 +729,6 @@ impl Joined {
             generation: 0,
             timer: None,
         }
-    }
-}
-
-/// The epoch an open answers once the pull is done: the one asked for while
-/// it is acceptable, a refusal once it is past its life, and no distributor
-/// when the reply carried no such epoch.
-fn answer_epoch(found: Option<Epoch>, now: i64) -> Result<Epoch, GroupError> {
-    match found {
-        Some(epoch) if epoch.acceptable(now) => Ok(epoch),
-        Some(_) => Err(GroupError::of(Reason::EpochExpired)),
-        None => Err(GroupError::of(Reason::NoDistributor)),
     }
 }
 
@@ -773,7 +781,8 @@ impl std::error::Error for Elapsed {}
 mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use super::*;
     use crate::group::wire::reply_value;
@@ -876,6 +885,51 @@ mod tests {
 
     fn clock() -> Arc<AtomicI64> {
         Arc::new(AtomicI64::new(NOW))
+    }
+
+    /// A keyring whose pulls wait on `gate` after the first, so a test can
+    /// leave one in flight. It answers how many pulls it has been asked for.
+    fn gated_keyring(
+        answers: Vec<Answer>,
+        gate: Arc<tokio::sync::Semaphore>,
+        now: &Arc<AtomicI64>,
+    ) -> (Keyring, Arc<AtomicUsize>) {
+        let answers = Arc::new(Mutex::new(VecDeque::from(answers)));
+        let turns = Arc::new(AtomicUsize::new(0));
+        let puller: Puller = Arc::new({
+            let answers = Arc::clone(&answers);
+            let turns = Arc::clone(&turns);
+            move |_pull| {
+                let answers = Arc::clone(&answers);
+                let turns = Arc::clone(&turns);
+                let gate = Arc::clone(&gate);
+                Box::pin(async move {
+                    if turns.fetch_add(1, Ordering::SeqCst) > 0 {
+                        let _turned = Arc::clone(&gate).acquire_owned().await;
+                    }
+                    let answer = answers.lock().unwrap().pop_front();
+                    answer.unwrap_or_else(|| Err(PullError::Failed(Box::new(NoAnswer))))
+                })
+            }
+        });
+        let now = Arc::clone(now);
+        let keyring = Keyring::new(Options {
+            pull: puller,
+            pull_timeout: Duration::from_secs(30),
+            now: Arc::new(move || now.load(Ordering::SeqCst)),
+            uniform: Arc::new(|| 0.5),
+        });
+        (keyring, turns)
+    }
+
+    /// Waits until a test's own pulls have reached `wanted`, so an assertion
+    /// is made while one is genuinely in flight.
+    async fn until_asked(turns: &Arc<AtomicUsize>, wanted: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while turns.load(Ordering::SeqCst) < wanted && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(turns.load(Ordering::SeqCst), wanted, "the pull went out");
     }
 
     fn joined(ucan: Vec<u8>) -> JoinOptions {
@@ -1019,6 +1073,56 @@ mod tests {
         assert!(refused.is(Reason::NoDistributor), "{refused}");
         assert_eq!(refused.reason(), Some(Reason::NoDistributor));
         assert!(refused.source().is_some(), "the parse failure is the cause");
+    }
+
+    /// A pull in flight does not take the group out of the keyring: the policy
+    /// it carries is enforced for the whole of the pull, and the epochs it
+    /// holds still open. An attacker who can make a pull take its full timeout
+    /// cannot use that to lift a required policy, nor to have a held event
+    /// read as one from a group this node does not hold.
+    #[tokio::test]
+    async fn a_pull_in_flight_does_not_lift_the_policy() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (keyring, turns) = gated_keyring(
+            vec![answered(Policy::Required, vec![epoch(1, 60_000)])],
+            Arc::clone(&gate),
+            &clock(),
+        );
+        keyring
+            .join([7; 32], PREFIX, joined(Vec::new()))
+            .await
+            .unwrap();
+
+        // An id the group does not hold is pulled by id, and that pull waits.
+        let pulling = {
+            let keyring = keyring.clone();
+            tokio::spawn(async move {
+                keyring
+                    .open_epoch([7; 32], PREFIX, [9; ID_SIZE], PUBLISHER)
+                    .await
+            })
+        };
+        until_asked(&turns, 2).await;
+
+        assert_eq!(
+            keyring.policy([7; 32], PREFIX).map(|(_, policy)| policy),
+            Some(Policy::Required),
+            "the policy holds while a pull is out"
+        );
+        let held = keyring
+            .open_epoch([7; 32], PREFIX, [1; ID_SIZE], PUBLISHER)
+            .await
+            .expect("an epoch the group holds still opens");
+        assert_eq!(held.id, [1; ID_SIZE]);
+        let published = keyring
+            .publish_epoch([7; 32], PREFIX)
+            .await
+            .expect("and one it can still publish under");
+        assert_eq!(published.id, [1; ID_SIZE]);
+
+        gate.add_permits(1);
+        let refused = pulling.await.unwrap().unwrap_err();
+        assert!(refused.is(Reason::NoDistributor), "{refused}");
     }
 
     /// A distributor that refuses with one of the design's reasons reaches the
