@@ -1,6 +1,7 @@
 //! Signed objects, as macula_signed_object signs and verifies them: fields
 //! gain alg, the signature covers the label, the key's SHA-384 and the tbs as
-//! received, and a verifier reads the object in macula's order.
+//! received, and a verifier reads the object in macula's order: alg before
+//! the signature.
 
 use macula_rust::cbor::Value;
 use macula_rust::node_key::{NodeKey, Purpose};
@@ -36,8 +37,14 @@ fn a_signed_object_verifies_under_its_label_and_names_its_algorithm() {
             verify_object("MACULA-OTHER-V1", &object.to_value(), profile).unwrap_err(),
             ObjectError::SignatureInvalid
         );
+        // Another well-formed tbs naming the profile's alg passes the cheap
+        // read, so the signature refuses it.
         let mut altered = object.clone();
-        altered.tbs[3] ^= 1;
+        altered.tbs = macula_rust::cbor::encode(&Value::Map(vec![
+            (Value::text("alg"), Value::text(profile.sig_alg())),
+            (Value::text("seq"), Value::Int(8)),
+        ]))
+        .unwrap();
         assert_eq!(
             verify_object("MACULA-TEST-V1", &altered.to_value(), profile).unwrap_err(),
             ObjectError::SignatureInvalid
@@ -102,4 +109,68 @@ fn an_object_of_the_wrong_shape_or_another_profile_is_refused() {
     assert!(sign_object("MACULA-TEST-V1", &duplicate, &key).is_err());
     let int_key = vec![(Value::Int(1), Value::Int(1))];
     assert!(sign_object("MACULA-TEST-V1", &int_key, &key).is_err());
+}
+
+/// The tbs naming the other profile's algorithm, and nothing else.
+fn foreign_alg_tbs(profile: Profile) -> Vec<u8> {
+    let other = match profile {
+        Profile::PqPure => Profile::PqHybrid,
+        Profile::PqHybrid => Profile::PqPure,
+    };
+    macula_rust::cbor::encode(&Value::Map(vec![(
+        Value::text("alg"),
+        Value::text(other.sig_alg()),
+    )]))
+    .unwrap()
+}
+
+/// A signature of the profile's length that verifies over nothing.
+fn not_a_signature(profile: Profile) -> Vec<u8> {
+    vec![0x5A; macula_rust::node_key::signature_size(profile)]
+}
+
+/// alg is read before the signature (macula#104): an object naming another
+/// algorithm, or a tbs that does not decode to a map naming alg, is refused
+/// on that cheap read, so a signature that would not verify never names the
+/// refusal and no signature verification is spent on it.
+#[test]
+fn alg_and_tbs_are_refused_before_the_signature() {
+    for profile in [Profile::PqPure, Profile::PqHybrid] {
+        let key = NodeKey::generate(Purpose::Identity, profile).unwrap();
+        let carried = |tbs: Vec<u8>| {
+            Object {
+                key: key.public_key(),
+                tbs,
+                signature: not_a_signature(profile),
+            }
+            .to_value()
+        };
+        let held = |tbs: Vec<u8>| {
+            HeldObject {
+                tbs,
+                signature: not_a_signature(profile),
+            }
+            .to_value()
+        };
+        let cases = [
+            (foreign_alg_tbs(profile), ObjectError::AlgMismatch),
+            (vec![0x82, 0x01, 0x02], ObjectError::Malformed),
+            (
+                macula_rust::cbor::encode(&Value::Map(vec![(Value::text("seq"), Value::Int(1))]))
+                    .unwrap(),
+                ObjectError::Malformed,
+            ),
+        ];
+        for (tbs, refusal) in cases {
+            assert_eq!(
+                verify_object("MACULA-TEST-V1", &carried(tbs.clone()), profile).unwrap_err(),
+                refusal
+            );
+            assert_eq!(
+                verify_held_object("MACULA-TEST-V1", &held(tbs), &key.public_key(), profile)
+                    .unwrap_err(),
+                refusal
+            );
+        }
+    }
 }

@@ -15,6 +15,17 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Security
+
+- **A signed object naming a foreign algorithm is refused before any
+  signature verification** (macula#104). `verify_object` and
+  `verify_held_object` decode tbs and check its alg against the verifier's
+  profile before the ML-DSA-87 verify, as macula's `macula_signed_object`
+  now does and as `verify_object_by_alg` (records) already did. An object
+  with a foreign alg, or a tbs that does not decode, under a signature that
+  does not verify is now `AlgMismatch` or `Malformed` where it was
+  `SignatureInvalid`.
+
 #### Changed
 
 - **`subscribe` returns once the station has accepted the subscription**

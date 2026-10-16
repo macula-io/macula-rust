@@ -163,9 +163,11 @@ pub fn sign_held_object(
 
 /// Verifies an object that carries its key, under `label` and the verifier's
 /// `profile`, in macula's order: exactly key, tbs and signature, each a byte
-/// string; key in the profile's carried form; the signature over tbs as
-/// received; only then tbs under the decoding rule, a map whose alg names the
-/// profile's algorithm. alg is checked and never selects an algorithm.
+/// string; key in the profile's carried form; tbs under the decoding rule, a
+/// map whose alg names the profile's algorithm; only then the signature over
+/// tbs as received. Reading alg first is the cheap refusal: an object naming
+/// another algorithm costs a decode, never a signature verification
+/// (macula#104). alg is checked and never selects an algorithm.
 pub fn verify_object(
     label: &str,
     value: &Value,
@@ -233,14 +235,6 @@ fn verified(
     signature: &[u8],
     profile: Profile,
 ) -> Result<VerifiedObject, ObjectError> {
-    if !verify(
-        &object_signed_bytes(label, &key, &tbs),
-        signature,
-        &key,
-        profile,
-    ) {
-        return Err(ObjectError::SignatureInvalid);
-    }
     let fields = cbor::decode(&tbs).map_err(|_| ObjectError::Malformed)?;
     let alg = match (&fields, fields.get("alg")) {
         (Value::Map(_), Some(Value::Text(alg))) => alg.clone(),
@@ -248,6 +242,14 @@ fn verified(
     };
     if alg != profile.sig_alg() {
         return Err(ObjectError::AlgMismatch);
+    }
+    if !verify(
+        &object_signed_bytes(label, &key, &tbs),
+        signature,
+        &key,
+        profile,
+    ) {
+        return Err(ObjectError::SignatureInvalid);
     }
     Ok(VerifiedObject { key, tbs, fields })
 }
