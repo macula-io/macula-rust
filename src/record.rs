@@ -154,6 +154,8 @@ pub enum RecordError {
     NotADomainType,
     /// A domain record's subject that is empty.
     InvalidSubject,
+    /// A domain record's payload that is not a CBOR map (WIRE_1_0.md 5.1).
+    PayloadNotAMap,
     /// A signature that does not verify.
     SignatureInvalid,
     /// An alg the verifier's allowlist does not hold, refused before any
@@ -225,6 +227,9 @@ impl fmt::Display for RecordError {
                 write!(f, "the procedure delegation does not verify: {why}")
             }
             RecordError::Key(e) => write!(f, "{e}"),
+            RecordError::PayloadNotAMap => {
+                write!(f, "a record payload must be a CBOR map (WIRE_1_0.md 5.1)")
+            }
             other => write!(f, "{other:?}"),
         }
     }
@@ -293,7 +298,8 @@ fn unsigned(record_type: RecordType, payload: Value, ttl_ms: u64) -> Record {
 
 /// An unsigned record of a domain type, 0x20 to 0xFF, with `subject`, living
 /// `ttl_ms`, or 48 hours when 0. An empty subject would name a slot apart
-/// from no subject, so it is refused.
+/// from no subject, so it is refused, and so is a payload that is not a map,
+/// which no record carries.
 pub fn envelope(
     record_type: u8,
     payload: Value,
@@ -306,6 +312,9 @@ pub fn envelope(
     }
     if subject.as_ref().is_some_and(|s| s.is_empty()) {
         return Err(RecordError::InvalidSubject);
+    }
+    if !matches!(payload, Value::Map(_)) {
+        return Err(RecordError::PayloadNotAMap);
     }
     let mut r = unsigned(t, payload, ttl_ms);
     r.subject = subject;

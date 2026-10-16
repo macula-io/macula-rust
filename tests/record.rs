@@ -263,6 +263,25 @@ fn a_domain_envelope_is_for_a_domain_type_with_a_subject_that_is_not_empty() {
     ));
 }
 
+#[test]
+fn a_domain_envelope_refuses_a_payload_that_is_not_a_map_by_name() {
+    for payload in [
+        Value::text("hello"),
+        Value::Bytes(b"hello".to_vec()),
+        Value::Int(1),
+        Value::List(vec![]),
+        Value::Null,
+    ] {
+        assert!(
+            matches!(
+                envelope(0x40, payload.clone(), Some(b"a subject".to_vec()), 0),
+                Err(RecordError::PayloadNotAMap)
+            ),
+            "{payload:?}"
+        );
+    }
+}
+
 /// The shared fixtures: advertisements in a node's own namespace, and the
 /// verdicts macula reaches on each.
 #[test]
