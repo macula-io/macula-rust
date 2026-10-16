@@ -478,9 +478,15 @@ impl Link {
             subscription.unsubscribed = true;
             return Err(e);
         }
-        // A subscription refused or not answered in time drops here, and
-        // sends the UNSUBSCRIBE when it was the last on its realm and topic.
-        answered(&self.inner, added.answer).await?;
+        // A subscription refused or not answered in time is withdrawn here,
+        // in the caller's own order: its UNSUBSCRIBE, when it was the last on
+        // its realm and topic, goes out before any SUBSCRIBE of a retry, which
+        // a withdrawal left to Drop's task could overtake. A refused one sends
+        // nothing: the refusal already ended the topic's subscriptions.
+        if let Err(e) = answered(&self.inner, added.answer).await {
+            let _ = subscription.unsubscribe().await;
+            return Err(e);
+        }
         Ok(subscription)
     }
 }
