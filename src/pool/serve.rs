@@ -153,7 +153,8 @@ impl PoolInner {
     }
 
     /// Gives a new link the node's subscriptions, then its served
-    /// procedures, as macula's pool replays them on a respawned link.
+    /// procedures, as macula's pool replays them on a respawned link. A
+    /// subscription the station refuses there is not on that link.
     pub(super) async fn replay(&self, link: &Link) {
         let (subs, served) = {
             let state = self.lock();
@@ -162,8 +163,14 @@ impl PoolInner {
                 state.served.values().cloned().collect::<Vec<_>>(),
             )
         };
-        for sub in subs {
-            sub.attach(link).await;
+        // Each subscription waits for its own REGISTER_ACK, so one the
+        // station is slow to answer does not hold the others up.
+        let attaching: Vec<_> = subs
+            .into_iter()
+            .map(|sub| tokio::spawn(sub.attach_owned(link.clone())))
+            .collect();
+        for a in attaching {
+            let _ = a.await;
         }
         for s in served {
             s.attach(link.clone());

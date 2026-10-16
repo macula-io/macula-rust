@@ -66,6 +66,10 @@ use framing::{read_frame, FrameWriter, HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES};
 /// How long the handshake may take, as macula's 30 seconds.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a SUBSCRIBE waits for the station's REGISTER_ACK (macula#12): the
+/// handshake's timeout, as macula's pool waits.
+pub const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
+
 /// How long Close waits, after its GOODBYE, for the station to close the
 /// connection before closing it itself.
 const CLOSE_LINGER: Duration = Duration::from_secs(1);
@@ -144,6 +148,9 @@ pub enum LinkError {
         kind: frame::RegisterKind,
         reason: String,
     },
+    /// The station did not answer a SUBSCRIBE within
+    /// [`REGISTER_ACK_TIMEOUT`] (WIRE_1_0.md section 3.5).
+    RegisterUnacknowledged(frame::RegisterKind),
     /// A stream ended by a STREAM_ERROR: the peer's, the station's relay
     /// error (`relay`), or this side's own abort.
     Stream {
@@ -195,6 +202,9 @@ impl fmt::Display for LinkError {
             LinkError::Goodbye(reason) => write!(f, "the station said goodbye: {reason}"),
             LinkError::RegisterRefused { kind, reason } => {
                 write!(f, "the station refused the {kind:?}: {reason}")
+            }
+            LinkError::RegisterUnacknowledged(kind) => {
+                write!(f, "the station did not answer the {kind:?} in time")
             }
             LinkError::Confidentiality(e) => write!(f, "{e}"),
             LinkError::SealedRefused { named: Some(id) } => write!(
@@ -332,6 +342,9 @@ struct State {
     unrouted: HashMap<String, u64>,
     pending: HashMap<[u8; 16], call::Pending>,
     subs: HashMap<([u8; 32], String), Vec<pubsub::SubscriberSlot>>,
+    /// The SUBSCRIBEs the station has not answered, by realm and topic,
+    /// oldest first, each with the subscriptions waiting on it.
+    sub_acks: HashMap<([u8; 32], String), pubsub::AckQueue>,
     served: HashMap<([u8; 32], String), serve::ServedEntry>,
     streams: Vec<std::sync::Weak<stream::StreamInner>>,
 }
@@ -580,6 +593,7 @@ fn new_inner(
             unrouted: HashMap::new(),
             pending: HashMap::new(),
             subs: HashMap::new(),
+            sub_acks: HashMap::new(),
             served: HashMap::new(),
             streams: Vec::new(),
         }),
@@ -642,6 +656,7 @@ impl Inner {
         };
         let pending = std::mem::take(&mut state.pending);
         let subs = std::mem::take(&mut state.subs);
+        let sub_acks = std::mem::take(&mut state.sub_acks);
         let served = std::mem::take(&mut state.served);
         let streams = std::mem::take(&mut state.streams);
         drop(state);
@@ -649,6 +664,7 @@ impl Inner {
             let _ = p.outcome.send(Err(err.clone()));
         }
         drop(subs);
+        pubsub::end_waits(sub_acks, &err);
         for s in served.into_values() {
             s.end(err.clone());
         }
@@ -805,8 +821,9 @@ fn received(inner: &Arc<Inner>, payload: &[u8]) -> Result<(), LinkError> {
 }
 
 /// The station's REGISTER_ACK: a refused ADVERTISE of the served
-/// procedure's current record ends that serving, a refused SUBSCRIBE of this
-/// node ends the subscription, and every ack is counted by its kind and outcome. One of a
+/// procedure's current record ends that serving, a SUBSCRIBE of this node's
+/// answers the subscriptions waiting on it, its refusal ending them, and
+/// every ack is counted by its kind and outcome. One of a
 /// kind this crate does not know is read past, counted.
 fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
     let Some(ack) = frame::read_register_ack(v)? else {
@@ -815,12 +832,19 @@ fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
     };
     let outcome = ack.refusal.as_deref().unwrap_or("accepted");
     inner.count(&format!("register_ack_{:?}_{outcome}", ack.kind).to_lowercase());
-    let Some(reason) = ack.refusal.clone() else {
-        return Ok(());
+    let answer = match ack.refusal.clone() {
+        None => Ok(()),
+        Some(reason) => Err(LinkError::RegisterRefused {
+            kind: ack.kind,
+            reason,
+        }),
     };
-    let refused = LinkError::RegisterRefused {
-        kind: ack.kind,
-        reason,
+    let ours = subscribe_ack_is_ours(&ack.answered, &inner.self_id);
+    if ack.kind == frame::RegisterKind::Subscribe && ours {
+        pubsub::subscribe_answered(inner, &(ack.realm, ack.name.clone()), answer.clone());
+    }
+    let Err(refused) = answer else {
+        return Ok(());
     };
     match (ack.kind, &ack.answered) {
         (frame::RegisterKind::Advertise, frame::Answered::Advertisement { record_version }) => {
@@ -831,11 +855,7 @@ fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
                 refused,
             )
         }
-        (frame::RegisterKind::Subscribe, answered)
-            if subscribe_ack_is_ours(answered, &inner.self_id) =>
-        {
-            pubsub::subscribe_refused(inner, &(ack.realm, ack.name.clone()))
-        }
+        (frame::RegisterKind::Subscribe, _) if ours => {}
         (frame::RegisterKind::Subscribe, _) => inner.count("register_ack_subscribe_not_ours"),
         _ => {}
     }

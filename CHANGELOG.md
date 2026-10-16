@@ -15,6 +15,26 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Changed
+
+- **`subscribe` returns once the station has accepted the subscription**
+  (macula-rust#33, macula#12). `Link::subscribe` waits for the station's
+  REGISTER_ACK of its SUBSCRIBE, up to `REGISTER_ACK_TIMEOUT` (30 s, as
+  macula's pool waits), so "subscribed" is a barrier: a publication sent
+  after it returns is delivered. A refusal is `LinkError::RegisterRefused`,
+  no answer in time the new `LinkError::RegisterUnacknowledged`, and either
+  way the subscription is withdrawn. A second subscription to the same realm
+  and topic waits on the same answer. `Pool::subscribe` subscribes on every
+  link at once and returns when one station accepts, as macula's
+  `await_registration` does, or `PoolError::NoLink` with each link's error
+  when none does; a link dialled again replays its subscriptions concurrently.
+  The sleeps after subscribing in the tests, the sealed-groups interop and the
+  `publish_subscribe` example are gone.
+- **`record::envelope` refuses a payload that is not a map** (macula-rust#31)
+  with the new `RecordError::PayloadNotAMap`, where the mistake is made,
+  instead of a `Malformed("a tbs of another shape")` from `record::sign`
+  (WIRE_1_0.md 5.1).
+
 ### [0.11.0-rc.1] - 2026-10-14
 
 #### Added

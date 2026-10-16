@@ -18,8 +18,9 @@ const TOPIC: &str = "acme/demo/greeting_sent_v1";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = common::connect(None).await;
+    // subscribe returns once the station has acknowledged the subscription,
+    // so this node hears its own publication with no wait in between.
     let mut sub = pool.subscribe(&common::realm(), TOPIC).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     pool.publish(Publication {
         realm: common::realm(),
         topic: TOPIC.into(),

@@ -139,8 +139,13 @@ async fn a_publication_is_heard_once_by_each_subscriber() {
     let listener = node(&env, 0).await;
     let publisher = node(&env, 0).await;
     let topic = "mcl-rust/tests/greeting_sent_v1";
+    // subscribe returns once the station has accepted the SUBSCRIBE, so a
+    // publication sent right after it is delivered, with no wait between.
     let mut sub = listener.subscribe(&env.realm_id, topic).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        listener.unrouted().get("register_ack_subscribe_accepted"),
+        Some(&1)
+    );
     publisher
         .publish(Publication {
             realm: env.realm_id,

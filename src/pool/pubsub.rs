@@ -56,7 +56,13 @@ struct Forwarder {
 }
 
 impl Pool {
-    /// Subscribes the node to `topic` in `realm` on every link.
+    /// Subscribes the node to `topic` in `realm` on every link, returning
+    /// once one link's station has accepted it (macula#12), as macula's
+    /// await_registration does: an event published after this returns is
+    /// delivered. The other links go on subscribing. Every link failing is
+    /// [`PoolError::NoLink`] with each one's error, a refusal being
+    /// [`LinkError::RegisterRefused`]; with no link up it returns at once,
+    /// and the links the pool dials later subscribe.
     pub async fn subscribe(
         &self,
         realm: &[u8; 32],
@@ -88,14 +94,30 @@ impl Pool {
             dropped: AtomicU64::new(0),
         });
         register(&self.inner, &sub)?;
-        for link in self.inner.links() {
-            sub.attach(&link).await;
-        }
-        Ok(Subscription {
-            inner: sub,
+        let subscription = Subscription {
+            inner: sub.clone(),
             events,
             unsubscribed: false,
-        })
+        };
+        let links = self.inner.links();
+        if links.is_empty() {
+            return Ok(subscription);
+        }
+        let (answers_tx, mut answers) = mpsc::channel(links.len());
+        for link in links {
+            tokio::spawn(attach_answering(sub.clone(), link, answers_tx.clone()));
+        }
+        drop(answers_tx);
+        let mut errors = Vec::new();
+        while let Some(answer) = answers.recv().await {
+            match answer {
+                Ok(()) => return Ok(subscription),
+                Err(e) => errors.push(e),
+            }
+        }
+        // Dropping the subscription ends it on every link.
+        drop(subscription);
+        Err(PoolError::NoLink(errors))
     }
 
     /// Signs `p` once and sends it on the first replication_factor links, in
@@ -239,25 +261,30 @@ impl SubInner {
         wanted
     }
 
+    /// [`SubInner::attach`], for a task of its own.
+    pub(super) async fn attach_owned(self: Arc<Self>, link: Link) -> Result<(), LinkError> {
+        self.attach(&link).await
+    }
+
     /// Subscribes on `link`, once, and forwards what it hears until the
-    /// link's subscription ends.
-    pub(super) async fn attach(self: &Arc<Self>, link: &Link) {
+    /// link's subscription ends: the link's error when its station refused
+    /// the subscription or did not answer, and `Ok` when there was nothing to
+    /// do, the subscription having ended or being on the link already.
+    pub(super) async fn attach(self: &Arc<Self>, link: &Link) -> Result<(), LinkError> {
         let events = {
             let held = self.lock();
             match &held.events {
                 Some(events) if !held.on_links.contains_key(&link.serial()) => events.clone(),
-                _ => return,
+                _ => return Ok(()),
             }
         };
-        let Ok(on_link) = link.subscribe(&self.realm, &self.topic).await else {
-            return;
-        };
+        let on_link = link.subscribe(&self.realm, &self.topic).await?;
         let (stop, stopped) = oneshot::channel();
         let (unsubscribed_tx, unsubscribed) = oneshot::channel();
         let kept = self.keep_forwarder(link.serial(), Forwarder { stop, unsubscribed });
         if !kept {
             let _ = on_link.unsubscribe().await;
-            return;
+            return Ok(());
         }
         tokio::spawn(forward(
             self.clone(),
@@ -267,7 +294,17 @@ impl SubInner {
             stopped,
             unsubscribed_tx,
         ));
+        Ok(())
     }
+}
+
+/// Subscribes `sub` on `link`, sending how that went to `answers`.
+async fn attach_answering(
+    sub: Arc<SubInner>,
+    link: Link,
+    answers: mpsc::Sender<Result<(), LinkError>>,
+) {
+    let _ = answers.send(sub.attach(&link).await).await;
 }
 
 /// Tells each forwarder to stop and waits for its link to unsubscribe; the

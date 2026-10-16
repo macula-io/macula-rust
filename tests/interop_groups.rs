@@ -124,12 +124,8 @@ async fn a_rust_member_and_macula_open_each_others_events_under_one_epoch() {
         .await
         .expect("the member subscribes under the group");
     println!("subscribed");
-    // A SUBSCRIBE is sent, not acknowledged: the station registers it in its
-    // own time. This peer writes the barrier the other member publishes on,
-    // so it waits here rather than let the other publish into a subscription
-    // the station does not have yet, which is what the crate's own tests do
-    // after subscribing too.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // subscribe_group returned once the station accepted the SUBSCRIBE, so
+    // the other member may publish as soon as it sees the barrier.
     std::fs::write(work().join("ready.go"), b"").unwrap();
     wait_for("ready.erlang", 180).await;
 

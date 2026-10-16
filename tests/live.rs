@@ -120,7 +120,6 @@ async fn the_pool_hears_its_own_publication() {
         hex::encode(suffix)
     );
     let mut sub = pool.subscribe(&realm, &topic).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
     pool.publish(Publication {
         realm,
         topic,
