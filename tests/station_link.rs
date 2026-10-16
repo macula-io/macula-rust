@@ -171,7 +171,6 @@ async fn a_publication_is_heard_once_by_each_subscriber() {
     sub.unsubscribe().await.unwrap();
 }
 
-/// Answers who rang, and refuses "fail" with a handler error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_subscription_is_withdrawn_and_a_retry_can_succeed() {
     let lab = Lab::start(Profile::PqPure);
@@ -208,6 +207,7 @@ async fn a_refused_subscription_is_withdrawn_and_a_retry_can_succeed() {
     drop(sub);
 }
 
+/// Answers who rang, and refuses "fail" with a handler error.
 async fn ring_answer(r: Request) -> Result<Value, String> {
     if r.payload == Value::text("fail") {
         return Err("refused by the handler".to_string());

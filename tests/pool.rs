@@ -416,8 +416,8 @@ async fn a_subscription_every_station_refuses_is_no_link() {
     let (a, b) = (lab.station("refuse a"), lab.station("refuse b"));
     let p = connect(&key(Profile::PqPure), None, &[&a, &b]).await;
     let me = p.node_id();
-    eventually("both links up", || {
-        lab.connected(&a, &me) && lab.connected(&b, &me)
+    eventually("both links up in the pool", || {
+        p.status().iter().filter(|l| l.up).count() == 2
     })
     .await;
     let realm = [5; 32];
