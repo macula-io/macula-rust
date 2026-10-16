@@ -2,7 +2,7 @@ module github.com/macula-io/macula-rust/tests/teststation
 
 go 1.27.0
 
-require github.com/macula-io/macula-go v0.27.0-rc.3
+require github.com/macula-io/macula-go v0.27.0-rc.4
 
 require (
 	github.com/google/uuid v1.6.0 // indirect

@@ -411,6 +411,41 @@ async fn unsubscribe_ends_the_subscription_everywhere() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_every_station_refuses_is_no_link() {
+    let lab = Lab::start(Profile::PqPure);
+    let (a, b) = (lab.station("refuse a"), lab.station("refuse b"));
+    let p = connect(&key(Profile::PqPure), None, &[&a, &b]).await;
+    let me = p.node_id();
+    eventually("both links up", || {
+        lab.connected(&a, &me) && lab.connected(&b, &me)
+    })
+    .await;
+    let realm = [5; 32];
+    lab.judge(&a, "subscribe", "not_authorized");
+    lab.judge(&b, "subscribe", "not_authorized");
+    match p.subscribe(&realm, TOPIC).await {
+        Err(PoolError::NoLink(errors)) => {
+            assert_eq!(errors.len(), 2, "{errors:?}");
+            assert!(
+                errors.iter().all(|e| matches!(
+                    e,
+                    LinkError::RegisterRefused { reason, .. } if reason == "not_authorized"
+                )),
+                "{errors:?}"
+            );
+        }
+        other => panic!("expected NoLink, got {:?}", other.map(|_| ())),
+    }
+    assert!(!lab.subscribed(&a, &me, &realm, TOPIC) && !lab.subscribed(&b, &me, &realm, TOPIC));
+
+    // One station accepting is enough.
+    lab.judge(&b, "subscribe", "accept");
+    let _sub = p.subscribe(&realm, TOPIC).await.unwrap();
+    assert!(lab.subscribed(&b, &me, &realm, TOPIC));
+    assert!(!lab.subscribed(&a, &me, &realm, TOPIC));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_record_put_through_the_pool_is_found_by_type() {
     let lab = Lab::start(Profile::PqPure);
     let s = lab.station("records");

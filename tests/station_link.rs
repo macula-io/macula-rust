@@ -8,8 +8,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::lab::Lab;
 use common::TestStations;
 use macula_rust::cbor::Value;
+use macula_rust::frame::RegisterKind;
 use macula_rust::frame::{Payload, StreamEncoding, StreamMode, StreamRole};
 use macula_rust::handshake::HandshakeError;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
@@ -21,6 +23,7 @@ use macula_rust::station_link::{
     handler, stream_handler, Call, ConfidentialityError, ConfidentialityReason, Config, Link,
     LinkError, Offer, Publication, Request, Seal, Stream, StreamCall, StreamEvent,
 };
+use macula_rust::transport::Target;
 
 /// A link as a new node: its own identity key and issuer.
 async fn node(env: &TestStations, station: usize) -> Link {
@@ -169,6 +172,42 @@ async fn a_publication_is_heard_once_by_each_subscriber() {
 }
 
 /// Answers who rang, and refuses "fail" with a handler error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_subscription_is_withdrawn_and_a_retry_can_succeed() {
+    let lab = Lab::start(Profile::PqPure);
+    let s = lab.station("refuse");
+    let identity = Arc::new(NodeKey::generate_identity(lab.profile, PUZZLE_DIFFICULTY).unwrap());
+    let issuer = StatementIssuer::with_wall_clock(identity.clone()).unwrap();
+    let target = Target {
+        host: s.host.clone(),
+        port: s.port,
+        profile: lab.profile,
+        expected_node_id: s.node_id,
+    };
+    let link = Link::dial(Config::new(target, identity, issuer))
+        .await
+        .unwrap();
+    let me = link.node_id();
+    let (realm, topic) = ([9; 32], "mcl-rust/tests/greeting_sent_v1");
+
+    lab.judge(&s, "subscribe", "not_authorized");
+    let refused = link.subscribe(&realm, topic).await.err();
+    assert_eq!(
+        refused,
+        Some(LinkError::RegisterRefused {
+            kind: RegisterKind::Subscribe,
+            reason: "not_authorized".into(),
+        })
+    );
+    assert!(!lab.subscribed(&s, &me, &realm, topic));
+    assert!(link.error().is_none(), "a refusal leaves the link up");
+
+    lab.judge(&s, "subscribe", "accept");
+    let sub = link.subscribe(&realm, topic).await.unwrap();
+    assert!(lab.subscribed(&s, &me, &realm, topic));
+    drop(sub);
+}
+
 async fn ring_answer(r: Request) -> Result<Value, String> {
     if r.payload == Value::text("fail") {
         return Err("refused by the handler".to_string());

@@ -167,6 +167,14 @@ impl Lab {
         );
     }
 
+    /// How `s` answers each registration of `kind` (advertise, unadvertise,
+    /// subscribe, unsubscribe) from now on: `verdict` is a refusal reason,
+    /// `silent` for no REGISTER_ACK, or `accept` to accept every
+    /// registration of every kind again.
+    pub fn judge(&self, s: &LabStation, kind: &str, verdict: &str) {
+        self.expect(&format!("judge {} {kind} {verdict}", s.index), "judged");
+    }
+
     fn realm_line(&self, command: &str) -> LabRealm {
         let reply = self.expect(command, "realm");
         let f: Vec<&str> = reply.split_whitespace().collect();

@@ -1,7 +1,7 @@
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-github.com/macula-io/macula-go v0.27.0-rc.3 h1:8ws7YyEWEOgO0TT7WsG8rA9pPCHmmPKpZyNTJteJNW4=
-github.com/macula-io/macula-go v0.27.0-rc.3/go.mod h1:avldKU9O9cDRXMnlTdPn7YiVI2aucg3Yjnv/hxlmoEQ=
+github.com/macula-io/macula-go v0.27.0-rc.4 h1:zEFYJChl4DShZlDpW6kOeKdFUgViio6gHD0FwySh83k=
+github.com/macula-io/macula-go v0.27.0-rc.4/go.mod h1:avldKU9O9cDRXMnlTdPn7YiVI2aucg3Yjnv/hxlmoEQ=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0 h1:APacT+iIaNF6fd8AGEiN3bT/Jtkd2jz4v4TzM7MFjy0=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0/go.mod h1:3IOHRbJIc+L6YKMwfDtJAM9Vj9k0YY4muhuyUYk5tbk=
 github.com/quic-go/quic-go v0.62.0 h1:ZHDjCk5OacATwGvs8PWE97CTvX7AqZiVoW7++ZOXTf8=

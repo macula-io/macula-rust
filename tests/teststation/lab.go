@@ -28,6 +28,12 @@ import (
 //	realm <name> <org>                       realm <r> <realm_id hex> <realm_key hex>
 //	impostor <r>                             realm <r2> <realm_id hex> <realm_key hex>
 //	admit <r> <i> <node hex> ...             admitted
+//	judge <i> <kind> <verdict>               judged
+//
+// judge sets how station i answers each registration of kind (advertise,
+// unadvertise, subscribe, unsubscribe): verdict is a refusal reason
+// WIRE_1_0.md section 3.5 names, "silent" to send no REGISTER_ACK, or
+// "accept" to accept every registration of every kind again.
 //
 // An impostor of realm r has its realm_id and org and another realm key, as a
 // node claiming the realm without its key would sign.
@@ -219,8 +225,35 @@ func lab(t *helperT, p profile.Profile, f []string, station func(int) *teststati
 		}
 		(*realms)[n].Admit(t, s, nodes...)
 		return "admitted", nil
+	case "judge":
+		s, err := pick(1)
+		if err != nil {
+			return "", err
+		}
+		if err := need(4); err != nil {
+			return "", err
+		}
+		s.Judge(verdict(f[2], f[3]))
+		return "judged", nil
 	}
 	return "", fmt.Errorf("unknown command %s", f[0])
+}
+
+// verdict judges registrations of kind as given, accepting every other one;
+// "accept" is nil, accepting every one.
+func verdict(kind, given string) func(string) (string, bool) {
+	if given == "accept" {
+		return nil
+	}
+	return func(k string) (string, bool) {
+		if k != kind {
+			return "", false
+		}
+		if given == "silent" {
+			return "", true
+		}
+		return given, false
+	}
 }
 
 func yes(b bool) string {
