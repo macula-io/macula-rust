@@ -17,10 +17,14 @@ usually touches both, but their version numbers don't move in lockstep.
 
 #### Fixed
 
-- **A STATUS statement pushed for a binding is always newer than the one
-  before it** (macula-architecture#22), as macula 15.5.0's
-  `macula_statement_issuer` issues them: at the clock's time, or a millisecond
-  after the binding's last statement when the clock has stepped back. A 15.5.0
+- **A STATUS statement pushed for a binding is newer than the one before it
+  while the clock is within the tolerance of it** (macula-architecture#22), as
+  macula 15.6.0's `macula_statement_issuer` issues them (macula#110): at the
+  clock's time, or a millisecond after the binding's last statement when the
+  clock has stepped back. Once that millisecond is more than 5 minutes ahead
+  of the clock, the statement is issued at the clock, since a peer closes the
+  link on a statement dated that far ahead; a connection that accepted the
+  later statement drops it as not newer and stays up. A 15.5.0
   peer drops a statement that is not newer than the last it accepted on a
   connection (`status_not_newer`), so before this a backward clock step of 15
   minutes or more had one to three honest statements refused. A step of an

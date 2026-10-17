@@ -99,8 +99,9 @@ pub type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
 /// A binding the issuer holds, with its newest statement, and its key while
 /// it is the current binding. `stated_at` is the clock's time at that
-/// statement, which schedules the next; `issued_at` is the newest issued_at of
-/// any statement pushed for the binding, never lowered.
+/// statement, which schedules the next; `issued_at` is that statement's
+/// issued_at, lowered to the clock when the clock stepped back past the
+/// tolerance.
 struct StatedBinding {
     key: Option<Arc<NodeKey>>,
     binding: SignedTbs,
@@ -378,7 +379,9 @@ async fn tick_until_dropped(weak: Weak<Mutex<State>>, on_error: impl Fn(IssuerEr
 /// and hands it to the binding's subscribers. A peer drops a statement that is
 /// not newer than the last it accepted on a connection, so it is issued after
 /// the binding's last, a millisecond after it when the clock has stepped back,
-/// as macula_statement_issuer does.
+/// as macula_statement_issuer does. A peer also closes a link on a statement
+/// issued more than a verifier's tolerance after its clock, so once a
+/// millisecond after the last is that far ahead, it is issued at `now`.
 fn restate(
     identity: &NodeKey,
     subscribers: &HashMap<[u8; 48], Vec<Arc<Slot>>>,
@@ -386,7 +389,7 @@ fn restate(
     held: &mut StatedBinding,
     now: i64,
 ) -> Result<(), BindingError> {
-    let issued_at = now.max(held.issued_at + 1);
+    let issued_at = later(held.issued_at, now);
     let statement = status_statement(
         identity,
         &held.binding,
@@ -402,6 +405,17 @@ fn restate(
     Ok(())
 }
 
+/// When a statement following one issued at `previous` is issued at `now`: a
+/// millisecond after `previous` while that is within a verifier's tolerance of
+/// `now`, and `now` once it is not.
+fn later(previous: i64, now: i64) -> i64 {
+    if previous < now + TOLERANCE_MS {
+        now.max(previous + 1)
+    } else {
+        now
+    }
+}
+
 /// A new dial with no statement to carry, with the error of the work done
 /// first, if any.
 fn dial_refused(work: &Result<(), IssuerError>, e: &BindingError) -> IssuerError {
@@ -414,8 +428,7 @@ fn dial_refused(work: &Result<(), IssuerError>, e: &BindingError) -> IssuerError
 /// The statement a new dial carries for `held` at `now`: its newest, or, when
 /// that was issued after `now` by more than a verifier's tolerance because the
 /// clock stepped back, one issued at `now`. A new connection has no earlier
-/// statement to be newer than, and statements pushed on connections stay newer
-/// than this one, so it is never pushed.
+/// statement to be newer than, so it is never pushed.
 fn dial_statement(
     identity: &NodeKey,
     held: &StatedBinding,
