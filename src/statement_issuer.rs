@@ -98,13 +98,16 @@ pub struct ConnectMaterial {
 pub type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
 /// A binding the issuer holds, with its newest statement, and its key while
-/// it is the current binding.
+/// it is the current binding. `stated_at` is the clock's time at that
+/// statement, which schedules the next; `issued_at` is the newest issued_at of
+/// any statement pushed for the binding, never lowered.
 struct StatedBinding {
     key: Option<Arc<NodeKey>>,
     binding: SignedTbs,
     statement: SignedTbs,
     bound_at: i64,
     stated_at: i64,
+    issued_at: i64,
     not_after: i64,
 }
 
@@ -192,7 +195,8 @@ impl StatementIssuer {
             Some(key) if current.in_force(now) => Ok(ConnectMaterial {
                 key: key.clone(),
                 binding: current.binding.clone(),
-                status: current.statement.clone(),
+                status: dial_statement(&state.identity, current, now)
+                    .map_err(|e| dial_refused(&work, &e))?,
             }),
             _ => Err(IssuerError::NoConnectMaterial(match work {
                 Err(e) => e.to_string(),
@@ -345,6 +349,7 @@ impl State {
                 statement,
                 bound_at: now,
                 stated_at: now,
+                issued_at: now,
                 not_after,
             },
         );
@@ -370,7 +375,10 @@ async fn tick_until_dropped(weak: Weak<Mutex<State>>, on_error: impl Fn(IssuerEr
 }
 
 /// Issues a new statement for one binding in force, keeps it as the newest,
-/// and hands it to the binding's subscribers.
+/// and hands it to the binding's subscribers. A peer drops a statement that is
+/// not newer than the last it accepted on a connection, so it is issued after
+/// the binding's last, a millisecond after it when the clock has stepped back,
+/// as macula_statement_issuer does.
 fn restate(
     identity: &NodeKey,
     subscribers: &HashMap<[u8; 48], Vec<Arc<Slot>>>,
@@ -378,13 +386,45 @@ fn restate(
     held: &mut StatedBinding,
     now: i64,
 ) -> Result<(), BindingError> {
-    let statement = status_statement(identity, &held.binding, now, now + STATEMENT_VALID_MS)?;
+    let issued_at = now.max(held.issued_at + 1);
+    let statement = status_statement(
+        identity,
+        &held.binding,
+        issued_at,
+        issued_at + STATEMENT_VALID_MS,
+    )?;
     held.statement = statement.clone();
     held.stated_at = now;
+    held.issued_at = issued_at;
     for slot in subscribers.get(hash).into_iter().flatten() {
         deliver(slot, statement.clone());
     }
     Ok(())
+}
+
+/// A new dial with no statement to carry, with the error of the work done
+/// first, if any.
+fn dial_refused(work: &Result<(), IssuerError>, e: &BindingError) -> IssuerError {
+    IssuerError::NoConnectMaterial(match work {
+        Err(w) => format!("{w}; {e}"),
+        Ok(()) => e.to_string(),
+    })
+}
+
+/// The statement a new dial carries for `held` at `now`: its newest, or, when
+/// that was issued after `now` by more than a verifier's tolerance because the
+/// clock stepped back, one issued at `now`. A new connection has no earlier
+/// statement to be newer than, and statements pushed on connections stay newer
+/// than this one, so it is never pushed.
+fn dial_statement(
+    identity: &NodeKey,
+    held: &StatedBinding,
+    now: i64,
+) -> Result<SignedTbs, BindingError> {
+    if held.issued_at - TOLERANCE_MS <= now {
+        return Ok(held.statement.clone());
+    }
+    status_statement(identity, &held.binding, now, now + STATEMENT_VALID_MS)
 }
 
 fn deliver(slot: &Slot, statement: SignedTbs) {

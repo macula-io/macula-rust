@@ -105,3 +105,98 @@ fn only_an_identity_key_issues() {
     let connect = NodeKey::generate(Purpose::Connect, P).unwrap();
     assert!(StatementIssuer::new(Arc::new(connect), Box::new(|| START)).is_err());
 }
+
+/// The issued_at a status statement's tbs names.
+fn issued_at(statement: &macula_rust::binding::SignedTbs) -> i64 {
+    let fields = macula_rust::cbor::decode(&statement.tbs).unwrap();
+    match fields.get("issued_at") {
+        Some(macula_rust::cbor::Value::Int(n)) => *n as i64,
+        other => panic!("a statement's issued_at: {other:?}"),
+    }
+}
+
+/// Ticks at `ms` and returns the statement the subscription holds.
+fn pushed_at(
+    clock: &AtomicI64,
+    issuer: &StatementIssuer,
+    statements: &mut macula_rust::statement_issuer::StatementSubscription,
+    ms: i64,
+) -> macula_rust::binding::SignedTbs {
+    clock.store(ms, Ordering::SeqCst);
+    issuer.tick().unwrap();
+    statements.try_recv().expect("a statement was handed over")
+}
+
+/// A peer drops a statement that is not newer than the last it accepted on a
+/// connection (macula 15.5.0's status_not_newer), so each statement pushed
+/// for a binding is issued after the one before it, a millisecond after it
+/// when the clock has stepped back, as macula_statement_issuer does
+/// (macula-architecture#22).
+#[test]
+fn a_statement_pushed_after_the_clock_stepped_back_is_still_newer() {
+    let (clock, issuer, _identity) = issuer();
+    let material = issuer.connect_material().unwrap();
+    let mut statements = issuer.subscribe(&material.binding).unwrap();
+    let minute = 60 * 1000;
+
+    let before = issued_at(&pushed_at(
+        &clock,
+        &issuer,
+        &mut statements,
+        START + 30 * minute,
+    ));
+    // 20 minutes back: past the tolerance, but not before the binding, so the
+    // CONNECT key stays.
+    let stepped = issued_at(&pushed_at(
+        &clock,
+        &issuer,
+        &mut statements,
+        START + 10 * minute,
+    ));
+    assert_eq!(stepped, before + 1);
+    // Once the clock passes the last statement, statements follow it again.
+    let later = START + 50 * minute;
+    assert_eq!(
+        issued_at(&pushed_at(&clock, &issuer, &mut statements, later)),
+        later
+    );
+}
+
+/// A new dial has no earlier statement to be newer than, so after the clock
+/// stepped back past the tolerance it carries a statement at the clock's
+/// time, which verifies there, while statements pushed on connections stay
+/// newer than every statement issued for the binding, the new dial's too.
+#[test]
+fn a_new_dial_after_the_clock_stepped_back_carries_a_statement_in_force() {
+    let (clock, issuer, identity) = issuer();
+    let material = issuer.connect_material().unwrap();
+    let mut statements = issuer.subscribe(&material.binding).unwrap();
+    let minute = 60 * 1000;
+    let last = issued_at(&pushed_at(
+        &clock,
+        &issuer,
+        &mut statements,
+        START + 30 * minute,
+    ));
+
+    let stepped = START + 10 * minute;
+    clock.store(stepped, Ordering::SeqCst);
+    let dial = issuer.connect_material().unwrap();
+    assert_eq!(
+        verify_status(&dial.status, &dial.binding, &identity, P, stepped).unwrap(),
+        stepped + 60 * minute
+    );
+    if let Ok(pushed) = statements.try_recv() {
+        assert!(issued_at(&pushed) > last, "a push older than the last");
+    }
+    let next = issued_at(&pushed_at(
+        &clock,
+        &issuer,
+        &mut statements,
+        stepped + 16 * minute,
+    ));
+    assert!(
+        next > last,
+        "the next push, {next}, is not after the last, {last}"
+    );
+}
