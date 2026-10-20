@@ -40,7 +40,7 @@
 > seal scheme 1), and a node with `kem_advertise` on names its key, opens
 > sealed requests and answers them sealed, and a caller's seal report says
 > whether the exchange behind a result was sealed and to which key; both
-> directions are held to macula's vectors and run live against macula 13
+> directions are held to macula's vectors and run live against macula 15.6.0
 > with `confidential => required` (`scripts/interop/sealed.sh`). A call or
 > an open presents a UCAN, and a procedure served under a UCAN policy answers
 > only what it authorizes, every verdict held to macula's UCAN_V1 vectors and
