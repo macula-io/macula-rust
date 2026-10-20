@@ -15,6 +15,14 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### Security
+
+- `record::MAX_ENDORSEMENT_WINDOW_MS` is 24 hours, down from 30 days, as
+  in macula (macula#118): a realm member endorsement admits its member for at
+  most a day, so a revoked member stops being admitted within 24 hours even
+  where the realm's tombstone never reaches the verifier. The wire 1.0
+  vectors are unchanged.
+
 ### [0.11.0] - 2026-10-20
 
 The wire 1.0 final: the release for the live fleet, which has run wire 1.0

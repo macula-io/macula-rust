@@ -64,8 +64,10 @@ pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 /// expires_at, 5 minutes.
 pub const CLOCK_TOLERANCE_MS: u64 = 5 * MINUTE_MS;
 
-/// The longest a realm member endorsement admits its member, 30 days.
-pub const MAX_ENDORSEMENT_WINDOW_MS: u64 = 30 * DAY_MS;
+/// The longest a realm member endorsement admits its member, 24 hours, so a
+/// revoked member whose tombstone never arrives stops being admitted within a
+/// day (macula#118).
+pub const MAX_ENDORSEMENT_WINDOW_MS: u64 = 24 * HOUR_MS;
 
 /// The schema version every built-in type has in wire 1.0; readers check it,
 /// custodians do not (WIRE_1_0.md section 5.1).
