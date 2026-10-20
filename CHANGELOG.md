@@ -15,6 +15,14 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.11.0] - 2026-10-20
+
+The wire 1.0 final: the release for the live fleet, which has run wire 1.0
+since 19 October 2026. Against 0.11.0-rc.1, subscribing and serving both
+wait for the station's REGISTER_ACK (macula#12), as every SDK's final does,
+and the fixes below. Interop runs pass against macula 15.6.0
+(`scripts/interop/sealed.sh` and `groups.sh` in both profiles, `ucan.sh`).
+
 #### Changed
 
 - **`Link::serve` returns once the station has accepted its ADVERTISE**

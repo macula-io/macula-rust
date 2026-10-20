@@ -20,13 +20,15 @@
 
 ---
 
-> **Status, 2026-10-13:** on **wire 1.0** (macula `docs/design/WIRE_1_0.md`),
+> **Status, 2026-10-20:** on **wire 1.0** (macula `docs/design/WIRE_1_0.md`),
 > the wire an operator can run for years on security fixes alone. Every class
 > of macula's wire 1.0 conformance vectors passes on every `cargo test`: the
 > frame envelope, frames, enums, records for readers and custodians, the
 > check order, tbs bytes, `_dht.*` shapes and the handshake transcripts. The
-> live fleet still runs the earlier wire until it moves to 1.0; 0.9.x is the
-> release that reaches it today. Post-quantum ML-DSA-87 identities (in
+> live fleet has run wire 1.0 since 19 October 2026, and 0.11.0 is the final
+> release that reaches it; 0.9.x and earlier speak the retired wire.
+> Subscribing and serving return once the station has accepted the
+> SUBSCRIBE or ADVERTISE (macula#12). Post-quantum ML-DSA-87 identities (in
 > pq_hybrid, the fleet's profile, the ML-DSA-87 + RSA-PSS-4096 composite),
 > ML-KEM hybrid key exchange, and signed requests. Calls and streams by
 > direct dial, serving (under an org or in a node's own namespace),
@@ -47,8 +49,8 @@
 > under the group's current epoch key, which the org's distributor hands out
 > over a sealed call under the org's grant, and an Erlang member and this
 > crate's member open each other's sealed event
-> (`scripts/interop/groups.sh`). Releases before 0.4.0 speak
-> the retired 10.x wire and cannot reach the current fleet.
+> (`scripts/interop/groups.sh`). Releases before 0.10.0-rc.1 speak an
+> earlier wire and cannot reach the current fleet.
 
 ## What is this?
 
@@ -69,7 +71,7 @@ Swift. The core crate has no FFI dependency and no FFI-shaped types.
 
 ```toml
 [dependencies]
-macula-rust = "0.9"
+macula-rust = "0.11"
 tokio = { version = "1", features = ["full"] }
 ```
 
