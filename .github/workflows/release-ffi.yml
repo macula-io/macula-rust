@@ -14,9 +14,10 @@ jobs:
   # carries the version this repository publishes; the default is the root.
   release-guard:
     name: The release guard
-    uses: macula-io/macula-ci-images/.github/workflows/release-guard.yml@2660ee4ce1c51ce3d2bf14043ebc8a2784065cd9
+    uses: macula-io/macula-ci-images/.github/workflows/release-guard.yml@b4c41abb404c32215a2823b7f19ac65b732e1dfe
     with:
-      version-root: ffi
+      tag-prefix: ffi-v
+      version-root: macula-rust-ffi
   publish:
     needs: [release-guard]
     name: publish to crates.io
