@@ -23,7 +23,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::cbor::{self, Value};
 use crate::frame::{self, StreamMode, VerifiedRequest};
@@ -43,7 +43,7 @@ use super::confidential::{
 };
 use super::framing::MAX_FRAME_BYTES;
 use super::stream::StreamHandler;
-use super::{now_ms, Inner, Link, LinkError};
+use super::{now_ms, Inner, Link, LinkError, REGISTER_ACK_TIMEOUT};
 
 /// The provider codes of a served procedure's ERRORs: a handler's own
 /// refusal, a handler that panicked, a procedure this link does not serve, a
@@ -180,9 +180,16 @@ pub(super) struct ServedInner {
     key: ([u8; 32], String),
     pub(super) offer: Offer,
     latest: Mutex<Record>,
+    /// The first ADVERTISE's record version and who waits on the station's
+    /// answer to it, until it is answered.
+    first_answer: Mutex<Option<([u8; 16], AdvertiseWaiter)>>,
     err: Mutex<Option<LinkError>>,
     done_tx: watch::Sender<bool>,
 }
+
+/// What a serving waiting on its first ADVERTISE is told: accepted, or why
+/// not.
+type AdvertiseWaiter = oneshot::Sender<Result<(), LinkError>>;
 
 /// A procedure this link serves, until [`Served::stop`] or the link ends, or
 /// until its advertisement lapses because its authorization could not be
@@ -201,8 +208,14 @@ impl Link {
     /// connected station as the serving station and living no longer than
     /// the records it carries nor 5 minutes, and checks its authorization
     /// (against the realm key for an org procedure) before sending it in an
-    /// ADVERTISE and putting it in the DHT. The advertisement is renewed at
-    /// half its lifetime.
+    /// ADVERTISE. It returns once the station has accepted the ADVERTISE and
+    /// the advertisement is in the DHT, so a CALL made after it is routed
+    /// (macula#12): a refusal is [`LinkError::RegisterRefused`], and the
+    /// advertisement is put nowhere; no answer within
+    /// [`REGISTER_ACK_TIMEOUT`] is [`LinkError::RegisterUnacknowledged`],
+    /// and that one, or one the DHT did not take, is withdrawn with an
+    /// UNADVERTISE, so a late acceptance routes nothing here. The
+    /// advertisement is renewed at half its lifetime.
     pub async fn serve(&self, mut o: Offer) -> Result<Served, LinkError> {
         let own = record::in_own_namespace(&o.procedure);
         if o.handler.is_some() == o.stream.is_some()
@@ -224,21 +237,65 @@ impl Link {
         let (advertisement, wire) = self.advertisement(&o, MAX_ADVERTISEMENT_TTL).await?;
         let key = (o.realm, o.procedure.clone());
         let (done_tx, _) = watch::channel(false);
+        let (answer_tx, answer) = oneshot::channel();
         let served = Arc::new(ServedInner {
             link: Arc::downgrade(&self.inner),
             key: key.clone(),
             offer: o,
-            latest: Mutex::new(advertisement),
+            latest: Mutex::new(advertisement.clone()),
+            first_answer: Mutex::new(Some((advertisement.version, answer_tx))),
             err: Mutex::new(None),
             done_tx,
         });
         route_calls(&self.inner, key, served.clone())?;
-        if let Err(e) = self.announce(&wire).await {
+        if let Err(e) = self.registered(&advertisement, &wire, answer).await {
             served.end(e.clone());
             return Err(e);
         }
         tokio::spawn(renew(served.clone()));
         Ok(Served { inner: served })
+    }
+
+    /// Sends the first advertisement in an ADVERTISE, waits for the
+    /// station's REGISTER_ACK of it on `answer`, then puts it in the DHT, as
+    /// macula's advertise/5 does. One the station did not answer, or the DHT
+    /// did not take, is withdrawn while the link is up; a refused one was
+    /// routed nowhere.
+    async fn registered(
+        &self,
+        advertisement: &Record,
+        wire: &[u8],
+        answer: oneshot::Receiver<Result<(), LinkError>>,
+    ) -> Result<(), LinkError> {
+        self.inner
+            .send_control(&frame::advertise_frame(wire))
+            .await?;
+        let registered = match advertise_answered_within(answer, REGISTER_ACK_TIMEOUT).await {
+            Ok(()) => self.put_record(wire).await,
+            Err(e) => Err(e),
+        };
+        let withdraw = match &registered {
+            Err(LinkError::RegisterRefused { .. }) | Ok(()) => false,
+            Err(_) => self.inner.lock().ended.is_none(),
+        };
+        if withdraw {
+            let _ = self.unadvertise(advertisement).await;
+        }
+        registered
+    }
+
+    /// Withdraws `advertisement` at the station with an UNADVERTISE carrying
+    /// its tombstone, signed by this node, and the tombstone's wire form.
+    async fn unadvertise(&self, advertisement: &Record) -> Result<Vec<u8>, LinkError> {
+        let inner = &self.inner;
+        let tombstone = record::new_tombstone(
+            advertisement,
+            Reason::Shutdown,
+            &TombstoneOptions::default(),
+        )?;
+        let wire = record::encode(&record::sign(&tombstone, &inner.key)?)?;
+        inner.send_control(&frame::unadvertise_frame(&wire)).await?;
+        Ok(wire)
     }
 
     /// `o`'s signed procedure_advertisement and its wire form, living at most
@@ -373,11 +430,9 @@ impl Served {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let tombstone =
-            record::new_tombstone(&latest, Reason::Shutdown, &TombstoneOptions::default())?;
-        let wire = record::encode(&record::sign(&tombstone, &inner.key)?)?;
-        inner.send_control(&frame::unadvertise_frame(&wire)).await?;
-        Link { inner }.put_record(&wire).await
+        let link = Link { inner };
+        let wire = link.unadvertise(&latest).await?;
+        link.put_record(&wire).await
     }
 
     /// Waits until the procedure is no longer served, and says why.
@@ -439,6 +494,43 @@ impl ServedInner {
         {
             state.served.remove(&self.key);
         }
+    }
+}
+
+/// The station's answer to an ADVERTISE of `key`'s record `record_version`,
+/// told to the serving waiting on its first ADVERTISE when it is that one's.
+pub(super) fn advertise_answered(
+    inner: &Inner,
+    key: &([u8; 32], String),
+    record_version: &[u8; 16],
+    answer: &Result<(), LinkError>,
+) {
+    let Some(served) = inner.lock().served.get(key).cloned() else {
+        return;
+    };
+    let mut first = served
+        .first_answer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if first.as_ref().is_some_and(|(v, _)| v == record_version) {
+        if let Some((_, waiter)) = first.take() {
+            let _ = waiter.send(answer.clone());
+        }
+    }
+}
+
+/// The station's answer to the first ADVERTISE, within `limit`: the link's
+/// end when the serving went with it.
+async fn advertise_answered_within(
+    answer: oneshot::Receiver<Result<(), LinkError>>,
+    limit: Duration,
+) -> Result<(), LinkError> {
+    match tokio::time::timeout(limit, answer).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(_)) => Err(LinkError::Closed),
+        Err(_) => Err(LinkError::RegisterUnacknowledged(
+            frame::RegisterKind::Advertise,
+        )),
     }
 }
 

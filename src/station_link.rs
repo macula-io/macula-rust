@@ -66,8 +66,9 @@ use framing::{read_frame, FrameWriter, HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES};
 /// How long the handshake may take, as macula's 30 seconds.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a SUBSCRIBE waits for the station's REGISTER_ACK (macula#12): the
-/// handshake's timeout, as macula's pool waits.
+/// How long a SUBSCRIBE or a serving's first ADVERTISE waits for the
+/// station's REGISTER_ACK (macula#12): the handshake's timeout, as macula's
+/// pool waits.
 pub const REGISTER_ACK_TIMEOUT: Duration = HANDSHAKE_TIMEOUT;
 
 /// How long Close waits, after its GOODBYE, for the station to close the
@@ -824,8 +825,9 @@ fn received(inner: &Arc<Inner>, payload: &[u8]) -> Result<(), LinkError> {
     Ok(())
 }
 
-/// The station's REGISTER_ACK: a refused ADVERTISE of the served
-/// procedure's current record ends that serving, a SUBSCRIBE of this node's
+/// The station's REGISTER_ACK: an ADVERTISE's answers the serving waiting on
+/// it, a refused ADVERTISE of the served procedure's current record ends that
+/// serving, a SUBSCRIBE of this node's
 /// answers the subscriptions waiting on it, its refusal ending them, and
 /// every ack is counted by its kind and outcome. One of a
 /// kind this crate does not know is read past, counted.
@@ -846,6 +848,16 @@ fn registered(inner: &Arc<Inner>, v: &Value) -> Result<(), LinkError> {
     let ours = subscribe_ack_is_ours(&ack.answered, &inner.self_id);
     if ack.kind == frame::RegisterKind::Subscribe && ours {
         pubsub::subscribe_answered(inner, &(ack.realm, ack.name.clone()), answer.clone());
+    }
+    if let (frame::RegisterKind::Advertise, frame::Answered::Advertisement { record_version }) =
+        (ack.kind, &ack.answered)
+    {
+        serve::advertise_answered(
+            inner,
+            &(ack.realm, ack.name.clone()),
+            record_version,
+            &answer,
+        );
     }
     let Err(refused) = answer else {
         return Ok(());

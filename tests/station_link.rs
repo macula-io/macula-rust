@@ -510,3 +510,68 @@ async fn resubscribe_rounds(
         sub.unsubscribe().await.unwrap();
     }
 }
+
+/// A link of a fresh node to the lab station `s`.
+async fn lab_link(lab: &Lab, s: &LabStation) -> Link {
+    let identity = Arc::new(NodeKey::generate_identity(lab.profile, PUZZLE_DIFFICULTY).unwrap());
+    let issuer = StatementIssuer::with_wall_clock(identity.clone()).unwrap();
+    let target = Target {
+        host: s.host.clone(),
+        port: s.port,
+        profile: lab.profile,
+        expected_node_id: s.node_id,
+    };
+    Link::dial(Config::new(target, identity, issuer))
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serving_returns_once_the_station_has_answered_its_advertise() {
+    let lab = Lab::start(Profile::PqPure);
+    let s = lab.station("advertise");
+    let link = lab_link(&lab, &s).await;
+    let realm = [9; 32];
+    let ring = record::own_procedure(&link.node_id(), "ring");
+    let offer = || Offer::unary(realm, &ring, handler(ring_answer));
+
+    // A refused ADVERTISE is serve's own error, and nothing is advertised.
+    lab.judge(&s, "advertise", "advertiser_quota");
+    let refused = link.serve(offer()).await.err();
+    assert_eq!(
+        refused,
+        Some(LinkError::RegisterRefused {
+            kind: RegisterKind::Advertise,
+            reason: "advertiser_quota".into(),
+        })
+    );
+    assert!(!lab.advertised(&s, &realm, &ring));
+    assert!(link.error().is_none(), "a refusal leaves the link up");
+
+    // One the station does not answer is withdrawn, so a late acceptance
+    // routes nothing to a procedure no longer served.
+    lab.judge(&s, "advertise", "silent");
+    let unanswered = link.serve(offer()).await.err();
+    assert_eq!(
+        unanswered,
+        Some(LinkError::RegisterUnacknowledged(RegisterKind::Advertise))
+    );
+    eventually_true(|| !lab.advertised(&s, &realm, &ring)).await;
+
+    // An accepted one is advertised as serve returns, with no wait after.
+    lab.judge(&s, "advertise", "accept");
+    let served = link.serve(offer()).await.unwrap();
+    assert!(lab.advertised(&s, &realm, &ring));
+    served.stop().await.unwrap();
+}
+
+/// Waits up to 5 seconds for `ok` to hold.
+async fn eventually_true(ok: impl Fn() -> bool) {
+    for _ in 0..50 {
+        if ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("never held");
+}

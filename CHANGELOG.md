@@ -15,6 +15,19 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Changed
+
+- **`Link::serve` returns once the station has accepted its ADVERTISE**
+  (macula-rust#35, macula#12), as `macula:advertise/5` and macula-go v0.27.0
+  do: the advertisement is put in the DHT only after the station's
+  REGISTER_ACK, so a CALL made after `serve` returns is routed. A refusal is
+  `LinkError::RegisterRefused` from `serve` itself and the advertisement is
+  put nowhere; no answer within `REGISTER_ACK_TIMEOUT` is
+  `LinkError::RegisterUnacknowledged`, and that one, or one the DHT did not
+  take, is withdrawn with an UNADVERTISE. `Pool::serve` serves on each link
+  this way and fails only when every link did. Renewals still send and go
+  on; a refused renewal ends the serving as before.
+
 #### Fixed
 
 - **A subscription dropped without unsubscribing no longer withdraws a later
