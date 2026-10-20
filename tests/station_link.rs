@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::lab::Lab;
+use common::lab::{Lab, LabStation};
 use common::TestStations;
 use macula_rust::cbor::Value;
 use macula_rust::frame::RegisterKind;
@@ -459,4 +459,54 @@ async fn streams_deliver_their_frames_and_are_released() {
         other => panic!("{other:?}"),
     }
     eventually("every stream released", || env.relayed() == 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_subscription_never_withdraws_a_later_one_of_its_topic() {
+    let lab = Lab::start(Profile::PqPure);
+    let s = lab.station("resubscribe");
+    let identity = Arc::new(NodeKey::generate_identity(lab.profile, PUZZLE_DIFFICULTY).unwrap());
+    let issuer = StatementIssuer::with_wall_clock(identity.clone()).unwrap();
+    let target = Target {
+        host: s.host.clone(),
+        port: s.port,
+        profile: lab.profile,
+        expected_node_id: s.node_id,
+    };
+    let link = Link::dial(Config::new(target, identity, issuer))
+        .await
+        .unwrap();
+    let me = link.node_id();
+    let (realm, topic) = ([9; 32], "mcl-rust/tests/greeting_sent_v1");
+
+    // Drop's UNSUBSCRIBE goes out from a task of its own; the SUBSCRIBE
+    // right after it must not overtake it, or the station ends up with no
+    // subscription that the caller was told is accepted (macula-rust#34).
+    // On a worker, the SUBSCRIBE's task, spawned last, is the one run first.
+    tokio::spawn(resubscribe_rounds(lab, s, link, me, realm, topic))
+        .await
+        .unwrap();
+}
+
+/// Twenty rounds of a subscription dropped and its topic subscribed again
+/// straight after, each checked at the station once it has settled.
+async fn resubscribe_rounds(
+    lab: Lab,
+    s: LabStation,
+    link: Link,
+    me: [u8; 32],
+    realm: [u8; 32],
+    topic: &'static str,
+) {
+    for round in 0..20 {
+        let sub = link.subscribe(&realm, topic).await.unwrap();
+        drop(sub);
+        let sub = link.subscribe(&realm, topic).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            lab.subscribed(&s, &me, &realm, topic),
+            "round {round}: the later subscription was withdrawn"
+        );
+        sub.unsubscribe().await.unwrap();
+    }
 }

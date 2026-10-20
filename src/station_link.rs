@@ -345,6 +345,9 @@ struct State {
     /// The SUBSCRIBEs the station has not answered, by realm and topic,
     /// oldest first, each with the subscriptions waiting on it.
     sub_acks: HashMap<([u8; 32], String), pubsub::AckQueue>,
+    /// The UNSUBSCRIBEs owed for realms and topics whose last subscription
+    /// is gone, until each goes out.
+    withdrawals: pubsub::Withdrawals,
     served: HashMap<([u8; 32], String), serve::ServedEntry>,
     streams: Vec<std::sync::Weak<stream::StreamInner>>,
 }
@@ -594,6 +597,7 @@ fn new_inner(
             pending: HashMap::new(),
             subs: HashMap::new(),
             sub_acks: HashMap::new(),
+            withdrawals: HashMap::new(),
             served: HashMap::new(),
             streams: Vec::new(),
         }),

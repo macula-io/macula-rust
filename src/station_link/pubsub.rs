@@ -286,12 +286,12 @@ impl Subscription {
         let Some(inner) = self.link.upgrade() else {
             return Ok(());
         };
-        if drop_subscriber(&inner, &self.key, self.id) {
-            let frame =
-                frame::unsubscribe_frame(self.key.1.as_bytes(), &self.key.0, &inner.self_id)?;
-            inner.send_control(&frame).await?;
-        }
-        Ok(())
+        let Some(withdrawal) = withdraw_subscriber(&inner, &self.key, self.id) else {
+            return Ok(());
+        };
+        let sent = send_withdrawal(&inner, &self.key, &withdrawal).await;
+        withdrawn(&inner, &self.key, &withdrawal);
+        sent
     }
 }
 
@@ -304,21 +304,61 @@ impl Drop for Subscription {
         let Some(inner) = self.link.upgrade() else {
             return;
         };
-        if !drop_subscriber(&inner, &self.key, self.id) {
+        let Some(withdrawal) = withdraw_subscriber(&inner, &self.key, self.id) else {
             return;
-        }
+        };
         let key = self.key.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(unsubscribe_dropped(inner, key));
+            runtime.spawn(unsubscribe_dropped(inner, key, withdrawal));
         }
     }
 }
 
 /// Sends the UNSUBSCRIBE of a subscription dropped without unsubscribing,
-/// for whatever it is worth now.
-async fn unsubscribe_dropped(inner: Arc<Inner>, key: ([u8; 32], String)) {
-    if let Ok(frame) = frame::unsubscribe_frame(key.1.as_bytes(), &key.0, &inner.self_id) {
-        let _ = inner.send_control(&frame).await;
+/// for whatever it is worth now, unless a SUBSCRIBE of its realm and topic
+/// sent it first.
+async fn unsubscribe_dropped(inner: Arc<Inner>, key: ([u8; 32], String), withdrawal: Withdrawal) {
+    let _ = send_withdrawal(&inner, &key, &withdrawal).await;
+    withdrawn(&inner, &key, &withdrawal);
+}
+
+/// The UNSUBSCRIBE a realm and topic owes the station once its last
+/// subscription on a link is gone, true once it has gone out or failed to.
+/// It stays on the link until then, and the next first SUBSCRIBE of the realm
+/// and topic sends it before its own frame, so a withdrawal is never overtaken
+/// by a later SUBSCRIBE it came before (macula-rust#34).
+pub(super) type Withdrawal = Arc<tokio::sync::Mutex<bool>>;
+
+/// The withdrawals of a link not yet sent, by realm and topic.
+pub(super) type Withdrawals = HashMap<([u8; 32], String), Withdrawal>;
+
+/// Sends `withdrawal`'s UNSUBSCRIBE, unless it has gone out already. Whoever
+/// sends it holds it while sending, so a SUBSCRIBE waiting on it goes out
+/// after it.
+async fn send_withdrawal(
+    inner: &Inner,
+    key: &([u8; 32], String),
+    withdrawal: &Withdrawal,
+) -> Result<(), LinkError> {
+    let mut sent = withdrawal.lock().await;
+    if *sent {
+        return Ok(());
+    }
+    *sent = true;
+    let frame = frame::unsubscribe_frame(key.1.as_bytes(), &key.0, &inner.self_id)?;
+    inner.send_control(&frame).await
+}
+
+/// `withdrawal` has gone out: it leaves the link, unless a SUBSCRIBE took it
+/// or a later withdrawal of the realm and topic took its place.
+fn withdrawn(inner: &Inner, key: &([u8; 32], String), withdrawal: &Withdrawal) {
+    let mut state = inner.lock();
+    if state
+        .withdrawals
+        .get(key)
+        .is_some_and(|w| Arc::ptr_eq(w, withdrawal))
+    {
+        state.withdrawals.remove(key);
     }
 }
 
@@ -328,6 +368,9 @@ async fn unsubscribe_dropped(inner: Arc<Inner>, key: ([u8; 32], String)) {
 struct Added {
     first: bool,
     answer: Option<oneshot::Receiver<Result<(), LinkError>>>,
+    /// The withdrawal of the realm and topic not yet sent, which the first
+    /// subscriber sends before its SUBSCRIBE.
+    withdrawal: Option<Withdrawal>,
 }
 
 /// Adds a subscriber, waiting on the SUBSCRIBE it sends when it is the first
@@ -348,7 +391,12 @@ fn add_subscriber(
     slots.push(SubscriberSlot { id, events });
     let first = slots.len() == 1;
     let answer = wait_on(&mut state.sub_acks, key, id, first);
-    Ok(Added { first, answer })
+    let withdrawal = first.then(|| state.withdrawals.remove(key)).flatten();
+    Ok(Added {
+        first,
+        answer,
+        withdrawal,
+    })
 }
 
 /// The station's answer to the SUBSCRIBE a subscription waits on, within
@@ -393,21 +441,30 @@ async fn within(
 }
 
 /// Sends the SUBSCRIBE subscription `id` waits on, for `key`'s topic in its
-/// realm. It is sent from a task of its own, so a caller that stops waiting
-/// does not stop it half-sent: the queue of unanswered SUBSCRIBEs then still
-/// matches what the station was sent. One that did not go out leaves the
-/// queue.
+/// realm, after the withdrawal of the realm and topic it took, if any. It is
+/// sent from a task of its own, so a caller that stops waiting does not stop
+/// it half-sent: the queue of unanswered SUBSCRIBEs then still matches what
+/// the station was sent. One that did not go out leaves the queue.
 async fn send_subscribe(
     inner: &Arc<Inner>,
     key: &([u8; 32], String),
     id: u64,
+    withdrawal: Option<Withdrawal>,
 ) -> Result<(), LinkError> {
     let inner = inner.clone();
     let key = key.clone();
     let sending = tokio::spawn(async move {
-        let sent = match frame::subscribe_frame(key.1.as_bytes(), &key.0, &inner.self_id) {
-            Ok(frame) => inner.send_control(&frame).await,
-            Err(e) => Err(e.into()),
+        let withdrawn = match &withdrawal {
+            Some(w) => send_withdrawal(&inner, &key, w).await,
+            None => Ok(()),
+        };
+        let sent = match (
+            withdrawn,
+            frame::subscribe_frame(key.1.as_bytes(), &key.0, &inner.self_id),
+        ) {
+            (Err(e), _) => Err(e),
+            (Ok(()), Ok(frame)) => inner.send_control(&frame).await,
+            (Ok(()), Err(e)) => Err(e.into()),
         };
         if let Err(e) = &sent {
             subscribe_unsent(&inner, &key, id, e);
@@ -419,7 +476,25 @@ async fn send_subscribe(
 
 /// Removes a subscriber, and whether it was the last on its realm and topic.
 fn drop_subscriber(inner: &Inner, key: &([u8; 32], String), id: u64) -> bool {
+    remove_slot(&mut inner.lock(), key, id)
+}
+
+/// Removes a subscriber, and the withdrawal its realm and topic owes the
+/// station when it was the last, recorded on the link under the same lock, so
+/// a SUBSCRIBE of the realm and topic after it finds it.
+fn withdraw_subscriber(inner: &Inner, key: &([u8; 32], String), id: u64) -> Option<Withdrawal> {
     let mut state = inner.lock();
+    if !remove_slot(&mut state, key, id) {
+        return None;
+    }
+    let withdrawal = Withdrawal::default();
+    state.withdrawals.insert(key.clone(), withdrawal.clone());
+    Some(withdrawal)
+}
+
+/// Removes a subscriber's slot, and whether it was the last on its realm and
+/// topic.
+fn remove_slot(state: &mut super::State, key: &([u8; 32], String), id: u64) -> bool {
     let Some(slots) = state.subs.get_mut(key) else {
         return false;
     };
@@ -468,7 +543,7 @@ impl Link {
             unsubscribed: false,
         };
         let sent = if added.first {
-            send_subscribe(&self.inner, &key, id).await
+            send_subscribe(&self.inner, &key, id, added.withdrawal).await
         } else {
             Ok(())
         };
@@ -480,9 +555,9 @@ impl Link {
         }
         // A subscription refused or not answered in time is withdrawn here,
         // in the caller's own order: its UNSUBSCRIBE, when it was the last on
-        // its realm and topic, goes out before any SUBSCRIBE of a retry, which
-        // a withdrawal left to Drop's task could overtake. A refused one sends
-        // nothing: the refusal already ended the topic's subscriptions.
+        // its realm and topic, goes out before any SUBSCRIBE of a retry. A
+        // refused one sends nothing: the refusal already ended the topic's
+        // subscriptions.
         if let Err(e) = answered(&self.inner, added.answer).await {
             let _ = subscription.unsubscribe().await;
             return Err(e);

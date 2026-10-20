@@ -17,6 +17,15 @@ usually touches both, but their version numbers don't move in lockstep.
 
 #### Fixed
 
+- **A subscription dropped without unsubscribing no longer withdraws a later
+  subscription of its realm and topic** (macula-rust#34). Drop sends its
+  UNSUBSCRIBE from a task of its own, and a `subscribe` of the same topic
+  right after could send its SUBSCRIBE first: the station then held no
+  subscription while the new one had been told it was accepted. The
+  UNSUBSCRIBE a topic owes is now recorded on the link under the lock that
+  removes its last subscriber, and the next first SUBSCRIBE of the topic
+  sends it before its own frame; `Subscription::unsubscribe` goes the same
+  way.
 - **A STATUS statement pushed for a binding is newer than the one before it
   while the clock is within the tolerance of it** (macula-architecture#22), as
   macula 15.6.0's `macula_statement_issuer` issues them (macula#110): at the
