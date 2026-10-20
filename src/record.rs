@@ -64,9 +64,9 @@ pub const MAX_RECORD_BYTES: usize = 256 * 1024;
 /// expires_at, 5 minutes.
 pub const CLOCK_TOLERANCE_MS: u64 = 5 * MINUTE_MS;
 
-/// The longest a realm member endorsement admits its member, 24 hours, so a
-/// revoked member whose tombstone never arrives stops being admitted within a
-/// day (macula#118).
+/// The longest window macula's verifier accepts on a realm member
+/// endorsement, 24 hours (macula#118). Mirrored here for reference: this crate
+/// carries endorsement bytes opaquely and does not enforce it.
 pub const MAX_ENDORSEMENT_WINDOW_MS: u64 = 24 * HOUR_MS;
 
 /// The schema version every built-in type has in wire 1.0; readers check it,

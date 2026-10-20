@@ -15,6 +15,8 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.12.0] - 2026-10-20
+
 ### Security
 
 - `record::MAX_ENDORSEMENT_WINDOW_MS` is 24 hours, down from 30 days, as
