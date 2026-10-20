@@ -1,4 +1,4 @@
-//! A live run against one macula 12 station: the pool connects pinned with a
+//! A live run against one wire 1.0 station: the pool connects pinned with a
 //! key generated for the run and never saved, reads the DHT, calls
 //! mcl-echo/echo by direct dial, and hears its own publication. The tests
 //! are ignored by default and run with `cargo test --test live -- --ignored`;
@@ -76,7 +76,7 @@ async fn live() -> (Pool, [u8; 32]) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: needs MACULA_RUST_LIVE_* and a macula 12 station"]
+#[ignore = "live: needs MACULA_RUST_LIVE_* and a wire 1.0 station"]
 async fn the_station_holds_verified_node_records() {
     let (pool, _) = live().await;
     let (records, _) = pool
@@ -84,15 +84,15 @@ async fn the_station_holds_verified_node_records() {
         .await
         .unwrap();
     assert!(!records.is_empty());
-    // The fleet's stations answer handshake v5, and nothing fell back.
+    // The fleet's stations prove their session on every handshake: no HELLO
+    // was refused for its session proof.
     let counters = handshake_counters();
-    assert!(counters["v5_connections"] >= 1, "{counters:?}");
-    assert_eq!(counters["v4_fallbacks"], 0, "{counters:?}");
+    assert!(counters.values().all(|n| *n == 0), "{counters:?}");
     pool.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: needs MACULA_RUST_LIVE_* and a macula 12 station"]
+#[ignore = "live: needs MACULA_RUST_LIVE_* and a wire 1.0 station"]
 async fn mcl_echo_is_reached_by_direct_dial() {
     let (pool, realm) = live().await;
     let answered = pool
@@ -110,7 +110,7 @@ async fn mcl_echo_is_reached_by_direct_dial() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "live: needs MACULA_RUST_LIVE_* and a macula 12 station"]
+#[ignore = "live: needs MACULA_RUST_LIVE_* and a wire 1.0 station"]
 async fn the_pool_hears_its_own_publication() {
     let (pool, realm) = live().await;
     let mut suffix = [0u8; 8];
