@@ -790,8 +790,7 @@ impl std::fmt::Display for Elapsed {
 impl std::error::Error for Elapsed {}
 
 // The test scaffolding here builds canned answers and fires scheduled
-// re-pulls by hand, which nests a block or two deeper than the gate allows.
-// The gate still holds the crate's own code to its limit.
+// re-pulls by hand.
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;

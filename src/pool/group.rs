@@ -325,9 +325,7 @@ pub(super) fn without_a_group(event: station_link::Event) -> station_link::Event
     }
 }
 
-// The test scaffolding here builds canned replies and canned events, which
-// nests a block or two deeper than the gate allows. The gate still holds the
-// crate's own code to its limit.
+// The test scaffolding here builds canned replies and canned events.
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
