@@ -793,7 +793,6 @@ impl std::error::Error for Elapsed {}
 // re-pulls by hand, which nests a block or two deeper than the gate allows.
 // The gate still holds the crate's own code to its limit.
 #[cfg(test)]
-#[allow(clippy::excessive_nesting)]
 mod tests {
     use std::collections::VecDeque;
     use std::error::Error;
@@ -889,6 +888,20 @@ mod tests {
         }
     }
 
+    /// The next canned answer. The first pull goes out at once; every later
+    /// one waits on the gate, so a test can hold it in flight.
+    async fn next_answer(
+        answers: Arc<Mutex<VecDeque<Answer>>>,
+        turns: Arc<AtomicUsize>,
+        gate: Arc<tokio::sync::Semaphore>,
+    ) -> Answer {
+        if turns.fetch_add(1, Ordering::SeqCst) > 0 {
+            let _turned = gate.acquire_owned().await;
+        }
+        let answer = answers.lock().unwrap().pop_front();
+        answer.unwrap_or_else(|| Err(PullError::Failed(Box::new(NoAnswer))))
+    }
+
     fn keyring(fake: &Arc<Fake>, now: &Arc<AtomicI64>) -> Keyring {
         let now = Arc::clone(now);
         Keyring::new(Options {
@@ -912,21 +925,14 @@ mod tests {
     ) -> (Keyring, Arc<AtomicUsize>) {
         let answers = Arc::new(Mutex::new(VecDeque::from(answers)));
         let turns = Arc::new(AtomicUsize::new(0));
-        let puller: Puller = Arc::new({
-            let answers = Arc::clone(&answers);
-            let turns = Arc::clone(&turns);
-            move |_pull| {
-                let answers = Arc::clone(&answers);
-                let turns = Arc::clone(&turns);
-                let gate = Arc::clone(&gate);
-                Box::pin(async move {
-                    if turns.fetch_add(1, Ordering::SeqCst) > 0 {
-                        let _turned = Arc::clone(&gate).acquire_owned().await;
-                    }
-                    let answer = answers.lock().unwrap().pop_front();
-                    answer.unwrap_or_else(|| Err(PullError::Failed(Box::new(NoAnswer))))
-                })
-            }
+        let (pulled_answers, pulled_turns, pulled_gate) =
+            (Arc::clone(&answers), Arc::clone(&turns), Arc::clone(&gate));
+        let puller: Puller = Arc::new(move |_pull| {
+            Box::pin(next_answer(
+                Arc::clone(&pulled_answers),
+                Arc::clone(&pulled_turns),
+                Arc::clone(&pulled_gate),
+            ))
         });
         let now = Arc::clone(now);
         let keyring = Keyring::new(Options {
@@ -936,6 +942,14 @@ mod tests {
             uniform: Arc::new(|| 0.5),
         });
         (keyring, turns)
+    }
+
+    /// An open of one epoch, spawned so the test can leave it in flight.
+    fn spawn_open(
+        keyring: Keyring,
+        id: [u8; ID_SIZE],
+    ) -> tokio::task::JoinHandle<Result<Epoch, GroupError>> {
+        tokio::spawn(async move { keyring.open_epoch([7; 32], PREFIX, id, PUBLISHER).await })
     }
 
     /// Waits until a test's own pulls have reached `wanted`, so an assertion
@@ -1022,15 +1036,18 @@ mod tests {
         assert_eq!(fake.asked(), 1, "a held epoch is published under at once");
     }
 
+    /// The by-id pull of one epoch answers with that epoch.
+    async fn assert_opens(keyring: &Keyring, id: u8) {
+        assert_eq!(opened(keyring, id).await.id, [id; ID_SIZE]);
+    }
+
     /// An unknown epoch is pulled by id, and one publisher is charged at most
     /// three of those pulls: the fourth is refused without asking at all.
     #[tokio::test]
     async fn an_unknown_epoch_is_pulled_by_id_three_times_a_publisher() {
         let current = answered(Policy::Required, vec![epoch(1, 60_000)]);
         let mut answers = vec![current];
-        for id in [4u8, 5, 6] {
-            answers.push(answered(Policy::Required, vec![epoch(id, 0)]));
-        }
+        answers.extend([4u8, 5, 6].map(|id| answered(Policy::Required, vec![epoch(id, 0)])));
         let fake = Fake::with(answers);
         let keyring = keyring(&fake, &clock());
         keyring
@@ -1038,9 +1055,9 @@ mod tests {
             .await
             .unwrap();
 
-        for id in [4u8, 5, 6] {
-            assert_eq!(opened(&keyring, id).await.id, [id; ID_SIZE]);
-        }
+        assert_opens(&keyring, 4).await;
+        assert_opens(&keyring, 5).await;
+        assert_opens(&keyring, 6).await;
         assert_eq!(fake.asked(), 4, "the join and three by-id pulls");
 
         let refused = keyring
@@ -1121,14 +1138,7 @@ mod tests {
             .unwrap();
 
         // An id the group does not hold is pulled by id, and that pull waits.
-        let pulling = {
-            let keyring = keyring.clone();
-            tokio::spawn(async move {
-                keyring
-                    .open_epoch([7; 32], PREFIX, [9; ID_SIZE], PUBLISHER)
-                    .await
-            })
-        };
+        let pulling = spawn_open(keyring.clone(), [9; ID_SIZE]);
         until_asked(&turns, 2).await;
 
         assert_eq!(

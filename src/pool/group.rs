@@ -329,7 +329,6 @@ pub(super) fn without_a_group(event: station_link::Event) -> station_link::Event
 // nests a block or two deeper than the gate allows. The gate still holds the
 // crate's own code to its limit.
 #[cfg(test)]
-#[allow(clippy::excessive_nesting)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
@@ -415,6 +414,40 @@ mod tests {
         }
     }
 
+    /// The canned reply, after waiting on the gate when this is not the
+    /// first pull.
+    async fn gated_reply(
+        reply: Value,
+        turns: Arc<AtomicUsize>,
+        gate: Arc<Semaphore>,
+    ) -> Result<(Value, [u8; 32]), PullError> {
+        if turns.fetch_add(1, Ordering::SeqCst) > 0 {
+            let _turned = gate.acquire_owned().await;
+        }
+        Ok((reply, PROVIDER))
+    }
+
+    /// Wait until the keyring has been asked for the `wanted`th time.
+    async fn until_pulled(turns: &Arc<AtomicUsize>, wanted: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while turns.load(Ordering::SeqCst) < wanted && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            turns.load(Ordering::SeqCst),
+            wanted,
+            "the by-id pull went out"
+        );
+    }
+
+    /// An open of one epoch, spawned so the test can leave it in flight.
+    fn spawn_open(
+        keyring: Keyring,
+        id: [u8; ID_SIZE],
+    ) -> tokio::task::JoinHandle<Result<group::Epoch, GroupError>> {
+        tokio::spawn(async move { keyring.open_epoch(REALM, PREFIX, id, PUBLISHER).await })
+    }
+
     /// A keyring holding `PREFIX` at required, whose pulls after the first
     /// wait on `gate`, so a test can leave one in flight.
     fn gated_keyring(gate: Arc<Semaphore>, turns: &Arc<AtomicUsize>) -> Keyring {
@@ -425,15 +458,11 @@ mod tests {
         });
         let turns = Arc::clone(turns);
         let puller: Puller = Arc::new(move |_pull| {
-            let reply = reply.clone();
-            let turns = Arc::clone(&turns);
-            let gate = Arc::clone(&gate);
-            Box::pin(async move {
-                if turns.fetch_add(1, Ordering::SeqCst) > 0 {
-                    let _turned = Arc::clone(&gate).acquire_owned().await;
-                }
-                Ok((reply, PROVIDER))
-            })
+            Box::pin(gated_reply(
+                reply.clone(),
+                Arc::clone(&turns),
+                Arc::clone(&gate),
+            ))
         });
         Keyring::new(KeyringOptions {
             pull: puller,
@@ -457,19 +486,8 @@ mod tests {
             .await
             .expect("the join is answered");
 
-        let pulling = {
-            let keyring = keyring.clone();
-            tokio::spawn(async move {
-                keyring
-                    .open_epoch(REALM, PREFIX, [9; ID_SIZE], PUBLISHER)
-                    .await
-            })
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while turns.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(turns.load(Ordering::SeqCst), 2, "the by-id pull went out");
+        let pulling = spawn_open(keyring.clone(), [9; ID_SIZE]);
+        until_pulled(&turns, 2).await;
 
         assert!(
             open_delivered(&keyring, None, event(Payload::Clear(Value::text("forged"))))
@@ -486,22 +504,27 @@ mod tests {
     /// a subscriber that needs every event sealed has to check it itself.
     #[tokio::test]
     async fn a_clear_event_is_delivered_under_a_preferred_group() {
-        for policy in [Policy::Preferred, Policy::Off] {
-            let keyring = keyring(policy).await;
-            let delivered = open_delivered(
-                &keyring,
-                Some(PREFIX),
-                event(Payload::Clear(Value::text("clear"))),
-            )
-            .await
-            .expect("a group that is not required delivers a clear event");
-            assert_eq!(delivered.unopened, None);
-            assert_eq!(
-                delivered.seal_key_id, None,
-                "a clear event names no epoch, which is how a subscriber tells"
-            );
-            assert_eq!(delivered.payload, Payload::Clear(Value::text("clear")));
-        }
+        delivered_while_not_required(Policy::Preferred).await;
+        delivered_while_not_required(Policy::Off).await;
+    }
+
+    /// A clear event arrives as it is, under one policy that is not
+    /// required.
+    async fn delivered_while_not_required(policy: Policy) {
+        let keyring = keyring(policy).await;
+        let delivered = open_delivered(
+            &keyring,
+            Some(PREFIX),
+            event(Payload::Clear(Value::text("clear"))),
+        )
+        .await
+        .expect("a group that is not required delivers a clear event");
+        assert_eq!(delivered.unopened, None);
+        assert_eq!(
+            delivered.seal_key_id, None,
+            "a clear event names no epoch, which is how a subscriber tells"
+        );
+        assert_eq!(delivered.payload, Payload::Clear(Value::text("clear")));
     }
 
     /// A required group refuses a clear event outright: it is never
