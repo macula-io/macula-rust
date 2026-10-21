@@ -121,15 +121,16 @@ jobs:
             --library target/release/libmacula_rust_ffi.so \
             --language swift --out-dir /tmp/bindings-swift --no-format
 
+  # A known-vulnerable dependency fails the build (macula-codebase-checks#11).
+  # The shared workflow, not a cargo audit step of our own: a step cannot be read
+  # for whether it can fail, and its --ignore is an exception nobody dated.
   audit:
-    name: cargo audit (dependency vulnerabilities)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-audit --locked
-      - run: cargo audit
+    name: Dependency advisories
+    permissions:
+      contents: read
+    uses: macula-io/macula-ci-images/.github/workflows/dependency-advisories.yml@dbc9533eb409c2118f45110613160060cc582f5d
+    with:
+      ecosystem: rust
 
   # The Erlang cross-verifier in scripts/cross-verify-macula, held to the
   # structural floor (macula-codebase-checks#9): nesting 2, no nested

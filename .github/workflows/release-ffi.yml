@@ -18,8 +18,20 @@ jobs:
     with:
       tag-prefix: ffi-v
       version-root: macula-rust-ffi
+  # Known-vulnerable dependencies do not publish (macula-codebase-checks#11).
+  # ci.yml runs the same scan on every push and pull request as the pre-tag
+  # signal; this workflow runs it on the tagged commit as well, so the tag is
+  # refused even when main went red between the last push and now.
+  advisories:
+    name: Dependency advisories
+    permissions:
+      contents: read
+    uses: macula-io/macula-ci-images/.github/workflows/dependency-advisories.yml@dbc9533eb409c2118f45110613160060cc582f5d
+    with:
+      ecosystem: rust
+
   publish:
-    needs: [release-guard]
+    needs: [release-guard, advisories]
     name: publish to crates.io
     runs-on: ubuntu-latest
     steps:
