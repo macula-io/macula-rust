@@ -36,3 +36,11 @@ linters:
     # held to the floor, except code the tool did not write (protobuf output).
     generated: lax
     rules: []
+
+issues:
+  # A capped run is not a reading of the floor: golangci-lint keeps the first
+  # 50 issues per linter and 3 per message by default, so a big first sweep is
+  # counted short. Both caps off, so every finding is reported and counted
+  # (macula-codebase-checks#9).
+  max-issues-per-linter: 0
+  max-same-issues: 0
