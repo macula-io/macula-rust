@@ -103,6 +103,7 @@ async fn quickstart(
     // first time. Log the path and node_id: another name or profile is another node.
     let dir = node_key::default_identity_dir().expect("HOME is set");
     let (key, path) = NodeKey::stored_identity(&dir, node_key::DEFAULT_IDENTITY_NAME, Profile::PqHybrid)?;
+    println!("identity {} node {:02x?}", path.display(), key.node_id()?);
     let mut opts = Opts::new(Arc::new(key));
     opts.realm_trust = HashMap::from([(realm, realm_key)]);
     let pool = Pool::connect(
@@ -137,16 +138,17 @@ async fn quickstart(
 Serving a procedure in the node's own namespace needs no org and no realm key:
 
 ```rust
-use macula_rust::pool::{Offer, Pool};
+use macula_rust::pool::{Offer, Pool, Served};
 use macula_rust::record::own_procedure;
 use macula_rust::station_link::handler;
 
-async fn serve_ring(pool: &Pool, realm: [u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
+/// Serves until the returned `Served` is stopped.
+async fn serve_ring(pool: &Pool, realm: [u8; 32]) -> Result<Served, Box<dyn std::error::Error>> {
     let ring = own_procedure(&pool.node_id(), "ring"); // ~<node_id>/ring
     let served = pool
         .serve(Offer::unary(realm, &ring, handler(|request| async move { Ok(request.payload) })))
         .await?;
-    Ok(())
+    Ok(served)
 }
 ```
 
