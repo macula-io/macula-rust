@@ -130,3 +130,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+
+  # The Erlang cross-verifier in scripts/cross-verify-macula, held to the
+  # structural floor (macula-codebase-checks#9): nesting 2, no nested
+  # try/catch, no if, functions at most 60 lines. In the house build image,
+  # since macula's NIFs build from source.
+  erlang-helper-lint:
+    name: Lint scripts/cross-verify-macula (structural floor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/macula-io/macula-ci-otp:20260923-1444@sha256:dd2ba6eb858a0eacedf0179300323fe5c6da46fb308d22da0ca8cfcd1f0718dc
+    steps:
+      - uses: actions/checkout@v4
+      - name: rebar3 as lint lint
+        working-directory: scripts/cross-verify-macula
+        run: rebar3 as lint lint

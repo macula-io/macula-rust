@@ -1,5 +1,8 @@
 [workspace]
 members = ["macula-rust-ffi"]
+# scripts/ holds Erlang helpers whose rebar3 deps build their own crates under
+# _build/; cargo must not treat those as part of this workspace.
+exclude = ["scripts"]
 
 [package]
 name = "macula-rust"
