@@ -1,2 +1,4 @@
 /target
 Cargo.lock.bak
+# go build in tests/teststation drops the station binary beside its package
+tests/teststation/teststation

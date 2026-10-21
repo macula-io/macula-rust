@@ -49,14 +49,7 @@ func runLab(t *helperT, p profile.Profile) {
 		if len(fields) == 0 {
 			continue
 		}
-		station := func(i int) *teststation.Station {
-			n, err := strconv.Atoi(fields[i])
-			if err != nil || n < 0 || n >= len(stations) {
-				return nil
-			}
-			return stations[n]
-		}
-		answer, err := lab(t, p, fields, station, &stations, &realms)
+		answer, err := lab(t, p, fields, &stations, &realms)
 		if err != nil {
 			fmt.Println("error", err)
 			continue
@@ -65,178 +58,256 @@ func runLab(t *helperT, p profile.Profile) {
 	}
 }
 
-func lab(t *helperT, p profile.Profile, f []string, station func(int) *teststation.Station,
-	stations *[]*teststation.Station, realms *[]teststation.Realm) (string, error) {
-	need := func(n int) error {
-		if len(f) < n {
-			return fmt.Errorf("%s needs %d arguments", f[0], n-1)
-		}
-		return nil
+// labCommand is one line of the lab protocol, and the state it acts on.
+type labCommand struct {
+	t        *helperT
+	p        profile.Profile
+	f        []string
+	stations *[]*teststation.Station
+	realms   *[]teststation.Realm
+}
+
+// need says whether the line carries n fields.
+func (c labCommand) need(n int) error {
+	if len(c.f) < n {
+		return fmt.Errorf("%s needs %d arguments", c.f[0], n-1)
 	}
-	pick := func(i int) (*teststation.Station, error) {
-		if err := need(i + 1); err != nil {
-			return nil, err
-		}
-		if s := station(i); s != nil {
-			return s, nil
-		}
-		return nil, fmt.Errorf("no station %s", f[i])
+	return nil
+}
+
+// pick is the station the line names by its index.
+func (c labCommand) pick(i int) (*teststation.Station, error) {
+	if err := c.need(i + 1); err != nil {
+		return nil, err
 	}
+	n, err := strconv.Atoi(c.f[i])
+	if err != nil || n < 0 || n >= len(*c.stations) {
+		return nil, fmt.Errorf("no station %s", c.f[i])
+	}
+	return (*c.stations)[n], nil
+}
+
+// realm is the realm the line names by its index.
+func (c labCommand) realm(i int) (teststation.Realm, error) {
+	if err := c.need(i + 1); err != nil {
+		return teststation.Realm{}, err
+	}
+	n, err := strconv.Atoi(c.f[i])
+	if err != nil || n < 0 || n >= len(*c.realms) {
+		return teststation.Realm{}, fmt.Errorf("no realm %s", c.f[i])
+	}
+	return (*c.realms)[n], nil
+}
+
+func lab(t *helperT, p profile.Profile, f []string, stations *[]*teststation.Station, realms *[]teststation.Realm) (string, error) {
+	c := labCommand{t: t, p: p, f: f, stations: stations, realms: realms}
 	switch f[0] {
 	case "start":
-		if err := need(2); err != nil {
-			return "", err
-		}
-		s := teststation.Start(t, p, strings.Join(f[1:], " "))
-		*stations = append(*stations, s)
-		return fmt.Sprintf("station %d %s %d %s", len(*stations)-1, s.Host, s.Port, hex.EncodeToString(s.NodeID[:])), nil
+		return c.start()
 	case "stop":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		s.Stop()
-		return "stopped", nil
+		return c.stop()
 	case "drop", "connected":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		node, err := id32(f, 2)
-		if err != nil {
-			return "", err
-		}
-		if f[0] == "drop" {
-			s.Drop(node)
-			return "dropped", nil
-		}
-		return yes(s.Connected(node)), nil
+		return c.dropOrConnected()
 	case "advertised":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		realm, err := id32(f, 2)
-		if err != nil {
-			return "", err
-		}
-		if err := need(4); err != nil {
-			return "", err
-		}
-		return yes(s.Advertised(realm, f[3])), nil
+		return c.advertised()
 	case "subscribed":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		node, err := id32(f, 2)
-		if err != nil {
-			return "", err
-		}
-		realm, err := id32(f, 3)
-		if err != nil {
-			return "", err
-		}
-		if err := need(5); err != nil {
-			return "", err
-		}
-		return yes(s.Subscribed(node, realm, f[4])), nil
+		return c.subscribed()
 	case "share":
-		var shared []*teststation.Station
-		for i := 1; i < len(f); i++ {
-			s, err := pick(i)
-			if err != nil {
-				return "", err
-			}
-			shared = append(shared, s)
-		}
-		teststation.ShareDHT(shared...)
-		return "shared", nil
+		return c.share()
 	case "put":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		wire, err := bytesAt(f, 2)
-		if err != nil {
-			return "", err
-		}
-		s.Put(wire)
-		return "put", nil
+		return c.put()
 	case "forge":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		key, err := id32(f, 2)
-		if err != nil {
-			return "", err
-		}
-		wire, err := bytesAt(f, 3)
-		if err != nil {
-			return "", err
-		}
-		s.Forge(key, wire)
-		return "forged", nil
+		return c.forge()
 	case "relayed":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("relayed %d", s.Relayed()), nil
+		return c.relayed()
 	case "realm":
-		if err := need(3); err != nil {
-			return "", err
-		}
-		r := teststation.NewRealm(t, p, f[1], f[2])
-		*realms = append(*realms, r)
-		return fmt.Sprintf("realm %d %s %s", len(*realms)-1, hex.EncodeToString(r.ID[:]), hex.EncodeToString(r.RealmKey())), nil
+		return c.newRealm()
 	case "impostor":
-		if err := need(2); err != nil {
-			return "", err
-		}
-		n, err := strconv.Atoi(f[1])
-		if err != nil || n < 0 || n >= len(*realms) {
-			return "", fmt.Errorf("no realm %s", f[1])
-		}
-		r := (*realms)[n]
-		r.Key = teststation.Key(t, p, fmt.Sprintf("impostor of realm %d", n))
-		*realms = append(*realms, r)
-		return fmt.Sprintf("realm %d %s %s", len(*realms)-1, hex.EncodeToString(r.ID[:]), hex.EncodeToString(r.RealmKey())), nil
+		return c.impostor()
 	case "admit":
-		if err := need(4); err != nil {
-			return "", err
-		}
-		n, err := strconv.Atoi(f[1])
-		if err != nil || n < 0 || n >= len(*realms) {
-			return "", fmt.Errorf("no realm %s", f[1])
-		}
-		s, err := pick(2)
-		if err != nil {
-			return "", err
-		}
-		var nodes [][32]byte
-		for i := 3; i < len(f); i++ {
-			node, err := id32(f, i)
-			if err != nil {
-				return "", err
-			}
-			nodes = append(nodes, node)
-		}
-		(*realms)[n].Admit(t, s, nodes...)
-		return "admitted", nil
+		return c.admit()
 	case "judge":
-		s, err := pick(1)
-		if err != nil {
-			return "", err
-		}
-		if err := need(4); err != nil {
-			return "", err
-		}
-		s.Judge(verdict(f[2], f[3]))
-		return "judged", nil
+		return c.judge()
 	}
 	return "", fmt.Errorf("unknown command %s", f[0])
+}
+
+func (c labCommand) start() (string, error) {
+	if err := c.need(2); err != nil {
+		return "", err
+	}
+	s := teststation.Start(c.t, c.p, strings.Join(c.f[1:], " "))
+	*c.stations = append(*c.stations, s)
+	return fmt.Sprintf("station %d %s %d %s", len(*c.stations)-1, s.Host, s.Port, hex.EncodeToString(s.NodeID[:])), nil
+}
+
+func (c labCommand) stop() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	s.Stop()
+	return "stopped", nil
+}
+
+func (c labCommand) dropOrConnected() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	node, err := id32(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	if c.f[0] == "drop" {
+		s.Drop(node)
+		return "dropped", nil
+	}
+	return yes(s.Connected(node)), nil
+}
+
+func (c labCommand) advertised() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	realm, err := id32(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	if err := c.need(4); err != nil {
+		return "", err
+	}
+	return yes(s.Advertised(realm, c.f[3])), nil
+}
+
+func (c labCommand) subscribed() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	node, err := id32(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	realm, err := id32(c.f, 3)
+	if err != nil {
+		return "", err
+	}
+	if err := c.need(5); err != nil {
+		return "", err
+	}
+	return yes(s.Subscribed(node, realm, c.f[4])), nil
+}
+
+func (c labCommand) share() (string, error) {
+	var shared []*teststation.Station
+	for i := 1; i < len(c.f); i++ {
+		s, err := c.pick(i)
+		if err != nil {
+			return "", err
+		}
+		shared = append(shared, s)
+	}
+	teststation.ShareDHT(shared...)
+	return "shared", nil
+}
+
+func (c labCommand) put() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	wire, err := bytesAt(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	s.Put(wire)
+	return "put", nil
+}
+
+func (c labCommand) forge() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	key, err := id32(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	wire, err := bytesAt(c.f, 3)
+	if err != nil {
+		return "", err
+	}
+	s.Forge(key, wire)
+	return "forged", nil
+}
+
+func (c labCommand) relayed() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("relayed %d", s.Relayed()), nil
+}
+
+func (c labCommand) newRealm() (string, error) {
+	if err := c.need(3); err != nil {
+		return "", err
+	}
+	r := teststation.NewRealm(c.t, c.p, c.f[1], c.f[2])
+	*c.realms = append(*c.realms, r)
+	return fmt.Sprintf("realm %d %s %s", len(*c.realms)-1, hex.EncodeToString(r.ID[:]), hex.EncodeToString(r.RealmKey())), nil
+}
+
+func (c labCommand) impostor() (string, error) {
+	if err := c.need(2); err != nil {
+		return "", err
+	}
+	r, err := c.realm(1)
+	if err != nil {
+		return "", err
+	}
+	n, _ := strconv.Atoi(c.f[1])
+	r.Key = teststation.Key(c.t, c.p, fmt.Sprintf("impostor of realm %d", n))
+	*c.realms = append(*c.realms, r)
+	return fmt.Sprintf("realm %d %s %s", len(*c.realms)-1, hex.EncodeToString(r.ID[:]), hex.EncodeToString(r.RealmKey())), nil
+}
+
+func (c labCommand) admit() (string, error) {
+	if err := c.need(4); err != nil {
+		return "", err
+	}
+	if _, err := c.realm(1); err != nil {
+		return "", err
+	}
+	n, _ := strconv.Atoi(c.f[1])
+	s, err := c.pick(2)
+	if err != nil {
+		return "", err
+	}
+	var nodes [][32]byte
+	for i := 3; i < len(c.f); i++ {
+		node, err := id32(c.f, i)
+		if err != nil {
+			return "", err
+		}
+		nodes = append(nodes, node)
+	}
+	(*c.realms)[n].Admit(c.t, s, nodes...)
+	return "admitted", nil
+}
+
+func (c labCommand) judge() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	if err := c.need(4); err != nil {
+		return "", err
+	}
+	s.Judge(verdict(c.f[2], c.f[3]))
+	return "judged", nil
 }
 
 // verdict judges registrations of kind as given, accepting every other one;

@@ -1,0 +1,38 @@
+# The structural floor (macula-io/macula-codebase-checks#9): deep nesting and
+# tangled functions fail the build, with no baseline and no inline disables.
+#
+# Every threshold is spelled out here, deliberately: a tool default is not the
+# floor, because a default can change under us. The counting is each tool's own,
+# and the numbers describe one level of nesting, as in elvis and credo.
+version: "2"
+
+linters:
+  # Only the structural floor is enabled here. Other linters are welcome when a
+  # repo wants them, but this config is the rule this sweep puts in place.
+  default: none
+  enable:
+    - nestif
+    - gocognit
+    - funlen
+  settings:
+    nestif:
+      # A score, not a depth: the outer if scores 1, an if nested in it 1 + its
+      # level. Two levels score 3 and pass; three score 6 and fail.
+      min-complexity: 4
+    gocognit:
+      # Cognitive complexity, clippy's measure: +1 per break in linear flow, +1
+      # more per level of nesting it sits at.
+      min-complexity: 15
+    funlen:
+      # Lines of a function, blank lines and comments not counted. This is the
+      # floor's measure, as elvis's max_function_length and clippy's are.
+      lines: 60
+      # funlen also caps statements, cannot be told to skip that, and would use
+      # its own default 40. Declared at 60 so it sits at the same size as the
+      # line cap instead of tightening the floor by a number nobody chose.
+      statements: 60
+  exclusions:
+    # No baseline and no generated-code escape: a file that is in the repo is
+    # held to the floor, except code the tool did not write (protobuf output).
+    generated: lax
+    rules: []

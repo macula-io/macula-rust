@@ -146,3 +146,20 @@ jobs:
       - name: rebar3 as lint lint
         working-directory: scripts/cross-verify-macula
         run: rebar3 as lint lint
+
+  # The Go test stations in tests/teststation, held to the structural floor
+  # (macula-codebase-checks#9): nestif 4, gocognit 15, funlen 60, with no
+  # baseline and no inline disables. The thresholds live in
+  # tests/teststation/.golangci.yml.
+  go-helper-lint:
+    name: Lint tests/teststation (structural floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
+          working-directory: tests/teststation
