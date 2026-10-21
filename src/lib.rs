@@ -12,6 +12,12 @@
 /// procedures.
 pub const WIRE_VERSION: &str = "1.0";
 
+/// The README's Rust blocks, compiled as doctests, so an example a reader
+/// copies from it builds against this crate (macula-codebase-checks#8).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
 pub mod binding;
 pub mod cbor;
 pub mod frame;

@@ -71,7 +71,7 @@ Swift. The core crate has no FFI dependency and no FFI-shaped types.
 
 ```toml
 [dependencies]
-macula-rust = "0.11"
+macula-rust = "0.12"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -85,55 +85,69 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use macula_rust::cbor::Value;
+use macula_rust::frame::Payload;
 use macula_rust::node_key::{self, NodeKey};
 use macula_rust::pool::{Call, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
 use macula_rust::station_link::Publication;
 
-// This program's identity under the account's identity directory
-// (~/.local/share/macula/identity/default.pq_hybrid.key on Linux), made the
-// first time. Log the path and node_id: another name or profile is another node.
-let dir = node_key::default_identity_dir().expect("HOME is set");
-let (key, path) = NodeKey::stored_identity(&dir, node_key::DEFAULT_IDENTITY_NAME, Profile::PqHybrid)?;
-let mut opts = Opts::new(Arc::new(key));
-opts.realm_trust = HashMap::from([(realm, realm_key)]);
-let pool = Pool::connect(
-    vec![Seed { host: "station-fi-helsinki.macula.io".into(), port: 4433, node_id: station_id }],
-    opts,
-)
-.await?;
-
-// A call reaches a provider by direct dial: its advertisement from the DHT,
-// trusted only when the realm key authorizes it, and its station dialed.
-let answer = pool
-    .call(Call { realm, procedure: "mcl-echo/echo".into(), payload: Value::text("hello"), ..Call::default() })
+/// The realm's id and key, and the station's node_id: the realm and the
+/// station publish them.
+async fn quickstart(
+    realm: [u8; 32],
+    realm_key: Vec<u8>,
+    station_id: [u8; 32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    // This program's identity under the account's identity directory
+    // (~/.local/share/macula/identity/default.pq_hybrid.key on Linux), made the
+    // first time. Log the path and node_id: another name or profile is another node.
+    let dir = node_key::default_identity_dir().expect("HOME is set");
+    let (key, path) = NodeKey::stored_identity(&dir, node_key::DEFAULT_IDENTITY_NAME, Profile::PqHybrid)?;
+    let mut opts = Opts::new(Arc::new(key));
+    opts.realm_trust = HashMap::from([(realm, realm_key)]);
+    let pool = Pool::connect(
+        vec![Seed { host: "station-fi-helsinki.macula.io".into(), port: 4433, node_id: station_id }],
+        opts,
+    )
     .await?;
 
-// Publish and subscribe; topics name a kind of fact, ids go in the payload.
-let mut sub = pool.subscribe(&realm, "acme/demo/greeting_sent_v1").await?;
-pool.publish(Publication {
-    realm,
-    topic: "acme/demo/greeting_sent_v1".into(),
-    payload: Value::Map(vec![(Value::text("text"), Value::text("hi"))]),
-    ttl_ms: None,
-})
-.await?;
-let event = sub.recv().await;
+    // A call reaches a provider by direct dial: its advertisement from the DHT,
+    // trusted only when the realm key authorizes it, and its station dialed.
+    let answer = pool
+        .call(Call { realm, procedure: "mcl-echo/echo".into(), payload: Value::text("hello"), ..Call::default() })
+        .await?;
 
-pool.close().await;
+    // Publish and subscribe; topics name a kind of fact, ids go in the payload.
+    let mut sub = pool.subscribe(&realm, "acme/demo/greeting_sent_v1").await?;
+    pool.publish(Publication {
+        realm,
+        topic: "acme/demo/greeting_sent_v1".into(),
+        payload: Payload::Clear(Value::Map(vec![(Value::text("text"), Value::text("hi"))])),
+        ttl_ms: None,
+    })
+    .await?;
+    let event = sub.recv().await;
+
+    pool.close().await;
+    println!("{answer:?} {event:?}");
+    Ok(())
+}
 ```
 
 Serving a procedure in the node's own namespace needs no org and no realm key:
 
 ```rust
-use macula_rust::pool::Offer;
+use macula_rust::pool::{Offer, Pool};
 use macula_rust::record::own_procedure;
 use macula_rust::station_link::handler;
 
-let ring = own_procedure(&pool.node_id(), "ring"); // ~<node_id>/ring
-let served = pool
-    .serve(Offer::unary(realm, &ring, handler(|request| async move { Ok(request.payload) })))
-    .await?;
+async fn serve_ring(pool: &Pool, realm: [u8; 32]) -> Result<(), Box<dyn std::error::Error>> {
+    let ring = own_procedure(&pool.node_id(), "ring"); // ~<node_id>/ring
+    let served = pool
+        .serve(Offer::unary(realm, &ring, handler(|request| async move { Ok(request.payload) })))
+        .await?;
+    Ok(())
+}
 ```
 
 Runnable versions are in [`examples/`](examples): `quickstart`, `serve`,

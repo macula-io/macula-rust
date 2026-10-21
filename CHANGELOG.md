@@ -15,6 +15,17 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Fixed
+
+- The README's Rust examples compile against the crate: they are doctests now
+  (`ReadmeDoctests` in `src/lib.rs`, under `cfg(doctest)` only), so `cargo test`
+  in CI and before every publish fails when one stops building
+  (macula-codebase-checks#8). Doing so found the quick start publishing a bare
+  `Value` where `Publication.payload` takes a `Payload` (`Payload::Clear` for an
+  unsealed one). Each example is a function whose parameters are what the prose
+  says a node needs (the realm's id and key, the station's node_id), and the
+  dependency line names 0.12.
+
 ### [0.12.0] - 2026-10-20
 
 ### Security
