@@ -10,6 +10,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::TestStations;
 use macula_rust::cbor::Value;
@@ -27,11 +28,22 @@ use macula_rust::station_link::{
 /// A link as a new node; with `keyring`, it advertises its key and, when
 /// `names_key`, names it in a sealed_required refusal.
 async fn node(env: &TestStations, keyring: Option<Arc<Keyring>>, names_key: bool) -> Link {
+    draining(env, keyring, names_key, 16).await
+}
+
+/// A node as [`node`] that drains `drains` refused streams at a time.
+async fn draining(
+    env: &TestStations,
+    keyring: Option<Arc<Keyring>>,
+    names_key: bool,
+    drains: usize,
+) -> Link {
     let identity = Arc::new(NodeKey::generate_identity(env.profile, PUZZLE_DIFFICULTY).unwrap());
     let issuer = StatementIssuer::with_wall_clock(identity.clone()).unwrap();
     let mut cfg = Config::new(env.target(0), identity, issuer);
     cfg.kem_advertise = keyring.is_some();
     cfg.refusal_names_key = names_key;
+    cfg.refusal_drains = drains;
     cfg.keyring = keyring;
     Link::dial(cfg).await.unwrap()
 }
@@ -107,6 +119,27 @@ async fn count_bytes(stream: Stream) -> Result<(), String> {
         ),
     ]);
     stream.reply(answer).await.map_err(|e| e.to_string())
+}
+
+/// Sends `chunks` chunks of `size` bytes as fast as the link takes them,
+/// ends its sending and gives the provider's reply.
+async fn upload(stream: Stream, chunks: usize, size: usize) -> Result<Value, LinkError> {
+    let chunk = vec![7u8; size];
+    for _ in 0..chunks {
+        stream.send(&chunk).await?;
+    }
+    stream.close_send().await?;
+    match stream.recv().await? {
+        StreamEvent::Reply { payload } => Ok(payload),
+        other => Err(LinkError::Frame(macula_rust::frame::FrameError::Payload(
+            format!("no reply: {other:?}"),
+        ))),
+    }
+}
+
+/// How many times the link counted `what`.
+fn counted(link: &Link, what: &str) -> u64 {
+    link.unrouted().get(what).copied().unwrap_or(0)
 }
 
 /// Waits for the caller's first chunk and sends it back.
@@ -212,4 +245,76 @@ async fn a_stream_refusal_naming_no_key_stands_as_sealed_required() {
         other => panic!("{other:?}"),
     }
     assert!(!stream.sealed());
+}
+
+/// A caller that wrote 4 MiB ahead before the refusal reached it still
+/// reseals: the provider drains its writes, so the station does not reset the
+/// stream and lose the refusal (macula-rust#42, Terra's finding from go#43).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clear_client_stream_that_wrote_hard_before_its_refusal_still_reseals() {
+    let env = TestStations::start(Profile::PqHybrid);
+    let keyring = Arc::new(Keyring::system(env.profile).unwrap());
+    let provider = node(&env, Some(keyring), true).await;
+    let caller = node(&env, None, false).await;
+    let count = record::own_procedure(&provider.node_id(), "count");
+    let handler = stream_handler(count_bytes);
+    let _served = serve(&env, &provider, &count, StreamMode::ClientStream, handler).await;
+
+    let open = clear_open(&env, &provider, &count, StreamMode::ClientStream);
+    let stream = caller.open_stream(open).await.unwrap();
+    let payload = upload(stream.clone(), 256, 16 * 1024).await.unwrap();
+    assert_eq!(payload.get("total"), Some(&Value::Int(4 * 1024 * 1024)));
+    assert_eq!(payload.get("sealed"), Some(&Value::Int(1)));
+    assert!(stream.sealed());
+    assert!(counted(&provider, "stream_refusal_drained") >= 1);
+}
+
+/// A flood of clear opens refused sealed_required past the link's drain
+/// places: each is released at once and every flooder's stream ends rather
+/// than waiting on a provider that reads no more, and a caller of another
+/// procedure on the same provider is answered meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_refused_opens_past_the_drain_places_does_not_stall_other_callers() {
+    let env = TestStations::start(Profile::PqPure);
+    let keyring = Arc::new(Keyring::system(env.profile).unwrap());
+    let provider = draining(&env, Some(keyring), true, 0).await;
+    let count = record::own_procedure(&provider.node_id(), "count");
+    let handler = stream_handler(count_bytes);
+    let _served = serve(&env, &provider, &count, StreamMode::ClientStream, handler).await;
+    let open = record::own_procedure(&provider.node_id(), "open");
+    let handler = stream_handler(count_bytes);
+    let offer = Offer::stream(env.realm_id, &open, StreamMode::ClientStream, handler);
+    let _open_served = provider.serve(offer).await.unwrap();
+
+    let mut flood = Vec::new();
+    for _ in 0..4 {
+        let flooder = node(&env, None, false).await;
+        let call = clear_open(&env, &provider, &count, StreamMode::ClientStream);
+        flood.extend((0..8).map(|_| tokio::spawn(flooded(flooder.clone(), call.clone()))));
+    }
+    let other = node(&env, None, false).await;
+    let call = clear_open(&env, &provider, &open, StreamMode::ClientStream);
+    let answered = tokio::time::timeout(Duration::from_secs(5), async {
+        upload(other.open_stream(call).await?, 4, 1024).await
+    })
+    .await
+    .expect("answered during the flood")
+    .unwrap();
+    assert_eq!(answered.get("total"), Some(&Value::Int(4 * 1024)));
+    for f in flood {
+        tokio::time::timeout(Duration::from_secs(15), f)
+            .await
+            .expect("a flooded stream ends")
+            .unwrap();
+    }
+    assert_eq!(counted(&provider, "stream_refusal_drained"), 0);
+    assert_eq!(counted(&provider, "stream_refusal_drains_full"), 32);
+}
+
+/// Opens `call` and uploads 1 MiB as fast as the link takes it, whatever
+/// becomes of the stream.
+async fn flooded(caller: Link, call: StreamCall) {
+    if let Ok(stream) = caller.open_stream(call).await {
+        let _ = upload(stream, 64, 16 * 1024).await;
+    }
 }

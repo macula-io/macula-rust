@@ -285,6 +285,10 @@ pub struct Config {
     /// makes it the rule. It needs a keyring.
     #[doc(hidden)]
     pub refusal_names_key: bool,
+    /// Streams the link drains at a time after a sealed_required refusal
+    /// (the default is 16). For tests only, to reach the cap.
+    #[doc(hidden)]
+    pub refusal_drains: usize,
 }
 
 impl Config {
@@ -302,6 +306,7 @@ impl Config {
             keyring: None,
             kem_advertise: false,
             refusal_names_key: false,
+            refusal_drains: stream::DRAINS,
         }
     }
 }
@@ -337,6 +342,9 @@ struct Inner {
     keyring: Option<Arc<Keyring>>,
     kem_advertise: bool,
     refusal_names_key: bool,
+    /// Places for streams being drained after a sealed_required refusal
+    /// (stream::DRAINS): past them a refusal closes at once.
+    drains: Arc<tokio::sync::Semaphore>,
     state: Mutex<State>,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
@@ -604,6 +612,7 @@ fn new_inner(
         keyring: cfg.keyring.clone(),
         kem_advertise: cfg.kem_advertise,
         refusal_names_key: cfg.refusal_names_key,
+        drains: Arc::new(tokio::sync::Semaphore::new(cfg.refusal_drains)),
         state: Mutex::new(State {
             ended: None,
             closing: false,

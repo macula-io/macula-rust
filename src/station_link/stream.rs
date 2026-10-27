@@ -60,6 +60,12 @@ const STREAM_OPEN_BYTES: usize = 1024 * 1024;
 const STREAM_OPEN_WAIT: Duration = Duration::from_secs(10);
 const STREAM_INBOX: usize = 16 * 1024 * 1024;
 
+/// Streams one link drains at a time after a sealed_required refusal.
+pub(super) const DRAINS: usize = 16;
+
+/// How long a refused stream's drain waits for the caller's sending to end.
+const DRAIN_WAIT: Duration = Duration::from_secs(5);
+
 /// How far ahead a STREAM_OPEN's deadline lies when its [`StreamCall`] names
 /// none, as macula's default.
 pub const DEFAULT_STREAM_DEADLINE: Duration = Duration::from_secs(30);
@@ -532,12 +538,21 @@ impl StreamInner {
                 .map(|key| (key, aborted(code, message))),
             _ => None,
         };
+        if key.is_some() {
+            // A write this session is still making waits on a provider that
+            // has stopped reading: it gives way, keeping its frame for the
+            // reopen, so the send lock comes free.
+            self.writer.abandon();
+        }
         let seq = self.send_seq.lock().await;
         let reopen = self.clear_reopen_slot().take();
         let (Some((key, refused)), Some(reopen)) = (key, reopen) else {
             return false;
         };
         self.side().reopening = true;
+        // The provider drains this session's sending until it ends: end it
+        // now, so the drain and its session place go as soon as it has read.
+        self.writer.finish().await;
         drop(seq);
         self.notify.notify_waiters();
         self.adopt_when_done(reopen.sealed_to(&self.link, key, refused));
@@ -1032,6 +1047,10 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     };
     let (session_open, sealing) = match session_open(&inner, &open, offer.as_ref()) {
         Ok(opened) => opened,
+        Err((CODE_SEALED_REQUIRED, message)) => {
+            let s = StreamInner::new(inner.clone(), send, open.clone(), false, None);
+            return refuse_sealed_required(&s, &message, recv, place).await;
+        }
         Err((code, message)) => return refuse_clear(code, &message, send, recv).await,
     };
     // From here a refusal of a sealed open goes sealed.
@@ -1164,6 +1183,50 @@ fn admit_stream(inner: &Inner, open: &VerifiedRequest) -> Result<SessionPlace, &
 /// Answers an open with a STREAM_ERROR of `code` and `message` at seq 0 and
 /// releases the stream.
 async fn refuse(s: &Arc<StreamInner>, code: &str, message: &str, mut recv: quinn::RecvStream) {
+    answer_refusal(s, code, message).await;
+    let _ = recv.stop(0u32.into());
+}
+
+/// Refuses a clear open sealed_required, then reads and drops what the
+/// caller still sends, up to the inbox and for at most five seconds, before
+/// releasing the stream: a caller that wrote ahead keeps its copy, and
+/// stopping its sending at once would have the station reset the stream and
+/// lose the refusal the caller reseals from (DESIGN_E2E_SEALED_BY_DEFAULT
+/// section 3). The drain holds the caller's session place and one of the
+/// link's [`DRAINS`]; with none left, the stream is released at once.
+async fn refuse_sealed_required(
+    s: &Arc<StreamInner>,
+    message: &str,
+    mut recv: quinn::RecvStream,
+    place: SessionPlace,
+) {
+    answer_refusal(s, CODE_SEALED_REQUIRED, message).await;
+    match s.link.drains.clone().try_acquire_owned() {
+        Ok(_drain) => {
+            s.link.count("stream_refusal_drained");
+            let _ = tokio::time::timeout(DRAIN_WAIT, drain(&mut recv)).await;
+        }
+        Err(_) => s.link.count("stream_refusal_drains_full"),
+    }
+    let _ = recv.stop(0u32.into());
+    drop(place);
+}
+
+/// Reads and drops a stream's remaining bytes, up to the inbox, until its
+/// sending ends.
+async fn drain(recv: &mut quinn::RecvStream) {
+    let mut left = STREAM_INBOX;
+    while let Ok(Some(chunk)) = recv.read_chunk(left, true).await {
+        left = left.saturating_sub(chunk.bytes.len());
+        if left == 0 {
+            return;
+        }
+    }
+}
+
+/// Writes an open's STREAM_ERROR of `code` and `message` at seq 0 and ends
+/// the stream's session.
+async fn answer_refusal(s: &Arc<StreamInner>, code: &str, message: &str) {
     s.link.count(&format!("stream_refused_{code}"));
     match naming_key(s, code, message) {
         Some(refusal) => {
@@ -1175,7 +1238,6 @@ async fn refuse(s: &Arc<StreamInner>, code: &str, message: &str, mut recv: quinn
             let _ = s.abort(code, message).await;
         }
     }
-    let _ = recv.stop(0u32.into());
 }
 
 /// A clear open's sealed_required refusal naming the keyring's current key
