@@ -540,11 +540,7 @@ impl StreamInner {
         self.side().reopening = true;
         drop(seq);
         self.notify.notify_waiters();
-        let s = self.clone();
-        tokio::spawn(async move {
-            let outcome = reopen.sealed_to(&s.link, key, refused).await;
-            s.adopt(outcome);
-        });
+        self.adopt_when_done(reopen.sealed_to(&self.link, key, refused));
         true
     }
 
@@ -634,13 +630,24 @@ impl StreamInner {
         self.side().reopening = true;
         drop(seq);
         self.notify.notify_waiters();
-        let s = self.clone();
         let named = refused_key(Some(detail));
+        self.adopt_when_done(reseal(named));
+        true
+    }
+
+    /// Runs a reseal and carries the stream on what it gives; one that
+    /// panics ends the stream, so it never stays reopening.
+    fn adopt_when_done(
+        self: &Arc<Self>,
+        reseal: Pin<Box<dyn Future<Output = Result<Stream, LinkError>> + Send>>,
+    ) {
+        let s = self.clone();
         tokio::spawn(async move {
-            let outcome = reseal(named).await;
+            let outcome = tokio::spawn(reseal)
+                .await
+                .unwrap_or_else(|e| Err(LinkError::Io(format!("the reseal failed: {e}"))));
             s.adopt(outcome);
         });
-        true
     }
 
     /// Carries the stream on the session its reseal reopened, this one
@@ -775,8 +782,9 @@ impl ClearReopen {
 
 /// The stream opened again on `link`, sealed to `key`, under a new request
 /// id and what is left of its deadline, with the copy sent on it first; the
-/// key handed to what learns it. Past the deadline the provider's refusal
-/// stands.
+/// key handed to what learns it. Past the deadline, before the reopen or
+/// while it runs, the provider's refusal stands: the stream never stays
+/// reopening.
 async fn reopened(
     r: ClearReopen,
     link: Link,
@@ -787,10 +795,23 @@ async fn reopened(
     if left == 0 {
         return Err(refused);
     }
+    let within = Duration::from_millis(left);
+    tokio::time::timeout(within, replayed_on(r, link, key, within))
+        .await
+        .unwrap_or(Err(refused))
+}
+
+/// [`reopened`]'s open and replay, under `left`.
+async fn replayed_on(
+    r: ClearReopen,
+    link: Link,
+    key: Vec<u8>,
+    left: Duration,
+) -> Result<Stream, LinkError> {
     let reseal = r.learnt.and_then(|learnt| learnt(&key));
     let call = StreamCall {
         seal: Some(Seal::To(key)),
-        deadline: Duration::from_millis(left),
+        deadline: left,
         ..r.call
     };
     let next = link.open_stream_held(call, reseal, None).await?;
