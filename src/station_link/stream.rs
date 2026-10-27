@@ -66,6 +66,13 @@ pub(super) const DRAINS: usize = 16;
 /// How long a refused stream's drain waits for the caller's sending to end.
 const DRAIN_WAIT: Duration = Duration::from_secs(5);
 
+/// How long a provider's handler may still run after its caller ended the
+/// stream, to read what the caller sent before its end.
+const HANDLER_DRAIN: Duration = Duration::from_secs(5);
+
+/// How long a close waits for the peer to end its side.
+pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
 /// How far ahead a STREAM_OPEN's deadline lies when its [`StreamCall`] names
 /// none, as macula's default.
 pub const DEFAULT_STREAM_DEADLINE: Duration = Duration::from_secs(30);
@@ -267,15 +274,34 @@ impl Stream {
         self.sent(at, true).await.1
     }
 
-    /// Ends the stream on both sides.
+    /// Ends the stream on both sides: once the peer has read the end and
+    /// ended its side too, or [`CLOSE_WAIT`] on. Until then the stream reads
+    /// on, so a clear open's refusal still on its way reseals it and replays
+    /// the close on the session it reopens on, and this side does not stop
+    /// its receiving while the peer may still write.
     pub async fn close(&self) -> Result<(), LinkError> {
         let at = |seq| StreamFields::End {
             seq,
             role: StreamRole::Both,
         };
-        let (inner, sent) = self.sent(at, true).await;
-        StreamInner::end(&inner, None);
+        let (_, sent) = self.sent(at, true).await;
+        let _ = tokio::time::timeout(CLOSE_WAIT, self.carrier_ended()).await;
+        StreamInner::end(&self.current(), None);
         sent
+    }
+
+    /// Waits until the session carrying the stream has ended, following a
+    /// reseal onto the session it reopens on.
+    async fn carrier_ended(&self) {
+        loop {
+            let live = self.live().await;
+            live.ended_or_reopening().await;
+            let moved = live.side().reopening;
+            match moved {
+                true => continue,
+                false => return,
+            }
+        }
     }
 
     /// Sends the provider's terminal value and ends the stream.
@@ -564,6 +590,30 @@ impl StreamInner {
         self.notify.notify_waiters();
         self.adopt_when_done(reopen.sealed_to(&self.link, key, refused));
         true
+    }
+
+    /// Whether this session has ended or a reseal is taking the stream off
+    /// it.
+    fn ended_or_moving(&self) -> bool {
+        let side = self.side();
+        side.ended || side.reopening
+    }
+
+    /// Waits until this session has ended or a reseal is taking the stream
+    /// off it.
+    async fn ended_or_reopening(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Read into a binding: a guard in the match would be held across
+            // the await.
+            let settled = self.ended_or_moving();
+            match settled {
+                true => return,
+                false => notified.await,
+            }
+        }
     }
 
     /// Ends this side's sending when a frame that spent its seq did not go
@@ -1267,11 +1317,11 @@ async fn serve(s: Arc<StreamInner>, offer: StreamOffer) {
     let mut running = tokio::spawn((offer.handler)(stream.clone()));
     let mut done = s.done_tx.subscribe();
     let outcome = tokio::select! {
-        outcome = &mut running => outcome,
-        _ = done.wait_for(|ended| *ended) => {
-            running.abort();
-            return;
-        }
+        outcome = &mut running => Some(outcome),
+        _ = done.wait_for(|ended| *ended) => None,
+    };
+    let Some(outcome) = outcome else {
+        return outlived(&s, running).await;
     };
     match outcome {
         Ok(Ok(())) => {
@@ -1291,6 +1341,22 @@ async fn serve(s: Arc<StreamInner>, offer: StreamOffer) {
                 .await;
         }
     }
+}
+
+/// Lets a handler whose stream ended before it returned finish: after the
+/// peer's last frame it has [`HANDLER_DRAIN`] to read what the stream still
+/// queues, the caller's end included; a stream ended otherwise aborts it at
+/// once.
+async fn outlived(s: &Arc<StreamInner>, mut running: tokio::task::JoinHandle<Result<(), String>>) {
+    let normal = s.side().err.is_none();
+    if normal
+        && tokio::time::timeout(HANDLER_DRAIN, &mut running)
+            .await
+            .is_ok()
+    {
+        return;
+    }
+    running.abort();
 }
 
 /// Verifies the peer's frames until the stream ends. It is the stream's one

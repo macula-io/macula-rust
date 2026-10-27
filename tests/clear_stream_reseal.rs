@@ -384,3 +384,89 @@ async fn received(stream: &Stream) -> (usize, Value) {
         }
     }
 }
+
+/// A clear client stream closed both ways right after it sent, before its
+/// refusal came, still reaches the provider sealed: the session reads on
+/// and the reopen replays the sends and the close. Before, the stream was
+/// ended at once and what it sent was lost, though close() returned Ok.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clear_stream_closed_before_its_refusal_came_reaches_the_provider_sealed() {
+    let env = TestStations::start(Profile::PqPure);
+    let keyring = Arc::new(Keyring::system(env.profile).unwrap());
+    let provider = node(&env, Some(keyring), true).await;
+    let caller = node(&env, None, false).await;
+    let drop_box = record::own_procedure(&provider.node_id(), "drop_box");
+    let (got, mut got_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = stream_handler(move |stream: Stream| received_into(stream, got.clone()));
+    let _served = serve(
+        &env,
+        &provider,
+        &drop_box,
+        StreamMode::ClientStream,
+        handler,
+    )
+    .await;
+
+    for _ in 0..5 {
+        let open = clear_open(&env, &provider, &drop_box, StreamMode::ClientStream);
+        let upload = caller.open_stream(open).await.unwrap();
+        upload.send(b"abcde").await.unwrap();
+        upload.close().await.unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(10), got_rx.recv())
+            .await
+            .expect("the provider got the stream");
+        assert_eq!(delivered, Some((5, true)));
+    }
+}
+
+/// A clear client stream to a provider that takes clear opens and sends
+/// nothing first: what it sent before close() reaches the provider, and
+/// close() returns once the provider has ended its side, not at the
+/// deadline. Before, the close ended the stream at once and the station's
+/// reset lost the end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clear_stream_that_sent_then_closed_is_delivered_and_close_returns_promptly() {
+    let env = TestStations::start(Profile::PqPure);
+    let provider = node(&env, None, false).await;
+    let caller = node(&env, None, false).await;
+    let drop_box = record::own_procedure(&provider.node_id(), "drop_box");
+    let (got, mut got_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = stream_handler(move |stream: Stream| received_into(stream, got.clone()));
+    let offer = Offer::stream(env.realm_id, &drop_box, StreamMode::ClientStream, handler);
+    let _served = provider.serve(offer).await.unwrap();
+
+    for _ in 0..5 {
+        let open = clear_open(&env, &provider, &drop_box, StreamMode::ClientStream);
+        let upload = caller.open_stream(open).await.unwrap();
+        upload.send(b"abcde").await.unwrap();
+        let closing = std::time::Instant::now();
+        upload.close().await.unwrap();
+        assert!(
+            closing.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            closing.elapsed()
+        );
+        let delivered = tokio::time::timeout(Duration::from_secs(10), got_rx.recv())
+            .await
+            .expect("the provider got the stream");
+        assert_eq!(delivered, Some((5, false)));
+    }
+}
+
+/// Counts the bytes the caller sent until its sending ends and hands the
+/// count and whether the stream came sealed to `got`.
+async fn received_into(
+    stream: Stream,
+    got: tokio::sync::mpsc::UnboundedSender<(usize, bool)>,
+) -> Result<(), String> {
+    let mut total = 0usize;
+    while let Ok(StreamEvent::Data {
+        body: Value::Bytes(b),
+        ..
+    }) = stream.recv().await
+    {
+        total += b.len();
+    }
+    let _ = got.send((total, stream.sealed()));
+    Ok(())
+}
