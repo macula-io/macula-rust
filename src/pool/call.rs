@@ -171,7 +171,7 @@ impl Pool {
         let candidates = bounded(deadline, inner.candidates(&key, realm_key.clone())).await?;
         let candidates = callable(candidates, c.confidential)?;
         let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
-        let outcome = bounded(deadline, inner.call_at(&link, &cand, &c, deadline)).await;
+        let (cand, outcome) = inner.call_at(&link, cand, &c, deadline).await;
         let sent = Sent {
             link: &link,
             call: &c,
@@ -353,28 +353,38 @@ impl PoolInner {
     /// Calls the candidate's provider on `link`, under what is left before
     /// `deadline`, and reports the call: a sealed call's result is only ever
     /// one its answer opened under the key it was sealed to (the link
-    /// refuses any other), so `sealed` 1 names that key.
+    /// refuses any other), so `sealed` 1 names that key. A clear call the
+    /// provider refused sealed_required naming its key, which the link
+    /// sealed to and sent once more, comes back with that key in the
+    /// candidate (see [`learnt`]), and the report names it. The candidate
+    /// the outcome came from, and the outcome.
     async fn call_at(
         &self,
         link: &Link,
-        cand: &Candidate,
+        cand: Candidate,
         c: &Call,
         deadline: Instant,
-    ) -> Result<(Value, Report), PoolError> {
+    ) -> (Candidate, Result<(Value, Report), PoolError>) {
         let left = deadline.saturating_duration_since(Instant::now());
-        let result = link
-            .call(station_link::Call {
-                realm: c.realm,
-                procedure: c.procedure.clone(),
-                target: cand.provider.node,
-                payload: c.payload.clone(),
-                timeout: left.max(Duration::from_millis(1)),
-                token: c.token.clone(),
-                proofs: c.proofs.clone(),
-                seal: Some(cand.seal()),
-            })
-            .await?;
-        Ok((result, Report::of(cand.provider.node, cand.kem_key_id())))
+        let call = link.call_resealing(station_link::Call {
+            realm: c.realm,
+            procedure: c.procedure.clone(),
+            target: cand.provider.node,
+            payload: c.payload.clone(),
+            timeout: left.max(Duration::from_millis(1)),
+            token: c.token.clone(),
+            proofs: c.proofs.clone(),
+            seal: Some(cand.seal()),
+        });
+        let Ok(called) = tokio::time::timeout_at(deadline, call).await else {
+            return (cand, Err(PoolError::Link(LinkError::CallTimeout)));
+        };
+        let cand = learnt(cand, called.resealed_to);
+        let outcome = called
+            .outcome
+            .map(|result| (result, Report::of(cand.provider.node, cand.kem_key_id())))
+            .map_err(PoolError::Link);
+        (cand, outcome)
     }
 
     /// A sealed call refused sealed_refused after its provider's key rotated,
@@ -408,9 +418,8 @@ impl PoolInner {
             Ok(next) => next,
             Err(e) => return (cand, Err(e)),
         };
-        let resent = self.call_at(sent.link, &next, sent.call, sent.deadline);
-        let outcome = bounded(sent.deadline, resent).await;
-        (next, outcome)
+        self.call_at(sent.link, next, sent.call, sent.deadline)
+            .await
     }
 
     /// Opens the stream at the candidate's provider on `link`, holding
@@ -644,6 +653,21 @@ fn as_link_error(e: PoolError) -> LinkError {
         PoolError::Link(e) => e,
         PoolError::Confidentiality(e) => LinkError::Confidentiality(e),
         other => LinkError::Io(other.to_string()),
+    }
+}
+
+/// `cand` with the KEM key its provider named in a signed sealed_required,
+/// when the link sealed the call to it (DESIGN_E2E_SEALED_BY_DEFAULT section
+/// 3). The key wins over the candidate's keyless advertisement: remembered
+/// with it, it seals the next call at once, for as long as that
+/// advertisement lives.
+fn learnt(cand: Candidate, resealed_to: Option<Vec<u8>>) -> Candidate {
+    match resealed_to {
+        Some(key) => Candidate {
+            kem_key: Some(key),
+            ..cand
+        },
+        None => cand,
     }
 }
 

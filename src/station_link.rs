@@ -28,7 +28,7 @@ mod stream;
 mod versions;
 
 pub use admission::{Admission, AdmissionLimits};
-pub use call::{Call, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
+pub use call::{Call, Called, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
 pub use confidential::{
     is_clear_refusal, Confidentiality, ConfidentialityError, ConfidentialityReason, Seal,
 };
@@ -666,7 +666,7 @@ impl Inner {
         let streams = std::mem::take(&mut state.streams);
         drop(state);
         for (_, p) in pending {
-            let _ = p.outcome.send(Err(err.clone()));
+            let _ = p.outcome.send(call::Answer::Final(Err(err.clone())));
         }
         drop(subs);
         pubsub::end_waits(sub_acks, &err);

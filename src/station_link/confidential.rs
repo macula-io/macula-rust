@@ -296,6 +296,22 @@ pub(super) fn refused_key(detail: Option<&str>) -> Option<[u8; KEY_ID_SIZE]> {
     Some(id)
 }
 
+/// The key a clear call's or open's refusal names for it to seal to
+/// (DESIGN_E2E_SEALED_BY_DEFAULT section 3): a sealed_required carrying, in
+/// its signed tbs, a KEM key this link's profile seals to. `None` for any
+/// other refusal, one without the key, or a key not of this profile (a
+/// provider before release A, or a faulty one): the refusal then stands as
+/// the provider's own.
+pub(super) fn reseal_key(
+    profile: Profile,
+    code: Option<&str>,
+    kem_key: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let key = kem_key.filter(|_| code == Some(CODE_SEALED_REQUIRED))?;
+    seal::parse_public_key(profile, key).ok()?;
+    Some(key.to_vec())
+}
+
 /// What a verified provider reply means to a call: for a sealed call, a
 /// sealed answer under the request's key id opened; a clear sealed_refused
 /// naming the provider's key; a clear refusal from the closed set; anything

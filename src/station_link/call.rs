@@ -5,14 +5,14 @@
 //! link does. On a v4 link the liveness probe is a call too.
 
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
 use crate::cbor::Value;
 use crate::frame::{self, RequestSpec, VerifiedRequest};
 
-use super::confidential::{reply_outcome, sealed_request, stated, CallSeal, Seal};
+use super::confidential::{reply_outcome, reseal_key, sealed_request, stated, CallSeal, Seal};
 use super::{now_ms, Inner, Link, LinkError};
 use crate::seal;
 
@@ -63,23 +63,101 @@ impl Default for Call {
 pub(super) struct Pending {
     pub(super) request: VerifiedRequest,
     pub(super) seal: Option<CallSeal>,
-    pub(super) outcome: oneshot::Sender<Result<Value, LinkError>>,
+    pub(super) outcome: oneshot::Sender<Answer>,
+}
+
+/// What a pending call is answered with: its outcome, or, for a clear call
+/// a provider refused sealed_required naming the key it holds, that key and
+/// the refusal, which stands if the call cannot be sent again.
+pub(super) enum Answer {
+    Final(Result<Value, LinkError>),
+    ResealTo { key: Vec<u8>, refused: LinkError },
+}
+
+impl Answer {
+    /// The outcome, the refusal standing for a key that is not taken.
+    fn outcome(self) -> Result<Value, LinkError> {
+        match self {
+            Answer::Final(outcome) => outcome,
+            Answer::ResealTo { refused, .. } => Err(refused),
+        }
+    }
+}
+
+/// What a call gave: its outcome, and the KEM key the link sealed it to once
+/// more after the provider refused it in the clear with sealed_required
+/// naming that key (DESIGN_E2E_SEALED_BY_DEFAULT section 3), `None` when it
+/// did not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Called {
+    pub outcome: Result<Value, LinkError>,
+    pub resealed_to: Option<Vec<u8>>,
 }
 
 impl Link {
     /// Signs `c` as a CALL, sends it, and waits for the RESULT or ERROR that
-    /// verifies for it.
+    /// verifies for it. A clear call the provider refuses sealed_required
+    /// with the key it holds is sealed to that key and sent once more, under
+    /// a new request id and within the same timeout; see
+    /// [`Link::call_resealing`] for which key that was.
     pub async fn call(&self, c: Call) -> Result<Value, LinkError> {
+        call(&self.inner, c).await.outcome
+    }
+
+    /// [`Link::call`], saying which key the call was sealed to once more, if
+    /// it was: the provider's own, from its signed refusal.
+    pub async fn call_resealing(&self, c: Call) -> Called {
         call(&self.inner, c).await
     }
 }
 
-pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError> {
+/// A call, sent once more sealed when its clear request is refused
+/// sealed_required naming the provider's key: at most once, and never in the
+/// clear again.
+pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Called {
     let timeout = if c.timeout.is_zero() {
         DEFAULT_CALL_TIMEOUT
     } else {
         c.timeout.min(MAX_CALL_TIMEOUT)
     };
+    let until = Instant::now() + timeout;
+    let (key, refused) = match sent(inner, &c, until).await {
+        Answer::Final(outcome) => {
+            return Called {
+                outcome,
+                resealed_to: None,
+            }
+        }
+        Answer::ResealTo { key, refused } => (key, refused),
+    };
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Called {
+            outcome: Err(refused),
+            resealed_to: None,
+        };
+    }
+    let resealed = Call {
+        seal: Some(Seal::To(key.clone())),
+        ..c
+    };
+    Called {
+        outcome: sent(inner, &resealed, until).await.outcome(),
+        resealed_to: Some(key),
+    }
+}
+
+/// `c` signed under a new request id and sent, with what is left before
+/// `until`, and its answer.
+async fn sent(inner: &Arc<Inner>, c: &Call, until: Instant) -> Answer {
+    match sent_once(inner, c, until).await {
+        Ok(answer) => answer,
+        Err(e) => Answer::Final(Err(e)),
+    }
+}
+
+async fn sent_once(inner: &Arc<Inner>, c: &Call, until: Instant) -> Result<Answer, LinkError> {
+    let timeout = until.saturating_duration_since(Instant::now());
     stated(&c.target, &inner.station.node_id, &c.seal)?;
     let target = if c.target == [0; 32] {
         inner.station.node_id
@@ -89,19 +167,19 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     let mut request_id = [0u8; 16];
     aws_lc_rs::rand::fill(&mut request_id).map_err(|_| LinkError::Io("no randomness".into()))?;
     let deadline = (now_ms() + timeout.as_millis() as i64) as u64;
-    let (sealed, call_seal) = sealed_call(inner, &c, target, request_id, deadline)?;
+    let (sealed, call_seal) = sealed_call(inner, c, target, request_id, deadline)?;
     let signed = frame::sign_call(
         &RequestSpec {
             request_id,
             realm: c.realm,
-            procedure: c.procedure,
+            procedure: c.procedure.clone(),
             target,
             deadline,
-            payload: c.payload,
+            payload: c.payload.clone(),
             sealed,
             mode: None,
-            token: c.token,
-            proofs: c.proofs,
+            token: c.token.clone(),
+            proofs: c.proofs.clone(),
             source_route: None,
             retry_budget: None,
         },
@@ -128,7 +206,7 @@ pub(super) async fn call(inner: &Arc<Inner>, c: Call) -> Result<Value, LinkError
     let answered = tokio::time::timeout(timeout, outcome).await;
     forget();
     match answered {
-        Ok(Ok(outcome)) => outcome,
+        Ok(Ok(answer)) => Ok(answer),
         Ok(Err(_)) => Err(inner.lock().ended.clone().unwrap_or(LinkError::Closed)),
         Err(_) => Err(LinkError::CallTimeout),
     }
@@ -202,17 +280,33 @@ fn verified_outcome(
     v: &Value,
     request: &VerifiedRequest,
     seal: Option<&CallSeal>,
-) -> Option<Result<Value, LinkError>> {
+) -> Option<Answer> {
     if v.get("reply").is_some() {
         let reply = frame::verify_reply(v, request, inner.profile).ok()?;
-        return Some(reply_outcome(reply, request, seal));
+        // Only a clear call is sealed again: a sealed one is never refused
+        // sealed_required, and nothing answers one with the clear.
+        let key = seal
+            .is_none()
+            .then(|| {
+                reseal_key(
+                    inner.profile,
+                    reply.code.as_deref(),
+                    reply.kem_key.as_deref(),
+                )
+            })
+            .flatten();
+        let outcome = reply_outcome(reply, request, seal);
+        return Some(match (key, outcome) {
+            (Some(key), Err(refused)) => Answer::ResealTo { key, refused },
+            (_, outcome) => Answer::Final(outcome),
+        });
     }
     let relayed =
         frame::verify_relay_error(v, request, inner.profile, &inner.station.node_id).ok()?;
-    Some(Err(LinkError::Relay {
+    Some(Answer::Final(Err(LinkError::Relay {
         reported_by: relayed.reported_by,
         code: relayed.code,
-    }))
+    })))
 }
 
 /// A liveness probe every 30 seconds; two misses in a row end the link. On v5
