@@ -25,8 +25,8 @@ use crate::frame::StreamMode;
 use crate::record::{self, RecordType, Trust, Verified};
 use crate::seal::KEY_ID_SIZE;
 use crate::station_link::{
-    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Link, LinkError, Report,
-    Reseal, Seal, Stream, DEFAULT_CALL_TIMEOUT,
+    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Learnt, Link, LinkError,
+    Report, Reseal, Seal, Stream, DEFAULT_CALL_TIMEOUT,
 };
 use crate::transport::Target;
 
@@ -220,8 +220,10 @@ impl Pool {
         let candidates = bounded(deadline, inner.candidates(&key, realm_key.clone())).await?;
         let candidates = callable(candidates, c.confidential)?;
         let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
+        let learnt = inner.stream_learnt(&key, &cand, &c, realm_key.clone(), &link);
         let reseal = inner.stream_reseal(&key, &cand, &c, realm_key, &link);
-        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c, reseal)).await;
+        let held = Held { reseal, learnt };
+        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c, held)).await;
         inner.settled(key, cand, outcome)
     }
 
@@ -422,17 +424,17 @@ impl PoolInner {
             .await
     }
 
-    /// Opens the stream at the candidate's provider on `link`, holding
-    /// `reseal` for a sealed_refused of its open.
+    /// Opens the stream at the candidate's provider on `link`, holding what
+    /// `held` names for a refusal of its open.
     async fn open_at(
         &self,
         link: &Link,
         cand: &Candidate,
         c: &StreamCall,
-        reseal: Option<Reseal>,
+        held: Held,
     ) -> Result<Stream, PoolError> {
         Ok(link
-            .open_stream_resealing(
+            .open_stream_held(
                 station_link::StreamCall {
                     realm: c.realm,
                     procedure: c.procedure.clone(),
@@ -444,9 +446,35 @@ impl PoolInner {
                     proofs: c.proofs.clone(),
                     seal: Some(cand.seal()),
                 },
-                reseal,
+                held.reseal,
+                held.learnt,
             )
             .await?)
+    }
+
+    /// What a clear stream's sealed reopen tells the pool: the key its
+    /// provider named, which the pool remembers in the candidate as a
+    /// call's (see [`learnt`]), and the reseal the reopened stream holds for
+    /// a sealed_refused of its own (A1). None for a sealed candidate.
+    fn stream_learnt(
+        self: &Arc<Self>,
+        key: &ResolvedKey,
+        cand: &Candidate,
+        c: &StreamCall,
+        realm_key: Option<Vec<u8>>,
+        link: &Link,
+    ) -> Option<Learnt> {
+        if cand.kem_key.is_some() {
+            return None;
+        }
+        let pool = Arc::downgrade(self);
+        let (key, cand, c, link) = (key.clone(), cand.clone(), c.clone(), link.clone());
+        Some(Box::new(move |kem_key: &[u8]| {
+            let pool = pool.upgrade()?;
+            let cand = learnt(cand, Some(kem_key.to_vec()));
+            pool.remember(key.clone(), cand.clone());
+            pool.stream_reseal(&key, &cand, &c, realm_key, &link)
+        }))
     }
 
     /// A sealed stream's one reseal, on a call's terms (see
@@ -608,6 +636,14 @@ struct Sent<'a> {
 /// one, or, when the refusal named none, the first that names a key. When
 /// the named key is not among them, key_mismatch naming both; when none
 /// names a key, no_kem_key.
+/// What an open holds for a refusal: a sealed open's reseal, a clear one's
+/// learning of the key.
+#[derive(Default)]
+struct Held {
+    reseal: Option<Reseal>,
+    learnt: Option<Learnt>,
+}
+
 /// What a stream's reseal reopens: the provider's own key, the key the pool
 /// remembers it under, the open, and its link and realm key.
 struct Resealing {
@@ -628,9 +664,12 @@ async fn resealed_stream(
     let deadline = Instant::now() + DEFAULT_CALL_TIMEOUT;
     let fresh = bounded(deadline, pool.resolve(&r.own, r.realm_key)).await;
     let reopened = match reseal_to(fresh, named) {
-        Ok(next) => bounded(deadline, pool.open_at(&r.link, &next, &r.c, None))
-            .await
-            .map(|stream| (stream, next)),
+        Ok(next) => bounded(
+            deadline,
+            pool.open_at(&r.link, &next, &r.c, Held::default()),
+        )
+        .await
+        .map(|stream| (stream, next)),
         Err(e) => Err(e),
     };
     // As a call settles: the provider's new key is remembered, and a stale
