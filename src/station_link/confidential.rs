@@ -753,6 +753,7 @@ mod tests {
             code: code.map(str::to_string),
             detail: None,
             sealed: None,
+            kem_key: None,
         }
     }
 
@@ -774,6 +775,7 @@ mod tests {
             code: None,
             detail: None,
             sealed: Some(sealed),
+            kem_key: None,
         };
         assert_eq!(
             reply_outcome(reply, &request, Some(&caller)),
@@ -862,7 +864,11 @@ mod tests {
     }
 
     fn from(signer: [u8; 32], fields: StreamFields) -> VerifiedStreamFrame {
-        VerifiedStreamFrame { signer, fields }
+        VerifiedStreamFrame {
+            signer,
+            fields,
+            kem_key: None,
+        }
     }
 
     #[test]

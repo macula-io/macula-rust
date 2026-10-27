@@ -30,8 +30,8 @@ pub use control::{
     unadvertise_frame, unsubscribe_frame,
 };
 pub use envelope::{
-    act_on_ext, check_ext, read_envelope, unknown_frame_type, Envelope, MAX_EXTENSIONS,
-    MAX_EXTENSION_NAME_BYTES, MAX_FRAME_TYPE_BYTES, QUIC_CODE_UNKNOWN_FRAME_TYPE,
+    act_on_ext, check_ext, ext_value, read_envelope, unknown_frame_type, Envelope, MAX_EXTENSIONS,
+    MAX_EXTENSION_NAME_BYTES, MAX_FRAME_TYPE_BYTES, QUIC_CODE_UNKNOWN_FRAME_TYPE, SEAL_KEM_KEY_EXT,
 };
 pub use publication::{
     delivered_via, sign_publish, verify_publication, Payload, PublicationSpec, VerifiedPublication,
@@ -39,8 +39,8 @@ pub use publication::{
 pub use register_ack::{read_register_ack, Answered, RegisterAck, RegisterKind};
 pub use reply::{
     claimed_reply_ids, sign_provider_error, sign_relay_error, sign_result,
-    sign_sealed_provider_error, sign_sealed_result, verify_relay_error, verify_reply,
-    RelayErrorSpec, RelayErrorType, ReplyType, VerifiedRelayError, VerifiedReply,
+    sign_sealed_provider_error, sign_sealed_required, sign_sealed_result, verify_relay_error,
+    verify_reply, RelayErrorSpec, RelayErrorType, ReplyType, VerifiedRelayError, VerifiedReply,
 };
 pub use request::{
     request_fields_accepted, sign_call, sign_stream_open, verify_request, RequestSpec, RequestType,
@@ -51,9 +51,9 @@ pub use session::{
     liveness_nonce, liveness_ping_frame, liveness_pong_frame, Liveness, LIVENESS_NONCE_SIZE,
 };
 pub use stream::{
-    open_stream, sign_caller_stream, sign_provider_stream, verify_caller_stream,
-    verify_provider_stream, StreamEncoding, StreamFields, StreamMode, StreamRole, StreamState,
-    VerifiedStreamFrame,
+    open_stream, sign_caller_stream, sign_provider_stream, sign_stream_sealed_required,
+    verify_caller_stream, verify_provider_stream, StreamEncoding, StreamFields, StreamMode,
+    StreamRole, StreamState, VerifiedStreamFrame,
 };
 pub(crate) use wire_counters::count_enum_fallback;
 pub use wire_counters::{wire_counters, WireCounts};
@@ -328,13 +328,43 @@ fn read_fields(v: &Value, table: &[(&str, Rule)]) -> Option<Fields> {
     Some(fields)
 }
 
-/// Acts on the `ext` a signed object's tbs carries (WIRE_1_0.md section 3.2):
-/// an unknown critical extension refuses that object, by name, never the
-/// link; an unknown non-critical one is counted.
-fn signed_ext(fields: &Fields) -> Result<(), FrameError> {
+/// Acts on the `ext` a signed object's tbs carries (WIRE_1_0.md section 3.2),
+/// knowing the extensions `known` names in that object: an unknown critical
+/// extension refuses that object, by name, never the link; an unknown
+/// non-critical one is counted.
+fn signed_ext(fields: &Fields, known: &[&str]) -> Result<(), FrameError> {
     match fields.get("ext") {
-        Some(ext) => act_on_ext(ext),
+        Some(ext) => act_on_ext(ext, known),
         None => Ok(()),
+    }
+}
+
+/// The signed tbs entry that carries `kem_key` as the non-critical extension
+/// [`SEAL_KEM_KEY_EXT`].
+fn kem_key_ext(kem_key: &[u8]) -> (Value, Value) {
+    entry(
+        "ext",
+        Value::Map(vec![(
+            Value::text(SEAL_KEM_KEY_EXT),
+            Value::Map(vec![
+                entry("critical", Value::Int(0)),
+                entry("value", Value::Bytes(kem_key.to_vec())),
+            ]),
+        )]),
+    )
+}
+
+/// The KEM key a provider's refusal carries in its signed tbs, as the
+/// non-critical extension [`SEAL_KEM_KEY_EXT`]: its bytes, or `None` when
+/// the extension is not there or its value is not a byte string. Whether the
+/// key fits a profile is its caller's check.
+fn carried_kem_key(fields: &Fields) -> Option<Vec<u8>> {
+    match fields
+        .get("ext")
+        .and_then(|ext| ext_value(ext, SEAL_KEM_KEY_EXT))
+    {
+        Some(Value::Bytes(key)) => Some(key.clone()),
+        _ => None,
     }
 }
 

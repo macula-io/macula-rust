@@ -251,7 +251,7 @@ pub fn verify_request(frame: &Value, profile: Profile) -> Result<VerifiedRequest
         return Err(FrameError::Malformed);
     }
     super::tbs_enum(&fields, "mode", STREAM_MODES)?;
-    super::signed_ext(&fields)?;
+    super::signed_ext(&fields, &[])?;
     let request = VerifiedRequest {
         frame_type,
         request_hash: Sha384::digest(&verified.tbs).into(),

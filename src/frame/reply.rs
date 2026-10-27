@@ -16,6 +16,9 @@ use super::{
 };
 
 const RESULT: &str = "result";
+/// The code a provider refuses a clear request with when it takes sealed
+/// ones only.
+pub(super) const SEALED_REQUIRED: &str = "sealed_required";
 const ERROR: &str = "error";
 const STREAM_ERROR: &str = "stream_error";
 
@@ -48,8 +51,8 @@ impl RelayErrorType {
 }
 
 /// A provider's RESULT or ERROR that verified for its request: the node that
-/// responded, a RESULT's payload, and an ERROR's code and detail; or, sealed
-/// end to end, `sealed` in their place.
+/// responded, a RESULT's payload, and an ERROR's code, detail and the KEM key
+/// it carries; or, sealed end to end, `sealed` in their place.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedReply {
     pub frame_type: ReplyType,
@@ -58,6 +61,11 @@ pub struct VerifiedReply {
     pub code: Option<String>,
     pub detail: Option<String>,
     pub sealed: Option<Sealed>,
+    /// The KEM key an ERROR carries in its signed tbs as `seal.kem_key`, as
+    /// carried (DESIGN_E2E_SEALED_BY_DEFAULT section 3); `None` for none.
+    /// Signed by the provider and bound to the request, so it is the
+    /// target's own key; its size is not checked here.
+    pub kem_key: Option<Vec<u8>>,
 }
 
 /// A station's relay error as it gives it: for a pending verified request, a
@@ -118,6 +126,25 @@ pub fn sign_provider_error(
         bounded_text("detail", detail.as_bytes(), MAX_ERROR_TEXT_BYTES)?;
         fields.push(entry("detail", Value::text(detail)));
     }
+    sign_reply(ReplyType::Error, request, fields, source_route_reverse, key)
+}
+
+/// Signs a provider's sealed_required ERROR for a verified clear request,
+/// with [`sign_result`]'s key check, carrying `kem_key`, the KEM key the
+/// provider holds now as carried, in its signed tbs as the non-critical
+/// extension `seal.kem_key`, for the caller to seal to
+/// (DESIGN_E2E_SEALED_BY_DEFAULT section 3).
+pub fn sign_sealed_required(
+    request: &VerifiedRequest,
+    kem_key: &[u8],
+    source_route_reverse: Option<Vec<u8>>,
+    key: &NodeKey,
+) -> Result<Value, FrameError> {
+    reply_signer(request, key)?;
+    let fields = vec![
+        entry("code", Value::text(SEALED_REQUIRED)),
+        super::kem_key_ext(kem_key),
+    ];
     sign_reply(ReplyType::Error, request, fields, source_route_reverse, key)
 }
 
@@ -245,7 +272,13 @@ pub fn verify_reply(
     {
         return Err(FrameError::Malformed);
     }
-    super::signed_ext(&fields)?;
+    // Only an ERROR knows seal.kem_key; on a RESULT it is unknown, counted.
+    let known: &[&str] = if frame_type == ERROR {
+        &[super::SEAL_KEM_KEY_EXT]
+    } else {
+        &[]
+    };
+    super::signed_ext(&fields, known)?;
     let reply = VerifiedReply {
         frame_type: if frame_type == RESULT {
             ReplyType::Result
@@ -257,6 +290,11 @@ pub fn verify_reply(
         code: fields.get("code").map(text_of),
         detail: fields.get("detail").map(text_of),
         sealed: sealed_field(&fields, SealedContext::Reply),
+        kem_key: if frame_type == ERROR {
+            super::carried_kem_key(&fields)
+        } else {
+            None
+        },
     };
     if reply.responded_by != node_id_of(&verified.key, profile) {
         return Err(FrameError::KeyIdMismatch);
@@ -356,7 +394,7 @@ pub fn verify_relay_error(
         return Err(FrameError::Malformed);
     }
     super::tbs_enum(&fields, "code", RELAY_CODES)?;
-    super::signed_ext(&fields)?;
+    super::signed_ext(&fields, &[])?;
     let relay_error = VerifiedRelayError {
         frame_type: if frame_type == ERROR {
             RelayErrorType::Error
