@@ -795,11 +795,15 @@ async fn reopened(
     };
     let next = link.open_stream_held(call, reseal, None).await?;
     let sent = replayed(&next.inner, r.sent).await;
-    if let Err(e) = sent {
-        StreamInner::end(&next.inner, Some(e.clone()));
-        return Err(e);
+    // A reopened session that ended meanwhile carries the stream on with
+    // why it ended, which its owner then reads.
+    match sent {
+        Err(e) if !next.inner.side().ended => {
+            StreamInner::end(&next.inner, Some(e.clone()));
+            Err(e)
+        }
+        _ => Ok(next),
     }
-    Ok(next)
 }
 
 /// The clear session's copy sent on the session it reopened on, in order:
