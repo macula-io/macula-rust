@@ -71,6 +71,17 @@ fn kem_key(profile: Profile) -> Vec<u8> {
     key
 }
 
+/// Held by every test that reads the process-wide count of ignored
+/// `seal.kem_key` extensions, so one test's count does not land inside
+/// another's before and after.
+static COUNTED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn counting() -> std::sync::MutexGuard<'static, ()> {
+    COUNTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn ignored_seal_kem_key() -> u64 {
     wire_counters()
         .ext_ignored
@@ -114,6 +125,7 @@ fn without_ext(fields: Vec<(Value, Value)>) -> Vec<(Value, Value)> {
 
 #[test]
 fn a_sealed_required_error_carries_the_provider_s_key_and_it_is_known() {
+    let _counted = counting();
     for profile in [Profile::PqPure, Profile::PqHybrid] {
         let k = keys(profile);
         let request = call(&k, profile);
@@ -155,6 +167,7 @@ fn a_stripped_extension_fails_as_a_tampered_reply_never_as_a_keyless_refusal() {
 
 #[test]
 fn seal_kem_key_on_a_result_is_unknown_there_counted_and_carries_nothing() {
+    let _counted = counting();
     let k = keys(Profile::PqPure);
     let request = call(&k, Profile::PqPure);
     let result = sign_result(&request, &Value::text("ok"), None, &k.provider).unwrap();
@@ -194,6 +207,7 @@ fn seal_kem_key_on_a_result_is_unknown_there_counted_and_carries_nothing() {
 
 #[test]
 fn a_stream_open_refused_sealed_required_carries_the_provider_s_key() {
+    let _counted = counting();
     for profile in [Profile::PqPure, Profile::PqHybrid] {
         let k = keys(profile);
         let open = stream_open(&k, profile);
