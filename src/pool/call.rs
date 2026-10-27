@@ -630,12 +630,6 @@ struct Sent<'a> {
     deadline: Instant,
 }
 
-/// The advertisement a refused sealed call is sealed to again, from the
-/// provider's fresh advertisements (`found`): the one naming exactly the key
-/// the refusal `named`, searched for since the DHT may still serve an older
-/// one, or, when the refusal named none, the first that names a key. When
-/// the named key is not among them, key_mismatch naming both; when none
-/// names a key, no_kem_key.
 /// What an open holds for a refusal: a sealed open's reseal, a clear one's
 /// learning of the key.
 #[derive(Default)]
@@ -710,6 +704,12 @@ fn learnt(cand: Candidate, resealed_to: Option<Vec<u8>>) -> Candidate {
     }
 }
 
+/// The advertisement a refused sealed call is sealed to again, from the
+/// provider's fresh advertisements (`found`): the one naming exactly the key
+/// the refusal `named`, searched for since the DHT may still serve an older
+/// one, or, when the refusal named none, the first that names a key. When
+/// the named key is not among them, key_mismatch naming both; when none
+/// names a key, no_kem_key.
 fn reseal_to(
     found: Result<Vec<Candidate>, PoolError>,
     named: Option<[u8; KEY_ID_SIZE]>,

@@ -538,15 +538,22 @@ impl StreamInner {
                 .map(|key| (key, aborted(code, message))),
             _ => None,
         };
-        if key.is_some() {
-            // A write this session is still making waits on a provider that
-            // has stopped reading: it gives way, keeping its frame for the
-            // reopen, so the send lock comes free.
-            self.writer.abandon();
+        // Only a keyed refusal while the copy is held takes the send lock:
+        // any other frame drops the copy without it, so this reader never
+        // waits behind a write stalled on flow control.
+        let Some((key, refused)) = key else {
+            self.clear_reopen_slot().take();
+            return false;
+        };
+        if self.clear_reopen_slot().is_none() {
+            return false;
         }
+        // A write this session is still making waits on a provider that has
+        // stopped reading: it gives way, keeping its frame for the reopen,
+        // so the send lock comes free.
+        self.writer.abandon();
         let seq = self.send_seq.lock().await;
-        let reopen = self.clear_reopen_slot().take();
-        let (Some((key, refused)), Some(reopen)) = (key, reopen) else {
+        let Some(reopen) = self.clear_reopen_slot().take() else {
             return false;
         };
         self.side().reopening = true;
@@ -753,7 +760,9 @@ impl StreamInner {
             StreamInner::reset_sending(this);
         }
         if let Some(budget) = this.budget().take() {
-            let held = std::mem::take(&mut this.side().held);
+            // The admission gets back all the inbox holds; the session keeps
+            // its own count, which reading what is still queued runs down.
+            let held = this.side().held;
             budget.admission.release_inbox(budget.caller, held);
             drop(budget.place);
         }
@@ -810,27 +819,23 @@ async fn reopened(
     if left == 0 {
         return Err(refused);
     }
-    let within = Duration::from_millis(left);
-    tokio::time::timeout(within, replayed_on(r, link, key, within))
-        .await
-        .unwrap_or(Err(refused))
-}
-
-/// [`reopened`]'s open and replay, under `left`.
-async fn replayed_on(
-    r: ClearReopen,
-    link: Link,
-    key: Vec<u8>,
-    left: Duration,
-) -> Result<Stream, LinkError> {
+    let until = tokio::time::Instant::now() + Duration::from_millis(left);
     let reseal = r.learnt.and_then(|learnt| learnt(&key));
     let call = StreamCall {
         seal: Some(Seal::To(key)),
-        deadline: left,
+        deadline: Duration::from_millis(left),
         ..r.call
     };
-    let next = link.open_stream_held(call, reseal, None).await?;
-    let sent = replayed(&next.inner, r.sent).await;
+    let next = match tokio::time::timeout_at(until, link.open_stream_held(call, reseal, None)).await
+    {
+        Ok(opened) => opened?,
+        Err(_) => return Err(refused),
+    };
+    // Past the deadline mid-replay, the reopened session is ended with the
+    // refusal, not left running half replayed.
+    let sent = tokio::time::timeout_at(until, replayed(&next.inner, r.sent))
+        .await
+        .unwrap_or(Err(refused));
     // A reopened session that ended meanwhile carries the stream on with
     // why it ended, which its owner then reads.
     match sent {

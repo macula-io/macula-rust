@@ -318,3 +318,69 @@ async fn flooded(caller: Link, call: StreamCall) {
         let _ = upload(stream, 64, 16 * 1024).await;
     }
 }
+
+/// Writes 4 MiB before reading anything, then counts what the caller sent
+/// until it ends its sending, and replies the count.
+async fn write_then_count(stream: Stream) -> Result<(), String> {
+    let chunk = vec![9u8; 16 * 1024];
+    for _ in 0..256 {
+        stream.send(&chunk).await.map_err(|e| e.to_string())?;
+    }
+    count_bytes(stream).await
+}
+
+/// Both sides write 4 MiB before either reads: each side's reader keeps
+/// taking frames while its owner's writes wait on flow control, clear and
+/// sealed (Terra, from go#43's reader-takes-the-send-lock deadlock).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bidi_stream_whose_sides_both_write_4_mib_before_reading_completes() {
+    let env = TestStations::start(Profile::PqHybrid);
+    for sealed in [false, true] {
+        let keyring = Arc::new(Keyring::system(env.profile).unwrap());
+        let key = keyring.current().public_key().carried().to_vec();
+        let provider = node(&env, sealed.then_some(keyring), false).await;
+        let caller = node(&env, None, false).await;
+        let both = record::own_procedure(&provider.node_id(), "both");
+        let handler = stream_handler(write_then_count);
+        let offer = Offer::stream(env.realm_id, &both, StreamMode::Bidi, handler);
+        let _served = provider.serve(offer).await.unwrap();
+        let mut open = clear_open(&env, &provider, &both, StreamMode::Bidi);
+        open.seal = Some(match sealed {
+            true => Seal::To(key),
+            false => Seal::Clear,
+        });
+
+        let stream = caller.open_stream(open).await.unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(30), write_then_read(&stream))
+            .await
+            .expect("both sides' 4 MiB went through");
+        assert_eq!(read.0, 4 * 1024 * 1024, "sealed {sealed}");
+        assert_eq!(read.1.get("total"), Some(&Value::Int(4 * 1024 * 1024)));
+        assert_eq!(read.1.get("sealed"), Some(&Value::Int(i128::from(sealed))));
+    }
+}
+
+/// Writes 4 MiB and ends its sending, then reads what the provider sent.
+async fn write_then_read(stream: &Stream) -> (usize, Value) {
+    let chunk = vec![7u8; 16 * 1024];
+    for _ in 0..256 {
+        stream.send(&chunk).await.unwrap();
+    }
+    stream.close_send().await.unwrap();
+    received(stream).await
+}
+
+/// The bytes the provider sent and its reply.
+async fn received(stream: &Stream) -> (usize, Value) {
+    let mut total = 0;
+    loop {
+        match stream.recv().await.unwrap() {
+            StreamEvent::Data {
+                body: Value::Bytes(b),
+                ..
+            } => total += b.len(),
+            StreamEvent::Reply { payload } => return (total, payload),
+            other => panic!("{other:?}"),
+        }
+    }
+}

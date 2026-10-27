@@ -944,6 +944,7 @@ fn provider_error(
 /// the keyring's current key in its tbs when the link is set to
 /// ([`super::Config::refusal_names_key`]); `None` as [`provider_error`].
 fn sealed_required(inner: &Inner, request: &VerifiedRequest) -> Option<Value> {
+    inner.count("call_refused_sealed_required");
     let signer = inner.signer();
     let key = inner.keyring.as_ref().filter(|_| inner.refusal_names_key);
     let Some(keyring) = key else {
