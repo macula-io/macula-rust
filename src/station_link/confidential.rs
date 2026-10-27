@@ -1009,4 +1009,34 @@ mod tests {
         }
         assert_eq!(refused_key(None), None);
     }
+
+    #[test]
+    fn only_a_sealed_required_naming_a_key_of_this_profile_reseals() {
+        for profile in [Profile::PqPure, Profile::PqHybrid] {
+            let keyring = Keyring::system(profile).unwrap();
+            let key = keyring.current().public_key().carried().to_vec();
+            let required = Some(CODE_SEALED_REQUIRED);
+            assert_eq!(reseal_key(profile, required, Some(&key)), Some(key.clone()));
+            assert_eq!(reseal_key(profile, required, None), None, "no key");
+            assert_eq!(
+                reseal_key(profile, required, Some(&key[1..])),
+                None,
+                "{profile:?}: a key of the wrong length"
+            );
+            let other = match profile {
+                Profile::PqPure => Profile::PqHybrid,
+                Profile::PqHybrid => Profile::PqPure,
+            };
+            let theirs = Keyring::system(other).unwrap();
+            let theirs = theirs.current().public_key().carried().to_vec();
+            assert_eq!(
+                reseal_key(profile, required, Some(&theirs)),
+                None,
+                "{profile:?}: a key of another profile"
+            );
+            for code in [Some(CODE_SEALED_REFUSED), Some("error"), None] {
+                assert_eq!(reseal_key(profile, code, Some(&key)), None, "{code:?}");
+            }
+        }
+    }
 }

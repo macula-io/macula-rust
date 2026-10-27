@@ -868,6 +868,22 @@ mod tests {
     }
 
     #[test]
+    fn a_learnt_key_seals_the_keyless_candidate_for_its_remaining_lifetime() {
+        let keyless = Candidate {
+            expires_at: 1_790_000_600_000,
+            ..cand(1, None)
+        };
+        let learnt_one = learnt(keyless.clone(), Some(vec![7; 1568]));
+        assert_eq!(learnt_one.seal(), Seal::To(vec![7; 1568]));
+        assert_eq!(learnt_one.kem_key_id(), Some(key_id_of(7)));
+        assert_eq!(learnt_one.expires_at, keyless.expires_at);
+        assert_eq!(learnt_one.provider, keyless.provider);
+        // A call that was not sealed again leaves the candidate as it was.
+        assert_eq!(learnt(keyless.clone(), None), keyless);
+        assert_eq!(keyless.seal(), Seal::Clear);
+    }
+
+    #[test]
     fn a_refused_call_is_sealed_again_only_to_the_key_named() {
         let found = || Ok(vec![cand(1, None), cand(1, Some(7)), cand(1, Some(8))]);
         let next = reseal_to(found(), Some(key_id_of(8))).unwrap();

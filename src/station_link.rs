@@ -280,6 +280,11 @@ pub struct Config {
     /// every station runs macula 12.11 or later, which stores and routes a
     /// keyed advertisement, and every caller runs 13. It needs a keyring.
     pub kem_advertise: bool,
+    /// Names the keyring's current key, signed, in a sealed_required refusal
+    /// (DESIGN_E2E_SEALED_BY_DEFAULT section 3). For tests only: release A
+    /// makes it the rule. It needs a keyring.
+    #[doc(hidden)]
+    pub refusal_names_key: bool,
 }
 
 impl Config {
@@ -296,6 +301,7 @@ impl Config {
             share: None,
             keyring: None,
             kem_advertise: false,
+            refusal_names_key: false,
         }
     }
 }
@@ -330,6 +336,7 @@ struct Inner {
     share: String,
     keyring: Option<Arc<Keyring>>,
     kem_advertise: bool,
+    refusal_names_key: bool,
     state: Mutex<State>,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
@@ -378,6 +385,11 @@ impl Link {
         if cfg.kem_advertise && cfg.keyring.is_none() {
             return Err(LinkError::InvalidConfig(
                 "kem_advertise names a key: it needs a keyring".into(),
+            ));
+        }
+        if cfg.refusal_names_key && cfg.keyring.is_none() {
+            return Err(LinkError::InvalidConfig(
+                "refusal_names_key names a key: it needs a keyring".into(),
             ));
         }
         dial_once(&cfg).await
@@ -591,6 +603,7 @@ fn new_inner(
         share,
         keyring: cfg.keyring.clone(),
         kem_advertise: cfg.kem_advertise,
+        refusal_names_key: cfg.refusal_names_key,
         state: Mutex::new(State {
             ended: None,
             closing: false,
