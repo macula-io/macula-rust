@@ -493,7 +493,7 @@ fn provider_first(
     Ok((
         VerifiedStreamFrame {
             signer,
-            kem_key: refusal_key(&frame_type, &read),
+            kem_key: refusal_key(frame_type, &read),
             fields,
         },
         next,

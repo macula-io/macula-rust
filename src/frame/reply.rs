@@ -234,6 +234,17 @@ fn sign_reply(
 pub(super) const REPLY_ROUTES: &[(&str, Rule)] = &[("source_route_reverse", Rule::AnyBytes)];
 pub(super) const RELAY_ERROR_ROUTES: &[(&str, Rule)] = &[("source_route_partial", Rule::AnyBytes)];
 
+/// Acts on a reply's tbs `ext`, and the KEM key an ERROR carries in it: only
+/// an ERROR knows seal.kem_key; on a RESULT it is unknown, counted.
+fn reply_ext(frame_type: &str, fields: &super::Fields) -> Result<Option<Vec<u8>>, FrameError> {
+    if frame_type != ERROR {
+        super::signed_ext(fields, &[])?;
+        return Ok(None);
+    }
+    super::signed_ext(fields, &[super::SEAL_KEM_KEY_EXT])?;
+    Ok(super::carried_kem_key(fields))
+}
+
 /// Verifies a received RESULT or provider ERROR for the request it answers:
 /// the frame's shape, the reply's signature and fields, responded_by as the
 /// key id of its key, the request's request_id and request_hash, and
@@ -272,13 +283,7 @@ pub fn verify_reply(
     {
         return Err(FrameError::Malformed);
     }
-    // Only an ERROR knows seal.kem_key; on a RESULT it is unknown, counted.
-    let known: &[&str] = if frame_type == ERROR {
-        &[super::SEAL_KEM_KEY_EXT]
-    } else {
-        &[]
-    };
-    super::signed_ext(&fields, known)?;
+    let kem_key = reply_ext(&frame_type, &fields)?;
     let reply = VerifiedReply {
         frame_type: if frame_type == RESULT {
             ReplyType::Result
@@ -290,11 +295,7 @@ pub fn verify_reply(
         code: fields.get("code").map(text_of),
         detail: fields.get("detail").map(text_of),
         sealed: sealed_field(&fields, SealedContext::Reply),
-        kem_key: if frame_type == ERROR {
-            super::carried_kem_key(&fields)
-        } else {
-            None
-        },
+        kem_key,
     };
     if reply.responded_by != node_id_of(&verified.key, profile) {
         return Err(FrameError::KeyIdMismatch);

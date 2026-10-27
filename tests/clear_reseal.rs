@@ -62,43 +62,42 @@ fn clear(env: &TestStations, provider: &Link, procedure: &str) -> Call {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_call_to_an_explicit_target_reseals_to_the_key_its_refusal_names() {
     for profile in [Profile::PqPure, Profile::PqHybrid] {
-        let env = TestStations::start(profile);
-        let keyring = Arc::new(Keyring::system(profile).unwrap());
-        let provider = node(&env, Some(keyring.clone()), true).await;
-        let caller = node(&env, None, false).await;
-        let vault = record::own_procedure(&provider.node_id(), "vault");
-        let _served = provider
-            .serve(required(env.realm_id, &vault))
-            .await
-            .unwrap();
-
-        let Called {
-            outcome,
-            resealed_to,
-        } = caller.call_resealing(clear(&env, &provider, &vault)).await;
-        let answered = outcome.unwrap_or_else(|e| {
-            panic!(
-                "{profile:?}: {e:?} provider {:?} caller {:?}",
-                provider.unrouted(),
-                caller.unrouted()
-            )
-        });
-        assert_eq!(answered.get("asked"), Some(&Value::text("plain")));
-        assert_eq!(
-            answered.get("sealed"),
-            Some(&Value::Int(1)),
-            "{profile:?}: answered sealed"
-        );
-        assert_eq!(
-            resealed_to.as_deref(),
-            Some(keyring.current().public_key().carried()),
-            "{profile:?}: sealed to the key the refusal named"
-        );
-
-        // Link::call reseals the same way.
-        let answered = caller.call(clear(&env, &provider, &vault)).await.unwrap();
-        assert_eq!(answered.get("sealed"), Some(&Value::Int(1)));
+        resealed_under(profile).await;
     }
+}
+
+/// One profile's pass: the clear call is answered sealed, under the key
+/// the refusal named, by `Link::call_resealing` and by `Link::call`.
+async fn resealed_under(profile: Profile) {
+    let env = TestStations::start(profile);
+    let keyring = Arc::new(Keyring::system(profile).unwrap());
+    let provider = node(&env, Some(keyring.clone()), true).await;
+    let caller = node(&env, None, false).await;
+    let vault = record::own_procedure(&provider.node_id(), "vault");
+    let _served = provider
+        .serve(required(env.realm_id, &vault))
+        .await
+        .unwrap();
+
+    let Called {
+        outcome,
+        resealed_to,
+    } = caller.call_resealing(clear(&env, &provider, &vault)).await;
+    let answered = outcome.unwrap_or_else(|e| panic!("{profile:?}: {e:?}"));
+    assert_eq!(answered.get("asked"), Some(&Value::text("plain")));
+    assert_eq!(
+        answered.get("sealed"),
+        Some(&Value::Int(1)),
+        "{profile:?}: answered sealed"
+    );
+    assert_eq!(
+        resealed_to.as_deref(),
+        Some(keyring.current().public_key().carried()),
+        "{profile:?}: sealed to the key the refusal named"
+    );
+
+    let answered = caller.call(clear(&env, &provider, &vault)).await.unwrap();
+    assert_eq!(answered.get("sealed"), Some(&Value::Int(1)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
