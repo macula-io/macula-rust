@@ -164,12 +164,16 @@ fn side_context(caller: bool) -> SealedContext {
     }
 }
 
-/// A stream frame that verified against its stream: its signer's key id and
-/// its fields.
+/// A stream frame that verified against its stream: its signer's key id, its
+/// fields, and the KEM key a STREAM_ERROR carries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedStreamFrame {
     pub signer: [u8; 32],
     pub fields: StreamFields,
+    /// The KEM key a clear STREAM_ERROR carries in its signed tbs as
+    /// `seal.kem_key`, as carried (DESIGN_E2E_SEALED_BY_DEFAULT section 3);
+    /// `None` for none. Its size is not checked here.
+    pub kem_key: Option<Vec<u8>>,
 }
 
 /// What a verifier holds for one stream: the verified STREAM_OPEN and, for
@@ -226,6 +230,30 @@ pub fn sign_provider_stream(
             .map_err(object_refusal)?
             .to_value()
     };
+    Ok(stream_frame(fields.frame_type(), "stream", object))
+}
+
+/// Signs a provider's refusal of a clear STREAM_OPEN that it takes sealed
+/// only: a STREAM_ERROR at seq 0, code sealed_required and `message`, with
+/// [`sign_provider_stream`]'s key check, carrying `kem_key`, the KEM key the
+/// provider holds now as carried, in its signed tbs as the non-critical
+/// extension `seal.kem_key` (DESIGN_E2E_SEALED_BY_DEFAULT section 3).
+pub fn sign_stream_sealed_required(
+    message: &str,
+    kem_key: &[u8],
+    open: &VerifiedRequest,
+    key: &NodeKey,
+) -> Result<Value, FrameError> {
+    let fields = StreamFields::Error {
+        seq: 0,
+        code: super::reply::SEALED_REQUIRED.to_string(),
+        message: message.to_string(),
+    };
+    let mut tbs = stream_build(&fields, open, key, false)?;
+    tbs.push(super::kem_key_ext(kem_key));
+    let object = sign_object(STREAM_LABEL, &tbs, key)
+        .map_err(object_refusal)?
+        .to_value();
     Ok(stream_frame(fields.frame_type(), "stream", object))
 }
 
@@ -421,7 +449,14 @@ pub fn verify_provider_stream(
     let mut next = state.clone();
     next.provider.next = fields.seq() + 1;
     next.provider.ended = frame_type == STREAM_END;
-    Ok((VerifiedStreamFrame { signer, fields }, next))
+    Ok((
+        VerifiedStreamFrame {
+            signer,
+            kem_key: refusal_key(&frame_type, &read),
+            fields,
+        },
+        next,
+    ))
 }
 
 fn provider_first(
@@ -455,7 +490,14 @@ fn provider_first(
         key: Some(verified.key),
         signer,
     };
-    Ok((VerifiedStreamFrame { signer, fields }, next))
+    Ok((
+        VerifiedStreamFrame {
+            signer,
+            kem_key: refusal_key(frame_type, &read),
+            fields,
+        },
+        next,
+    ))
 }
 
 /// Verifies a caller's received stream frame against its stream's state,
@@ -490,7 +532,14 @@ pub fn verify_caller_stream(
     let mut next = state.clone();
     next.caller.next = fields.seq() + 1;
     next.caller.ended = frame_type == STREAM_END;
-    Ok((VerifiedStreamFrame { signer, fields }, next))
+    Ok((
+        VerifiedStreamFrame {
+            signer,
+            kem_key: refusal_key(&frame_type, &read),
+            fields,
+        },
+        next,
+    ))
 }
 
 /// A stream frame's signed fields read through its type's table: frame_type,
@@ -563,7 +612,13 @@ fn stream_table_read(
     }
     super::tbs_enum(&fields, "encoding", &["raw", "msgpack"])?;
     super::tbs_enum(&fields, "role", &["send", "both"])?;
-    super::signed_ext(&fields)?;
+    // Only a STREAM_ERROR knows seal.kem_key; elsewhere it is unknown.
+    let known: &[&str] = if frame_type == STREAM_ERROR {
+        &[super::SEAL_KEM_KEY_EXT]
+    } else {
+        &[]
+    };
+    super::signed_ext(&fields, known)?;
     Ok(fields)
 }
 
@@ -614,6 +669,14 @@ fn stream_parse(
         },
     };
     Ok(parsed)
+}
+
+/// The KEM key a STREAM_ERROR's signed tbs carries; `None` on any other
+/// frame type.
+fn refusal_key(frame_type: &str, fields: &super::Fields) -> Option<Vec<u8>> {
+    (frame_type == STREAM_ERROR)
+        .then(|| super::carried_kem_key(fields))
+        .flatten()
 }
 
 fn stream_encoding(fields: &super::Fields) -> StreamEncoding {

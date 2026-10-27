@@ -431,7 +431,7 @@ pub fn verify(wire: &[u8], profile: Profile, now_ms: i64) -> Result<Verified, Re
     let r = custodian_checks(wire, profile, now_ms)?;
     reader_knows(&r)?;
     if let Some(ext) = &r.ext {
-        crate::frame::act_on_ext(ext).map_err(|e| match e {
+        crate::frame::act_on_ext(ext, &[]).map_err(|e| match e {
             crate::frame::FrameError::ExtensionUnsupported(name) => {
                 RecordError::ExtensionUnsupported(name)
             }

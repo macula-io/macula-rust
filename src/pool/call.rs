@@ -25,8 +25,8 @@ use crate::frame::StreamMode;
 use crate::record::{self, RecordType, Trust, Verified};
 use crate::seal::KEY_ID_SIZE;
 use crate::station_link::{
-    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Link, LinkError, Report,
-    Reseal, Seal, Stream, DEFAULT_CALL_TIMEOUT,
+    self, Confidentiality, ConfidentialityError, ConfidentialityReason, Learnt, Link, LinkError,
+    Report, Reseal, Seal, Stream, DEFAULT_CALL_TIMEOUT,
 };
 use crate::transport::Target;
 
@@ -171,7 +171,7 @@ impl Pool {
         let candidates = bounded(deadline, inner.candidates(&key, realm_key.clone())).await?;
         let candidates = callable(candidates, c.confidential)?;
         let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
-        let outcome = bounded(deadline, inner.call_at(&link, &cand, &c, deadline)).await;
+        let (cand, outcome) = inner.call_at(&link, cand, &c, deadline).await;
         let sent = Sent {
             link: &link,
             call: &c,
@@ -220,8 +220,10 @@ impl Pool {
         let candidates = bounded(deadline, inner.candidates(&key, realm_key.clone())).await?;
         let candidates = callable(candidates, c.confidential)?;
         let (link, cand) = first_reached(inner, &key, candidates, deadline).await?;
+        let learnt = inner.stream_learnt(&key, &cand, &c, realm_key.clone(), &link);
         let reseal = inner.stream_reseal(&key, &cand, &c, realm_key, &link);
-        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c, reseal)).await;
+        let held = Held { reseal, learnt };
+        let outcome = bounded(deadline, inner.open_at(&link, &cand, &c, held)).await;
         inner.settled(key, cand, outcome)
     }
 
@@ -353,28 +355,38 @@ impl PoolInner {
     /// Calls the candidate's provider on `link`, under what is left before
     /// `deadline`, and reports the call: a sealed call's result is only ever
     /// one its answer opened under the key it was sealed to (the link
-    /// refuses any other), so `sealed` 1 names that key.
+    /// refuses any other), so `sealed` 1 names that key. A clear call the
+    /// provider refused sealed_required naming its key, which the link
+    /// sealed to and sent once more, comes back with that key in the
+    /// candidate (see [`learnt`]), and the report names it. The candidate
+    /// the outcome came from, and the outcome.
     async fn call_at(
         &self,
         link: &Link,
-        cand: &Candidate,
+        cand: Candidate,
         c: &Call,
         deadline: Instant,
-    ) -> Result<(Value, Report), PoolError> {
+    ) -> (Candidate, Result<(Value, Report), PoolError>) {
         let left = deadline.saturating_duration_since(Instant::now());
-        let result = link
-            .call(station_link::Call {
-                realm: c.realm,
-                procedure: c.procedure.clone(),
-                target: cand.provider.node,
-                payload: c.payload.clone(),
-                timeout: left.max(Duration::from_millis(1)),
-                token: c.token.clone(),
-                proofs: c.proofs.clone(),
-                seal: Some(cand.seal()),
-            })
-            .await?;
-        Ok((result, Report::of(cand.provider.node, cand.kem_key_id())))
+        let call = link.call_resealing(station_link::Call {
+            realm: c.realm,
+            procedure: c.procedure.clone(),
+            target: cand.provider.node,
+            payload: c.payload.clone(),
+            timeout: left.max(Duration::from_millis(1)),
+            token: c.token.clone(),
+            proofs: c.proofs.clone(),
+            seal: Some(cand.seal()),
+        });
+        let Ok(called) = tokio::time::timeout_at(deadline, call).await else {
+            return (cand, Err(PoolError::Link(LinkError::CallTimeout)));
+        };
+        let cand = learnt(cand, called.resealed_to);
+        let outcome = called
+            .outcome
+            .map(|result| (result, Report::of(cand.provider.node, cand.kem_key_id())))
+            .map_err(PoolError::Link);
+        (cand, outcome)
     }
 
     /// A sealed call refused sealed_refused after its provider's key rotated,
@@ -408,22 +420,21 @@ impl PoolInner {
             Ok(next) => next,
             Err(e) => return (cand, Err(e)),
         };
-        let resent = self.call_at(sent.link, &next, sent.call, sent.deadline);
-        let outcome = bounded(sent.deadline, resent).await;
-        (next, outcome)
+        self.call_at(sent.link, next, sent.call, sent.deadline)
+            .await
     }
 
-    /// Opens the stream at the candidate's provider on `link`, holding
-    /// `reseal` for a sealed_refused of its open.
+    /// Opens the stream at the candidate's provider on `link`, holding what
+    /// `held` names for a refusal of its open.
     async fn open_at(
         &self,
         link: &Link,
         cand: &Candidate,
         c: &StreamCall,
-        reseal: Option<Reseal>,
+        held: Held,
     ) -> Result<Stream, PoolError> {
         Ok(link
-            .open_stream_resealing(
+            .open_stream_held(
                 station_link::StreamCall {
                     realm: c.realm,
                     procedure: c.procedure.clone(),
@@ -435,9 +446,35 @@ impl PoolInner {
                     proofs: c.proofs.clone(),
                     seal: Some(cand.seal()),
                 },
-                reseal,
+                held.reseal,
+                held.learnt,
             )
             .await?)
+    }
+
+    /// What a clear stream's sealed reopen tells the pool: the key its
+    /// provider named, which the pool remembers in the candidate as a
+    /// call's (see [`learnt`]), and the reseal the reopened stream holds for
+    /// a sealed_refused of its own (A1). None for a sealed candidate.
+    fn stream_learnt(
+        self: &Arc<Self>,
+        key: &ResolvedKey,
+        cand: &Candidate,
+        c: &StreamCall,
+        realm_key: Option<Vec<u8>>,
+        link: &Link,
+    ) -> Option<Learnt> {
+        if cand.kem_key.is_some() {
+            return None;
+        }
+        let pool = Arc::downgrade(self);
+        let (key, cand, c, link) = (key.clone(), cand.clone(), c.clone(), link.clone());
+        Some(Box::new(move |kem_key: &[u8]| {
+            let pool = pool.upgrade()?;
+            let cand = learnt(cand, Some(kem_key.to_vec()));
+            pool.remember(key.clone(), cand.clone());
+            pool.stream_reseal(&key, &cand, &c, realm_key, &link)
+        }))
     }
 
     /// A sealed stream's one reseal, on a call's terms (see
@@ -599,6 +636,14 @@ struct Sent<'a> {
 /// one, or, when the refusal named none, the first that names a key. When
 /// the named key is not among them, key_mismatch naming both; when none
 /// names a key, no_kem_key.
+/// What an open holds for a refusal: a sealed open's reseal, a clear one's
+/// learning of the key.
+#[derive(Default)]
+struct Held {
+    reseal: Option<Reseal>,
+    learnt: Option<Learnt>,
+}
+
 /// What a stream's reseal reopens: the provider's own key, the key the pool
 /// remembers it under, the open, and its link and realm key.
 struct Resealing {
@@ -619,9 +664,12 @@ async fn resealed_stream(
     let deadline = Instant::now() + DEFAULT_CALL_TIMEOUT;
     let fresh = bounded(deadline, pool.resolve(&r.own, r.realm_key)).await;
     let reopened = match reseal_to(fresh, named) {
-        Ok(next) => bounded(deadline, pool.open_at(&r.link, &next, &r.c, None))
-            .await
-            .map(|stream| (stream, next)),
+        Ok(next) => bounded(
+            deadline,
+            pool.open_at(&r.link, &next, &r.c, Held::default()),
+        )
+        .await
+        .map(|stream| (stream, next)),
         Err(e) => Err(e),
     };
     // As a call settles: the provider's new key is remembered, and a stale
@@ -644,6 +692,21 @@ fn as_link_error(e: PoolError) -> LinkError {
         PoolError::Link(e) => e,
         PoolError::Confidentiality(e) => LinkError::Confidentiality(e),
         other => LinkError::Io(other.to_string()),
+    }
+}
+
+/// `cand` with the KEM key its provider named in a signed sealed_required,
+/// when the link sealed the call to it (DESIGN_E2E_SEALED_BY_DEFAULT section
+/// 3). The key wins over the candidate's keyless advertisement: remembered
+/// with it, it seals the next call at once, for as long as that
+/// advertisement lives.
+fn learnt(cand: Candidate, resealed_to: Option<Vec<u8>>) -> Candidate {
+    match resealed_to {
+        Some(key) => Candidate {
+            kem_key: Some(key),
+            ..cand
+        },
+        None => cand,
     }
 }
 
@@ -841,6 +904,22 @@ mod tests {
 
     fn key_id_of(k: u8) -> [u8; KEY_ID_SIZE] {
         crate::seal::key_id(&[k; 1568])
+    }
+
+    #[test]
+    fn a_learnt_key_seals_the_keyless_candidate_for_its_remaining_lifetime() {
+        let keyless = Candidate {
+            expires_at: 1_790_000_600_000,
+            ..cand(1, None)
+        };
+        let learnt_one = learnt(keyless.clone(), Some(vec![7; 1568]));
+        assert_eq!(learnt_one.seal(), Seal::To(vec![7; 1568]));
+        assert_eq!(learnt_one.kem_key_id(), Some(key_id_of(7)));
+        assert_eq!(learnt_one.expires_at, keyless.expires_at);
+        assert_eq!(learnt_one.provider, keyless.provider);
+        // A call that was not sealed again leaves the candidate as it was.
+        assert_eq!(learnt(keyless.clone(), None), keyless);
+        assert_eq!(keyless.seal(), Seal::Clear);
     }
 
     #[test]

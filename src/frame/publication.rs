@@ -201,7 +201,7 @@ pub fn verify_publication(
         return Err(FrameError::Malformed);
     }
     let payload = payload_of(&fields).ok_or(FrameError::Malformed)?;
-    super::signed_ext(&fields)?;
+    super::signed_ext(&fields, &[])?;
     let ttl_ms = fields.get("ttl_ms").and_then(protocol_uint);
     let published_at = protocol_uint(&fields["published_at"]).unwrap_or(0);
     let publication = VerifiedPublication {

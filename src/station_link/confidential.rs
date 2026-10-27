@@ -296,6 +296,22 @@ pub(super) fn refused_key(detail: Option<&str>) -> Option<[u8; KEY_ID_SIZE]> {
     Some(id)
 }
 
+/// The key a clear call's or open's refusal names for it to seal to
+/// (DESIGN_E2E_SEALED_BY_DEFAULT section 3): a sealed_required carrying, in
+/// its signed tbs, a KEM key this link's profile seals to. `None` for any
+/// other refusal, one without the key, or a key not of this profile (a
+/// provider before release A, or a faulty one): the refusal then stands as
+/// the provider's own.
+pub(super) fn reseal_key(
+    profile: Profile,
+    code: Option<&str>,
+    kem_key: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let key = kem_key.filter(|_| code == Some(CODE_SEALED_REQUIRED))?;
+    seal::parse_public_key(profile, key).ok()?;
+    Some(key.to_vec())
+}
+
 /// What a verified provider reply means to a call: for a sealed call, a
 /// sealed answer under the request's key id opened; a clear sealed_refused
 /// naming the provider's key; a clear refusal from the closed set; anything
@@ -753,6 +769,7 @@ mod tests {
             code: code.map(str::to_string),
             detail: None,
             sealed: None,
+            kem_key: None,
         }
     }
 
@@ -774,6 +791,7 @@ mod tests {
             code: None,
             detail: None,
             sealed: Some(sealed),
+            kem_key: None,
         };
         assert_eq!(
             reply_outcome(reply, &request, Some(&caller)),
@@ -862,7 +880,11 @@ mod tests {
     }
 
     fn from(signer: [u8; 32], fields: StreamFields) -> VerifiedStreamFrame {
-        VerifiedStreamFrame { signer, fields }
+        VerifiedStreamFrame {
+            signer,
+            fields,
+            kem_key: None,
+        }
     }
 
     #[test]
@@ -986,5 +1008,34 @@ mod tests {
             assert_eq!(refused_key(Some(not_one)), None, "{not_one:?}");
         }
         assert_eq!(refused_key(None), None);
+    }
+
+    #[test]
+    fn only_a_sealed_required_naming_a_key_of_this_profile_reseals() {
+        reseals_under(Profile::PqPure, Profile::PqHybrid);
+        reseals_under(Profile::PqHybrid, Profile::PqPure);
+    }
+
+    fn reseals_under(profile: Profile, other: Profile) {
+        let keyring = Keyring::system(profile).unwrap();
+        let key = keyring.current().public_key().carried().to_vec();
+        let required = Some(CODE_SEALED_REQUIRED);
+        assert_eq!(reseal_key(profile, required, Some(&key)), Some(key.clone()));
+        assert_eq!(reseal_key(profile, required, None), None, "no key");
+        assert_eq!(
+            reseal_key(profile, required, Some(&key[1..])),
+            None,
+            "{profile:?}: a key of the wrong length"
+        );
+        let theirs = Keyring::system(other).unwrap();
+        let theirs = theirs.current().public_key().carried().to_vec();
+        assert_eq!(
+            reseal_key(profile, required, Some(&theirs)),
+            None,
+            "{profile:?}: a key of another profile"
+        );
+        for code in [Some(CODE_SEALED_REFUSED), Some("error"), None] {
+            assert_eq!(reseal_key(profile, code, Some(&key)), None, "{code:?}");
+        }
     }
 }

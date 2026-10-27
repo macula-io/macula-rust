@@ -28,17 +28,17 @@ mod stream;
 mod versions;
 
 pub use admission::{Admission, AdmissionLimits};
-pub use call::{Call, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
+pub use call::{Call, Called, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
 pub use confidential::{
     is_clear_refusal, Confidentiality, ConfidentialityError, ConfidentialityReason, Seal,
 };
 pub use pubsub::{Event, EventDedup, Publication, PublicationSeq, SignedPublication, Subscription};
 pub use report::{Report, ReportError};
 pub use serve::{handler, BoxFuture, Handler, Offer, Request, Served, StreamOffer};
-pub(crate) use stream::Reseal;
 pub use stream::{
     stream_handler, Stream, StreamCall, StreamEvent, StreamHandler, DEFAULT_STREAM_DEADLINE,
 };
+pub(crate) use stream::{Learnt, Reseal};
 pub use versions::handshake_counters;
 
 use std::collections::HashMap;
@@ -280,6 +280,11 @@ pub struct Config {
     /// every station runs macula 12.11 or later, which stores and routes a
     /// keyed advertisement, and every caller runs 13. It needs a keyring.
     pub kem_advertise: bool,
+    /// Names the keyring's current key, signed, in a sealed_required refusal
+    /// (DESIGN_E2E_SEALED_BY_DEFAULT section 3). For tests only: release A
+    /// makes it the rule. It needs a keyring.
+    #[doc(hidden)]
+    pub refusal_names_key: bool,
 }
 
 impl Config {
@@ -296,6 +301,7 @@ impl Config {
             share: None,
             keyring: None,
             kem_advertise: false,
+            refusal_names_key: false,
         }
     }
 }
@@ -330,6 +336,7 @@ struct Inner {
     share: String,
     keyring: Option<Arc<Keyring>>,
     kem_advertise: bool,
+    refusal_names_key: bool,
     state: Mutex<State>,
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
@@ -378,6 +385,11 @@ impl Link {
         if cfg.kem_advertise && cfg.keyring.is_none() {
             return Err(LinkError::InvalidConfig(
                 "kem_advertise names a key: it needs a keyring".into(),
+            ));
+        }
+        if cfg.refusal_names_key && cfg.keyring.is_none() {
+            return Err(LinkError::InvalidConfig(
+                "refusal_names_key names a key: it needs a keyring".into(),
             ));
         }
         dial_once(&cfg).await
@@ -591,6 +603,7 @@ fn new_inner(
         share,
         keyring: cfg.keyring.clone(),
         kem_advertise: cfg.kem_advertise,
+        refusal_names_key: cfg.refusal_names_key,
         state: Mutex::new(State {
             ended: None,
             closing: false,
@@ -666,7 +679,7 @@ impl Inner {
         let streams = std::mem::take(&mut state.streams);
         drop(state);
         for (_, p) in pending {
-            let _ = p.outcome.send(Err(err.clone()));
+            let _ = p.outcome.send(call::Answer::Final(Err(err.clone())));
         }
         drop(subs);
         pubsub::end_waits(sub_acks, &err);

@@ -18,9 +18,11 @@ pub const MAX_EXTENSIONS: usize = 16;
 /// distinct from 3, "did not decode".
 pub const QUIC_CODE_UNKNOWN_FRAME_TYPE: u32 = 5;
 
-/// The extensions this crate acts on. Wire 1.0 defines none; each arrives
-/// with the capability bit that announces it.
-const KNOWN_EXTENSIONS: &[&str] = &[];
+/// The non-critical extension a provider's sealed_required ERROR and
+/// STREAM_ERROR carry in their signed tbs: the KEM key the provider holds
+/// now, as carried, for the caller to seal to (DESIGN_E2E_SEALED_BY_DEFAULT
+/// section 3). Known only in those two objects; anywhere else it is unknown.
+pub const SEAL_KEM_KEY_EXT: &str = "seal.kem_key";
 
 /// A received frame as wire 1.0 reads it: its type, and the frame without
 /// `ext`, so the type's own table never sees it.
@@ -58,7 +60,7 @@ pub fn read_envelope(v: &Value) -> Result<Envelope, FrameError> {
                 _ => return Err(FrameError::Malformed),
             },
             "ext" => {
-                act_on_ext(value)?;
+                act_on_ext(value, &[])?;
                 continue;
             }
             "version" | "capabilities" => return Err(FrameError::Malformed),
@@ -108,15 +110,17 @@ pub fn check_ext(v: &Value) -> Result<(), FrameError> {
     ext_entries(v).map(|_| ())
 }
 
-/// Acts on a well-formed `ext` map as a receiver that knows no extension: an
-/// unknown critical one is [`FrameError::ExtensionUnsupported`], each such
-/// name counted as `wire_ext_refused`; only when none is, each unknown
-/// non-critical one is counted under its name as `wire_ext_ignored`.
-pub fn act_on_ext(v: &Value) -> Result<(), FrameError> {
+/// Acts on a well-formed `ext` map as a receiver that knows the extensions
+/// `known` names where this map is: an unknown critical one is
+/// [`FrameError::ExtensionUnsupported`], each such name counted as
+/// `wire_ext_refused`; only when none is, each unknown non-critical one is
+/// counted under its name as `wire_ext_ignored`. A known one is its reader's
+/// to take.
+pub fn act_on_ext(v: &Value, known: &[&str]) -> Result<(), FrameError> {
     let entries = ext_entries(v)?;
     let refused: Vec<&String> = entries
         .iter()
-        .filter(|(name, critical)| *critical && !KNOWN_EXTENSIONS.contains(&name.as_str()))
+        .filter(|(name, critical)| *critical && !known.contains(&name.as_str()))
         .map(|(name, _)| name)
         .collect();
     if let Some(first) = refused.first() {
@@ -125,11 +129,17 @@ pub fn act_on_ext(v: &Value) -> Result<(), FrameError> {
     }
     for (name, _) in entries
         .iter()
-        .filter(|(name, _)| !KNOWN_EXTENSIONS.contains(&name.as_str()))
+        .filter(|(name, _)| !known.contains(&name.as_str()))
     {
         count_ext_ignored(name);
     }
     Ok(())
+}
+
+/// The value of the extension `name` in a well-formed `ext` map, if it is
+/// there.
+pub fn ext_value<'a>(v: &'a Value, name: &str) -> Option<&'a Value> {
+    v.get(name)?.get("value")
 }
 
 /// A well-formed `ext` map's entries, name and whether it is critical.

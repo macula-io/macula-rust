@@ -694,7 +694,7 @@ async fn reply(inner: &Inner, request: &VerifiedRequest, offer: Option<Offer>) -
                 .as_ref()
                 .is_some_and(|o| !clear_allowed(o.confidential, inner.keyed_since(o), now_ms()));
             if refused {
-                return provider_error(&inner.signer(), request, CODE_SEALED_REQUIRED, None);
+                return sealed_required(inner, request);
             }
             (request.payload.clone(), None)
         }
@@ -938,6 +938,19 @@ fn provider_error(
     detail: Option<&str>,
 ) -> Option<Value> {
     frame::sign_provider_error(request, code, detail, None, signer.key).ok()
+}
+
+/// This node's signed sealed_required ERROR for a clear `request`, naming
+/// the keyring's current key in its tbs when the link is set to
+/// ([`super::Config::refusal_names_key`]); `None` as [`provider_error`].
+fn sealed_required(inner: &Inner, request: &VerifiedRequest) -> Option<Value> {
+    let signer = inner.signer();
+    let key = inner.keyring.as_ref().filter(|_| inner.refusal_names_key);
+    let Some(keyring) = key else {
+        return provider_error(&signer, request, CODE_SEALED_REQUIRED, None);
+    };
+    let kem_key = keyring.current().public_key().carried().to_vec();
+    frame::sign_sealed_required(request, &kem_key, None, signer.key).ok()
 }
 
 async fn send_reply(inner: &Inner, reply: Value) {

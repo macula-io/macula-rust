@@ -19,6 +19,15 @@
 //! anything, after the provider's KEM key rotated: sealed to the key the
 //! refusal names, on a new session, behind the same handle; never in the
 //! clear (macula's stream reseal, E2E design Amendment A1, macula-rust#21).
+//!
+//! A caller's clear stream sends at once, as it always did, and keeps an
+//! ordered copy of what it sent, its end included, until the provider's
+//! first frame, at most 16 MiB of it. When that frame is a sealed_required
+//! naming in its signed tbs a key this link seals to, the stream reopens
+//! once, sealed to that key, on a new session behind the same handle, and
+//! sends the copy there first, numbered from 0, then what was written
+//! meanwhile. Any other first frame drops the copy
+//! (DESIGN_E2E_SEALED_BY_DEFAULT section 3, macula-rust#42).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -38,8 +47,8 @@ use crate::seal::KEY_ID_SIZE;
 use super::admission::{Admission, SessionPlace, Verdict};
 use super::authorize::authorize;
 use super::confidential::{
-    clear_allowed, opened_request, refused_key, sealed_request, stated, unsealed, Seal, StreamSeal,
-    CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
+    clear_allowed, opened_request, refused_key, reseal_key, sealed_request, stated, unsealed, Seal,
+    StreamSeal, CODE_SEALED_REFUSED, CODE_SEALED_REQUIRED,
 };
 use super::framing::{read_frame, FrameWriter, MAX_FRAME_BYTES};
 use super::serve::{
@@ -145,6 +154,23 @@ pub(crate) type Reseal = Box<
         + Send,
 >;
 
+/// What a caller's clear stream runs once it reopens sealed to the key its
+/// provider's refusal named: given that key, the reseal the reopened stream
+/// holds for a sealed_refused of its own open, if any.
+pub(crate) type Learnt = Box<dyn FnOnce(&[u8]) -> Option<Reseal> + Send>;
+
+/// A caller's clear stream's one sealed reopen, until it is spent or given
+/// up: the open to send again and its deadline, in unix milliseconds, what
+/// the clear session sent in order (each frame's fields and whether it was
+/// the last) and its encoded size, and what learns the key.
+struct ClearReopen {
+    call: StreamCall,
+    deadline: u64,
+    sent: Vec<(StreamFields, bool)>,
+    held: usize,
+    learnt: Option<Learnt>,
+}
+
 /// What a served stream's inbox holds is charged to its caller's budget in
 /// the node's admission, and the session holds its place there.
 struct Budget {
@@ -168,6 +194,8 @@ pub(super) struct StreamInner {
     done_tx: watch::Sender<bool>,
     /// A caller's sealed stream's one reseal, until it is spent.
     reseal: Mutex<Option<Reseal>>,
+    /// A caller's clear stream's one sealed reopen, with what it sent.
+    clear_reopen: Mutex<Option<ClearReopen>>,
 }
 
 #[derive(Default)]
@@ -198,9 +226,10 @@ impl Stream {
     }
 
     /// Whether the stream is sealed end to end: every chunk, reply and
-    /// error after the open travels sealed.
+    /// error after the open travels sealed. A clear stream that reopened
+    /// sealed is sealed from then on.
     pub fn sealed(&self) -> bool {
-        self.inner.sealing.is_some()
+        self.current().sealing.is_some()
     }
 
     /// Sends a raw chunk.
@@ -360,6 +389,7 @@ impl StreamInner {
             notify: Notify::new(),
             done_tx: watch::channel(false).0,
             reseal: Mutex::new(None),
+            clear_reopen: Mutex::new(None),
         })
     }
 
@@ -444,7 +474,11 @@ impl StreamInner {
         let encoded = self
             .signed(&fields)
             .inspect_err(|_| self.unsent_after_spending(spent))?;
-        if let Err(e) = self.writer.write(&encoded, MAX_FRAME_BYTES).await {
+        let written = self.writer.write(&encoded, MAX_FRAME_BYTES).await;
+        // A clear session its provider refused stops taking writes before
+        // the refusal is read: what it refuses is kept for the reopen too.
+        let kept = self.retained(&fields, last, encoded.len());
+        if let (Err(e), false) = (written, kept) {
             self.side().sent_end = true;
             return Err(e);
         }
@@ -455,6 +489,59 @@ impl StreamInner {
             self.sent_last().await;
         }
         Ok(())
+    }
+
+    /// Keeps a copy of a frame the clear session sent, for its sealed reopen,
+    /// while the copy is within the inbox bound, and whether it was kept;
+    /// past the bound the reopen is given up.
+    fn retained(&self, fields: &StreamFields, last: bool, size: usize) -> bool {
+        let mut slot = self.clear_reopen_slot();
+        let Some(reopen) = slot.as_mut() else {
+            return false;
+        };
+        if reopen.held + size > STREAM_INBOX {
+            *slot = None;
+            return false;
+        }
+        reopen.held += size;
+        reopen.sent.push((fields.clone(), last));
+        true
+    }
+
+    fn clear_reopen_slot(&self) -> MutexGuard<'_, Option<ClearReopen>> {
+        self.clear_reopen.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The provider's first frame on a caller's clear stream: a seq-0
+    /// sealed_required naming a key this link seals to starts the stream's
+    /// sealed reopen, when it still holds one, and this session reads no
+    /// more (true); checked and marked under the send lock, so nothing is
+    /// sent on this session after its copy is taken. Any other first frame
+    /// drops the copy (false).
+    async fn resealed_clear(
+        self: &Arc<Self>,
+        fields: &StreamFields,
+        kem_key: Option<&[u8]>,
+    ) -> bool {
+        let key = match fields {
+            StreamFields::Error {
+                seq: 0,
+                code,
+                message,
+            } => reseal_key(self.link.profile, Some(code), kem_key)
+                .map(|key| (key, aborted(code, message))),
+            _ => None,
+        };
+        let seq = self.send_seq.lock().await;
+        let reopen = self.clear_reopen_slot().take();
+        let (Some((key, refused)), Some(reopen)) = (key, reopen) else {
+            return false;
+        };
+        self.side().reopening = true;
+        drop(seq);
+        self.notify.notify_waiters();
+        self.adopt_when_done(reopen.sealed_to(&self.link, key, refused));
+        true
     }
 
     /// Ends this side's sending when a frame that spent its seq did not go
@@ -543,13 +630,24 @@ impl StreamInner {
         self.side().reopening = true;
         drop(seq);
         self.notify.notify_waiters();
-        let s = self.clone();
         let named = refused_key(Some(detail));
+        self.adopt_when_done(reseal(named));
+        true
+    }
+
+    /// Runs a reseal and carries the stream on what it gives; one that
+    /// panics ends the stream, so it never stays reopening.
+    fn adopt_when_done(
+        self: &Arc<Self>,
+        reseal: Pin<Box<dyn Future<Output = Result<Stream, LinkError>> + Send>>,
+    ) {
+        let s = self.clone();
         tokio::spawn(async move {
-            let outcome = reseal(named).await;
+            let outcome = tokio::spawn(reseal)
+                .await
+                .unwrap_or_else(|e| Err(LinkError::Io(format!("the reseal failed: {e}"))));
             s.adopt(outcome);
         });
-        true
     }
 
     /// Carries the stream on the session its reseal reopened, this one
@@ -654,6 +752,93 @@ impl StreamInner {
     }
 }
 
+impl ClearReopen {
+    /// A clear open's sealed reopen, holding nothing yet; none for a sealed
+    /// open.
+    fn of(c: &StreamCall, deadline: u64, learnt: Option<Learnt>, clear: bool) -> Option<Self> {
+        clear.then(|| ClearReopen {
+            call: c.clone(),
+            deadline,
+            sent: Vec::new(),
+            held: 0,
+            learnt,
+        })
+    }
+
+    /// [`reopened`], boxed: the open it runs starts the reader that runs
+    /// it.
+    fn sealed_to(
+        self,
+        link: &Arc<Inner>,
+        key: Vec<u8>,
+        refused: LinkError,
+    ) -> Pin<Box<dyn Future<Output = Result<Stream, LinkError>> + Send>> {
+        let link = Link {
+            inner: link.clone(),
+        };
+        Box::pin(reopened(self, link, key, refused))
+    }
+}
+
+/// The stream opened again on `link`, sealed to `key`, under a new request
+/// id and what is left of its deadline, with the copy sent on it first; the
+/// key handed to what learns it. Past the deadline, before the reopen or
+/// while it runs, the provider's refusal stands: the stream never stays
+/// reopening.
+async fn reopened(
+    r: ClearReopen,
+    link: Link,
+    key: Vec<u8>,
+    refused: LinkError,
+) -> Result<Stream, LinkError> {
+    let left = r.deadline.saturating_sub(now_ms() as u64);
+    if left == 0 {
+        return Err(refused);
+    }
+    let within = Duration::from_millis(left);
+    tokio::time::timeout(within, replayed_on(r, link, key, within))
+        .await
+        .unwrap_or(Err(refused))
+}
+
+/// [`reopened`]'s open and replay, under `left`.
+async fn replayed_on(
+    r: ClearReopen,
+    link: Link,
+    key: Vec<u8>,
+    left: Duration,
+) -> Result<Stream, LinkError> {
+    let reseal = r.learnt.and_then(|learnt| learnt(&key));
+    let call = StreamCall {
+        seal: Some(Seal::To(key)),
+        deadline: left,
+        ..r.call
+    };
+    let next = link.open_stream_held(call, reseal, None).await?;
+    let sent = replayed(&next.inner, r.sent).await;
+    // A reopened session that ended meanwhile carries the stream on with
+    // why it ended, which its owner then reads.
+    match sent {
+        Err(e) if !next.inner.side().ended => {
+            StreamInner::end(&next.inner, Some(e.clone()));
+            Err(e)
+        }
+        _ => Ok(next),
+    }
+}
+
+/// The clear session's copy sent on the session it reopened on, in order:
+/// it runs from seq 0, as the new session counts.
+async fn replayed(
+    next: &Arc<StreamInner>,
+    sent: Vec<(StreamFields, bool)>,
+) -> Result<(), LinkError> {
+    for (fields, last) in sent {
+        next.send(|_| fields, last).await?;
+    }
+    Ok(())
+}
+
 impl StreamInner {
     /// Marks the stream ended, keeping `err` unless an error is kept
     /// already, and this side's sending with it; whether this side had sent
@@ -705,15 +890,18 @@ impl Link {
     /// writes the signed STREAM_OPEN. A stream it opens but cannot write the
     /// open on is released before the error returns.
     pub async fn open_stream(&self, c: StreamCall) -> Result<Stream, LinkError> {
-        self.open_stream_resealing(c, None).await
+        self.open_stream_held(c, None, None).await
     }
 
-    /// [`Link::open_stream`], the stream holding `reseal` for a
-    /// sealed_refused of its open (see the module's docs).
-    pub(crate) async fn open_stream_resealing(
+    /// [`Link::open_stream`], a sealed stream holding `reseal` for a
+    /// sealed_refused of its open, and a clear one handing the key its
+    /// provider names to `learnt` when it reopens sealed (see the module's
+    /// docs).
+    pub(crate) async fn open_stream_held(
         &self,
         c: StreamCall,
         reseal: Option<Reseal>,
+        learnt: Option<Learnt>,
     ) -> Result<Stream, LinkError> {
         let inner = &self.inner;
         stated(&c.target, &inner.station.node_id, &c.seal)?;
@@ -727,6 +915,7 @@ impl Link {
             .map_err(|_| LinkError::Io("no randomness".into()))?;
         let deadline = (now_ms() + deadline.as_millis() as i64) as u64;
         let (sealed, sealing) = sealed_open(inner, &c, request_id, deadline)?;
+        let clear_reopen = ClearReopen::of(&c, deadline, learnt, sealing.is_none());
         let signed = frame::sign_stream_open(
             &RequestSpec {
                 request_id,
@@ -769,6 +958,7 @@ impl Link {
             return Err(e);
         }
         *s.reseal_slot() = reseal;
+        *s.clear_reopen_slot() = clear_reopen;
         tokio::spawn(read(s.clone(), recv, state));
         Ok(Stream { inner: s })
     }
@@ -975,8 +1165,31 @@ fn admit_stream(inner: &Inner, open: &VerifiedRequest) -> Result<SessionPlace, &
 /// releases the stream.
 async fn refuse(s: &Arc<StreamInner>, code: &str, message: &str, mut recv: quinn::RecvStream) {
     s.link.count(&format!("stream_refused_{code}"));
-    let _ = s.abort(code, message).await;
+    match naming_key(s, code, message) {
+        Some(refusal) => {
+            let _ = s.writer.write(&refusal, MAX_FRAME_BYTES).await;
+            s.sent_last().await;
+            StreamInner::end(s, Some(aborted(code, message)));
+        }
+        None => {
+            let _ = s.abort(code, message).await;
+        }
+    }
     let _ = recv.stop(0u32.into());
+}
+
+/// A clear open's sealed_required refusal naming the keyring's current key
+/// in its signed tbs, encoded, when the link is set to
+/// ([`super::Config::refusal_names_key`]); `None` for any other refusal.
+fn naming_key(s: &StreamInner, code: &str, message: &str) -> Option<Vec<u8>> {
+    let inner = &s.link;
+    let keyring = inner.keyring.as_ref().filter(|_| inner.refusal_names_key)?;
+    if code != CODE_SEALED_REQUIRED || s.sealing.is_some() {
+        return None;
+    }
+    let kem_key = keyring.current().public_key().carried().to_vec();
+    let signed = frame::sign_stream_sealed_required(message, &kem_key, &s.open, &inner.key).ok()?;
+    cbor::encode(&signed).ok()
 }
 
 /// Runs the handler for the session, and ends the stream as the handler
@@ -1133,6 +1346,7 @@ async fn verified_frame(
             return None;
         }
     };
+    let kem_key = verified.kem_key.clone();
     let fields = match unsealed(verified, s.sealing.as_ref()) {
         Ok(fields) => fields,
         Err(e) => {
@@ -1140,6 +1354,9 @@ async fn verified_frame(
             return None;
         }
     };
+    if s.caller && s.resealed_clear(&fields, kem_key.as_deref()).await {
+        return None;
+    }
     // Before the frame is delivered, so a recv that returns it sees the
     // report settled.
     if s.caller && settles(&fields, s.sealing.is_some()) {
