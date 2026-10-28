@@ -76,7 +76,7 @@ pub enum Seal {
 /// The refusal codes of a sealed request, and of a clear one to a procedure
 /// past its keyless window.
 pub(super) const CODE_SEALED_REFUSED: &str = "sealed_refused";
-pub(super) const CODE_SEALED_REQUIRED: &str = "sealed_required";
+pub(crate) const CODE_SEALED_REQUIRED: &str = "sealed_required";
 
 /// macula's default and longest advertisement lifetime, which bounds the
 /// keyless window.

@@ -162,15 +162,7 @@ fn epoch_of(v: &Value) -> Option<Epoch> {
 /// Wipes every byte string a reply carries: an epoch key travels as one, and
 /// the value the reply arrived in outlives the epochs read out of it.
 pub(crate) fn zeroize_reply(v: &mut Value) {
-    match v {
-        Value::Bytes(bytes) => bytes.fill(0),
-        Value::List(items) => items.iter_mut().for_each(zeroize_reply),
-        Value::Map(pairs) => pairs.iter_mut().for_each(|(key, value)| {
-            zeroize_reply(key);
-            zeroize_reply(value);
-        }),
-        _ => {}
-    }
+    v.zeroize_bytes();
 }
 
 fn text(v: &Value, name: &str) -> Option<String> {

@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use tokio::sync::{oneshot, watch};
 
+use macula_mldsa::Zeroizing;
+
 use crate::cbor::{self, Value};
 use crate::frame::{self, StreamMode, VerifiedRequest};
 use crate::node_key::NodeKey;
@@ -831,7 +833,7 @@ fn answered(
     let Some(sealing) = sealing else {
         return clear_answer(signer, request, outcome);
     };
-    let payload = match outcome {
+    let mut payload = match outcome {
         Outcome::Refused(code, detail) => {
             return sealed_error(signer, request, sealing, code, detail.as_deref())
         }
@@ -843,6 +845,11 @@ fn answered(
     let Some(plain) = plain else {
         return sealed_error(signer, request, sealing, CODE_UNSENDABLE, None);
     };
+    // Both the payload and its encoding carry whatever the handler made —
+    // for a provider of keys, the keys themselves — and neither is read again
+    // once the seal exists. Dropping them would free the bytes without
+    // clearing them.
+    let plain = Zeroizing::new(plain);
     let signed = sealing
         .sealed_answer(
             seal::FRAME_RESULT,
@@ -853,6 +860,9 @@ fn answered(
         .and_then(|sealed| {
             frame::sign_sealed_result(request, &sealed, None, signer.key).map_err(LinkError::from)
         });
+    payload.zeroize_bytes();
+    drop(payload);
+    drop(plain);
     match sealed_result_refusal(signed) {
         Ok(reply) => Some(reply),
         Err(Refusal::Sealed(code)) => sealed_error(signer, request, sealing, code, None),

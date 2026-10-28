@@ -25,20 +25,30 @@
 //!   every epoch, past or current, whatever it shows. The set is the
 //!   application's state, and the application keeps it across a restart: a set
 //!   lost to one re-admits every removed member whose grant still verifies.
+//!   It is asked again once the membership answer is back, so a node removed
+//!   while its lookup ran is refused rather than admitted on an answer that was
+//!   true when it was asked.
 //! - [`DistributorOptions::membership`] is then read at the time of the call,
 //!   for a past epoch too, and answers [in](Membership::In),
 //!   [not a member](Membership::NotAMember) or
 //!   [unknown](Membership::Unknown). A check that does not answer within
 //!   [`DistributorOptions::membership_timeout`] is `membership_unknown`, never
 //!   `not_a_member`, so the member retries rather than being told it is out.
+//!   The pulls in flight share one lookup per group and caller, and past
+//!   [`MAX_LOOKUPS`] of them a pull is `membership_unknown` rather than one
+//!   more: one caller cannot put every other member's pulls behind an
+//!   unbounded queue of lookups.
 //!
 //! A pull names the group (`prefix`) and the epoch: `current`, or a past one
 //! by its 8-byte id. The reply carries the group's policy and the epochs: the
 //! asked one, and inside the current's ahead window the next one too. Epoch
 //! keys are kept in memory only, and never printed
-//! ([`Epoch`](super::Epoch)'s `Debug` redacts them). A refusal is one of the
-//! design's five, named exactly as every SDK names it: `not_a_member`,
+//! ([`Epoch`](super::Epoch)'s `Debug` redacts them); a reply's key bytes are
+//! wiped from memory once the reply is sealed. A refusal is one of the design's
+//! five, named exactly as every SDK names it: `not_a_member`,
 //! `membership_unknown`, `unknown_epoch`, `epoch_expired` and `unknown_group`.
+//! A pull that did not arrive sealed is refused `sealed_required` by the
+//! handler itself, whatever offer it was served under.
 //!
 //! **The store is bounded.** A pull names a group, and any caller the org's
 //! grant admits may name a new one, so the epochs one host holds are what an
@@ -59,26 +69,26 @@
 //! an idle distributor too; [`Distributor::erase_spent`] does the same work
 //! for an application that would rather time it.
 //!
-//! **The knobs are checked when the distributor is made.** A rotation of zero
-//! or less, a cap of zero, and an epoch cap below what one group's chain needs
-//! at the configured rotation are each refused by [`Distributor::new`]: every
-//! one of them leaves a distributor that answers its first pulls and then
-//! cannot answer any, so an operator reads which one it is at construction
-//! rather than from a member's failed pulls seventy minutes later.
+//! **The knobs are checked when the distributor is made.** A rotation outside
+//! one millisecond to a day, a cap of zero, and an epoch cap below what one
+//! group's chain needs at the configured rotation are each refused by
+//! [`Distributor::new`]: every one of them leaves a distributor that answers
+//! its first pulls and then cannot answer any, so an operator reads which one
+//! it is at construction rather than from a member's failed pulls seventy
+//! minutes later.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tokio::time::timeout;
 
 use crate::cbor::Value;
 use crate::pool::Offer;
 use crate::seal::Clock;
-use crate::station_link::{handler, Confidentiality, Handler, Request};
+use crate::station_link::{handler, Confidentiality, Handler, Request, CODE_SEALED_REQUIRED};
 use crate::ucan::Policy as Grant;
 
 use super::epoch::{for_publish, fresh, org_of, wall_clock, NoRandomness, TOLERANCE_MS};
@@ -93,6 +103,20 @@ pub const GROUP_KEYS_CAN: &str = "group_keys";
 /// and inside a member's 15-second pull deadline, so no answer is made that no
 /// member still waits for.
 pub const DEFAULT_MEMBERSHIP_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// The most membership lookups one distributor runs at once, macula's
+/// `MAX_LOOKUPS`. Every pull asks the application about its caller, so without
+/// a bound one admitted caller's pulls — as many as the link admits — would
+/// have every other member's pulls waiting on lookups behind them. Past it a
+/// pull is answered `membership_unknown` and retried.
+pub const MAX_LOOKUPS: usize = 64;
+
+/// The longest rotation a distributor serves: a day of publishing. An epoch's
+/// times are added to the distributor's clock, so `issued_at + rotation` and
+/// the life past it are held to a value that cannot carry those sums past what
+/// an `i64` holds for any clock a node is likely to read; and a day is far past
+/// the quarter of an hour the design publishes an epoch for.
+pub const MAX_ROTATE_AFTER_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// What the application's membership check answers for a caller in one group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,9 +152,10 @@ pub struct DistributorOptions {
     pub org: String,
     /// The policy every one of its groups is answered with.
     pub policy: Policy,
-    /// How long an epoch publishes, in milliseconds. It must be positive: an
-    /// epoch that publishes for no time at all is one a pull of the current
-    /// epoch makes again for ever.
+    /// How long an epoch publishes, in milliseconds: between one and
+    /// [`MAX_ROTATE_AFTER_MS`]. An epoch that publishes for no time at all is
+    /// one a pull of the current epoch makes again for ever, and one that
+    /// publishes for longer than a day adds times a clock's sum cannot carry.
     pub rotate_after_ms: i64,
     /// The clock its epochs' times are read from.
     pub now: Clock,
@@ -168,6 +193,12 @@ impl DistributorOptions {
 /// hold more than it was sized for. All three are needed: the first two bound
 /// the prefixes, because a pull names one and any admitted caller may name a
 /// new one; the third bounds one group's chain.
+///
+/// A group's room is charged to the caller whose pull first made the
+/// distributor hold it, and stays charged to that caller for as long as the
+/// group is held — whatever other callers pull it, and whoever keeps it alive
+/// by pulling. Only a group nothing of which is kept any more is released,
+/// with its charge.
 ///
 /// A refusal from one of them is not a refusal of the design's: it names
 /// itself in the `handler_error`'s detail (`too_many_groups_member`,
@@ -235,9 +266,10 @@ pub fn chain_bound(rotate_after_ms: i64) -> usize {
 /// pulls and then unable to answer any.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Misconfigured {
-    /// A rotation of zero or less: an epoch would publish for no time at all,
-    /// so a pull of the current epoch would make another for ever.
-    Rotation { rotate_after_ms: i64 },
+    /// A rotation outside `1..=`[`MAX_ROTATE_AFTER_MS`]: an epoch would publish
+    /// for no time at all, so a pull of the current epoch would make another
+    /// for ever, or for longer than an epoch's times can be added to a clock's.
+    Rotation { rotate_after_ms: i64, longest: i64 },
     /// A cap of zero: a distributor sized for nothing refuses every pull.
     NoRoom { cap: &'static str },
     /// [`Caps::epochs`] below [`chain_bound`]: the chain would fill in about
@@ -252,9 +284,13 @@ pub enum Misconfigured {
 impl fmt::Display for Misconfigured {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Misconfigured::Rotation { rotate_after_ms } => write!(
+            Misconfigured::Rotation {
+                rotate_after_ms,
+                longest,
+            } => write!(
                 f,
-                "rotate_after_ms is {rotate_after_ms}: an epoch must publish for a positive time",
+                "rotate_after_ms is {rotate_after_ms}: an epoch publishes for between 1 and \
+                 {longest} ms",
             ),
             Misconfigured::NoRoom { cap } => {
                 write!(
@@ -281,8 +317,11 @@ impl std::error::Error for Misconfigured {}
 /// then unable to answer at all.
 fn check(opts: &DistributorOptions) -> Result<(), Misconfigured> {
     let rotate_after_ms = opts.rotate_after_ms;
-    if rotate_after_ms <= 0 {
-        return Err(Misconfigured::Rotation { rotate_after_ms });
+    if rotate_after_ms <= 0 || rotate_after_ms > MAX_ROTATE_AFTER_MS {
+        return Err(Misconfigured::Rotation {
+            rotate_after_ms,
+            longest: MAX_ROTATE_AFTER_MS,
+        });
     }
     if let Some(cap) = first_zero_cap(opts.caps) {
         return Err(Misconfigured::NoRoom { cap });
@@ -312,6 +351,13 @@ fn first_zero_cap(caps: Caps) -> Option<&'static str> {
 /// A distributor of its org's groups' keys: the epochs of every group it
 /// serves, made on demand, contiguous, and held in memory only. Cloning shares
 /// the epochs, so every handle of one distributor serves the same chain.
+///
+/// **One distributor serves one realm.** A prefix's realm segment is not
+/// matched to the realm a pull arrived in: the chains a distributor holds are
+/// the org's groups whichever of the realms it is served for named them, so
+/// serving one distributor under several realms would hand one realm's group
+/// key to a caller another realm's channel admitted. Serve one per realm, and
+/// let each application's membership answer for that realm alone.
 #[derive(Clone)]
 pub struct Distributor {
     inner: Arc<Inner>,
@@ -331,10 +377,19 @@ struct Inner {
     /// the sweeper re-reads the instant it waits for and leaves rather than
     /// sleeping past both.
     woken: Arc<Notify>,
-    /// Set once the sweeper is started: one task sweeps for every handle of a
-    /// distributor, and none before something is held.
-    sweeping: AtomicBool,
+    /// The sweeper, while one runs: started by the first pull that holds
+    /// anything, and started again if the runtime it ran on has ended.
+    sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The membership lookups in flight, one per group and caller, at most
+    /// [`MAX_LOOKUPS`] of them.
+    lookups: Mutex<InFlight>,
 }
+
+/// A membership lookup's key: the group it is about, and the caller.
+type LookupKey = (String, [u8; 32]);
+
+/// The membership lookups a distributor has in flight.
+type InFlight = HashMap<LookupKey, Arc<Lookup>>;
 
 impl Inner {
     /// The lock the groups are held under. A panic under it leaves the epochs
@@ -342,6 +397,13 @@ impl Inner {
     /// a pull makes of it, so there is nothing half-written to doubt.
     fn lock(&self) -> MutexGuard<'_, Chains> {
         self.groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The lock the in-flight lookups are held under, for the same reason.
+    fn lookups(&self) -> MutexGuard<'_, InFlight> {
+        self.lookups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -374,6 +436,93 @@ impl Drop for Inner {
     /// than sleeping until an epoch's acceptance ends.
     fn drop(&mut self) {
         self.woken.notify_one();
+    }
+}
+
+/// A membership lookup in flight: the answer once the pull that ran it has
+/// one, and the wake-up every pull waiting on it parks on.
+struct Lookup {
+    answer: watch::Sender<Option<Membership>>,
+    hearing: watch::Receiver<Option<Membership>>,
+}
+
+impl Lookup {
+    fn new() -> Lookup {
+        let (answer, hearing) = watch::channel(None);
+        Lookup { answer, hearing }
+    }
+
+    /// The answer, given to every pull waiting on this lookup. The first
+    /// answer is the one kept.
+    fn settle(&self, answer: Membership) {
+        self.answer
+            .send_if_modified(|kept| settle_once(kept, answer));
+    }
+
+    /// The answer, waiting for the pull that ran the lookup to have it. A
+    /// lookup whose pull was dropped settles `unknown` as it goes, so this
+    /// always answers.
+    async fn waited(&self) -> Membership {
+        let mut hearing = self.hearing.clone();
+        match awaiting(&mut hearing).await {
+            Some(answer) => answer,
+            // Only a lookup whose sender went without an answer leaves this
+            // with none, which is a membership nobody could read.
+            None => Membership::Unknown,
+        }
+    }
+}
+
+/// Whether `answer` is the one kept: only the first settles a lookup.
+fn settle_once(kept: &mut Option<Membership>, answer: Membership) -> bool {
+    if kept.is_some() {
+        return false;
+    }
+    *kept = Some(answer);
+    true
+}
+
+/// The answer once the lookup has one, or `None` when the lookup went without
+/// one: its pull was dropped and took the sender with it.
+async fn awaiting(hearing: &mut watch::Receiver<Option<Membership>>) -> Option<Membership> {
+    while hearing.borrow_and_update().is_none() {
+        if hearing.changed().await.is_err() {
+            return None;
+        }
+    }
+    *hearing.borrow_and_update()
+}
+
+/// What a pull got when it asked for its caller's membership: a lookup it
+/// runs, one it waits on, or none because as many are in flight as the
+/// distributor runs.
+enum Claim {
+    Runs(Arc<Lookup>),
+    Waits(Arc<Lookup>),
+    Refused,
+}
+
+/// A lookup this pull runs: the answer is given to every pull waiting on it
+/// at [`Running::settle`], and a pull dropped before that — its request's
+/// deadline passed — still takes the lookup out of the in-flight set and
+/// tells the waits `unknown`, so no pull waits on a lookup nobody runs.
+struct Running {
+    inner: Arc<Inner>,
+    key: (String, [u8; 32]),
+    lookup: Arc<Lookup>,
+}
+
+impl Running {
+    /// The answer, given to every pull waiting on this lookup.
+    fn settle(&self, answer: Membership) {
+        self.lookup.settle(answer);
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.lookup.settle(Membership::Unknown);
+        self.inner.lookups().remove(&self.key);
     }
 }
 
@@ -711,13 +860,18 @@ impl Refusal {
 }
 
 /// Why a pull has no answer: one of the design's refusals, one of this
-/// distributor's own limits, or this node's own randomness not answering.
-/// None but the first is a refusal of the design's, so a member retries those
-/// as a failed pull rather than being told it is out of the group.
+/// distributor's own limits, this node's own randomness not answering, or a
+/// pull that came in the clear. None but the first is a refusal of the
+/// design's, so a member retries those as a failed pull rather than being told
+/// it is out of the group.
 enum Unanswered {
     Refused(Refusal),
     Capacity(Capacity),
     NoRandomness(NoRandomness),
+    /// The pull did not arrive sealed, and a distributor hands keys sealed
+    /// only: the same `sealed_required` a link sends a clear call to a sealed
+    /// offer.
+    Clear,
 }
 
 impl Unanswered {
@@ -729,6 +883,7 @@ impl Unanswered {
             Unanswered::Refused(refusal) => refusal.name().to_string(),
             Unanswered::Capacity(capacity) => capacity.detail().to_string(),
             Unanswered::NoRandomness(cause) => cause.to_string(),
+            Unanswered::Clear => CODE_SEALED_REQUIRED.to_string(),
         }
     }
 }
@@ -772,7 +927,8 @@ impl Distributor {
                 groups: Mutex::new(Chains::default()),
                 caps: opts.caps,
                 woken: Arc::new(Notify::new()),
-                sweeping: AtomicBool::new(false),
+                sweeper: Mutex::new(None),
+                lookups: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -815,23 +971,33 @@ impl Distributor {
     }
 
     /// The `<org>/group_keys_v1` handler to serve.
-    pub fn handler(&self) -> Handler {
+    ///
+    /// Not public: a distributor hands its offer out with [`Distributor::offer`],
+    /// which names the sealing and the grant, and a handler served without them
+    /// would hand a group's key out under no offer's conditions.
+    pub(crate) fn handler(&self) -> Handler {
         let distributor = self.clone();
         handler(move |request: Request| answering(distributor.clone(), request))
     }
 
     /// Answers one pull: the group's epochs to a caller the application admits
     /// to it.
+    ///
+    /// A pull that did not arrive sealed is refused: a distributor hands the
+    /// org's group keys out, and a clear one would put a key on the wire where
+    /// anyone on the path reads it. The named epoch is checked before the
+    /// caller's membership is read, so a malformed pull costs no lookup.
     async fn pull(&self, request: Request) -> Result<Value, Unanswered> {
+        if !request.sealed {
+            return Err(Unanswered::Clear);
+        }
         let prefix = self.owned(&request.payload)?;
+        let asked = epoch_asked(&request.payload)?;
         self.admit(&prefix, request.caller).await?;
         let now = (self.inner.now)();
-        let reply = match request.payload.get("epoch") {
-            Some(Value::Text(current)) if current == "current" => {
-                self.current(&prefix, request.caller, now)?
-            }
-            Some(Value::Bytes(id)) => self.past(&prefix, id, now)?,
-            _ => Err(Refusal::UnknownEpoch)?,
+        let reply = match asked {
+            EpochAsked::Current => self.current(&prefix, request.caller, now)?,
+            EpochAsked::Past(id) => self.past(&prefix, &id, now)?,
         };
         Ok(reply_value(&reply))
     }
@@ -850,18 +1016,72 @@ impl Distributor {
     }
 
     /// Whether the application admits `caller` to `prefix`: its removed set
-    /// first, which is absolute, then its membership, read now.
+    /// first, which is absolute, then its membership, read now, and the
+    /// removed set again once that answer has come.
     async fn admit(&self, prefix: &str, caller: [u8; 32]) -> Result<(), Refusal> {
-        if (self.inner.removed)(prefix, caller) {
-            return Err(Refusal::NotAMember);
+        self.still_member(prefix, caller)?;
+        match self.membership_of(prefix, caller).await {
+            Membership::In => self.still_member(prefix, caller),
+            Membership::NotAMember => Err(Refusal::NotAMember),
+            Membership::Unknown => Err(Refusal::MembershipUnknown),
         }
-        let asked = (self.inner.membership)(prefix.to_string(), caller);
-        match timeout(self.inner.membership_timeout, asked).await {
-            Ok(Membership::In) => Ok(()),
-            Ok(Membership::NotAMember) => Err(Refusal::NotAMember),
-            Ok(Membership::Unknown) => Err(Refusal::MembershipUnknown),
-            Err(_elapsed) => Err(Refusal::MembershipUnknown),
+    }
+
+    /// Whether the application's removed set still holds `caller`: asked
+    /// before its membership is read, and again once the answer is back, so a
+    /// node removed while its lookup ran is refused rather than admitted on an
+    /// answer that was true when it was asked.
+    fn still_member(&self, prefix: &str, caller: [u8; 32]) -> Result<(), Refusal> {
+        match (self.inner.removed)(prefix, caller) {
+            true => Err(Refusal::NotAMember),
+            false => Ok(()),
         }
+    }
+
+    /// The caller's membership of `prefix`, read at most once for the pulls in
+    /// flight: the pull that finds no lookup runs it and the others wait on the
+    /// same answer, and past [`MAX_LOOKUPS`] in flight a pull is
+    /// `membership_unknown` rather than one more lookup.
+    async fn membership_of(&self, prefix: &str, caller: [u8; 32]) -> Membership {
+        let key = (prefix.to_string(), caller);
+        match self.claim_lookup(&key) {
+            Claim::Runs(lookup) => self.run_lookup(key, lookup).await,
+            Claim::Waits(lookup) => lookup.waited().await,
+            Claim::Refused => Membership::Unknown,
+        }
+    }
+
+    /// The lookup this pull runs, waits on, or has no room for.
+    fn claim_lookup(&self, key: &(String, [u8; 32])) -> Claim {
+        let mut lookups = self.inner.lookups();
+        if let Some(lookup) = lookups.get(key) {
+            return Claim::Waits(Arc::clone(lookup));
+        }
+        if lookups.len() >= MAX_LOOKUPS {
+            return Claim::Refused;
+        }
+        let lookup = Arc::new(Lookup::new());
+        lookups.insert(key.clone(), Arc::clone(&lookup));
+        Claim::Runs(lookup)
+    }
+
+    /// Runs the caller's lookup, with the application given
+    /// [`DistributorOptions::membership_timeout`] to answer, and gives the
+    /// answer to every pull waiting on it: a lookup that does not answer in
+    /// time is `unknown`, never `not a member`.
+    async fn run_lookup(&self, key: (String, [u8; 32]), lookup: Arc<Lookup>) -> Membership {
+        let running = Running {
+            inner: Arc::clone(&self.inner),
+            key,
+            lookup,
+        };
+        let asked = (self.inner.membership)(running.key.0.clone(), running.key.1);
+        let answer = match timeout(self.inner.membership_timeout, asked).await {
+            Ok(answer) => answer,
+            Err(_elapsed) => Membership::Unknown,
+        };
+        running.settle(answer);
+        answer
     }
 
     /// The group's epochs to a pull of its current one: the ones still
@@ -902,7 +1122,7 @@ impl Distributor {
     /// still accepted, `epoch_expired` while its id is kept past that so a
     /// subscriber learns why it could not catch up, and `unknown_epoch` once
     /// nothing of it is held (a distributor that restarted holds none).
-    fn past(&self, prefix: &str, id: &[u8], now: i64) -> Result<Reply, Unanswered> {
+    fn past(&self, prefix: &str, id: &[u8; ID_SIZE], now: i64) -> Result<Reply, Unanswered> {
         let times = Times {
             now,
             rotation: self.inner.rotate_after_ms,
@@ -911,11 +1131,11 @@ impl Distributor {
             let groups = self.lock();
             groups.at(prefix, times)
         };
-        let found = keyed.into_iter().find(|epoch| epoch.id.as_slice() == id);
+        let found = keyed.into_iter().find(|epoch| &epoch.id == id);
         if let Some(epoch) = found {
             return Ok(self.reply(prefix, vec![epoch]));
         }
-        match spent.iter().any(|spent| spent.id.as_slice() == id) {
+        match spent.iter().any(|spent| &spent.id == id) {
             true => Err(Refusal::EpochExpired.into()),
             false => Err(Refusal::UnknownEpoch.into()),
         }
@@ -933,19 +1153,45 @@ impl Distributor {
 
     /// Something was held: the sweeper is told to re-read the instant it waits
     /// for, and is started the first time it is told, so a distributor made
-    /// and never pulled starts no task.
+    /// and never pulled starts no task. A sweeper whose runtime has ended is
+    /// started again, so the erasure never falls back to the pulls alone.
     fn note_held(&self) {
         self.inner.woken.notify_one();
-        if self.inner.sweeping.swap(true, Ordering::SeqCst) {
+        let mut sweeper = self
+            .inner
+            .sweeper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if sweeper.as_ref().is_some_and(|handle| !handle.is_finished()) {
             return;
         }
         let woken = Arc::clone(&self.inner.woken);
         let distributor = Arc::downgrade(&self.inner);
-        tokio::spawn(sweep_until_dropped(distributor, woken));
+        *sweeper = Some(tokio::spawn(sweep_until_dropped(distributor, woken)));
     }
 
     fn lock(&self) -> MutexGuard<'_, Chains> {
         self.inner.lock()
+    }
+}
+
+/// The epoch a pull names: the group's current one, or a past one by its id.
+enum EpochAsked {
+    Current,
+    Past([u8; ID_SIZE]),
+}
+
+/// What `payload` asks for: the current epoch, or a past one by its 8-byte id.
+/// Anything else is `unknown_epoch`, checked before the caller's membership is
+/// read so a malformed pull costs no lookup.
+fn epoch_asked(payload: &Value) -> Result<EpochAsked, Refusal> {
+    match payload.get("epoch") {
+        Some(Value::Text(current)) if current == "current" => Ok(EpochAsked::Current),
+        Some(Value::Bytes(id)) => match <[u8; ID_SIZE]>::try_from(id.as_slice()) {
+            Ok(id) => Ok(EpochAsked::Past(id)),
+            Err(_) => Err(Refusal::UnknownEpoch),
+        },
+        _ => Err(Refusal::UnknownEpoch),
     }
 }
 
@@ -1054,7 +1300,7 @@ fn ahead(epochs: Vec<Epoch>, times: Times) -> Result<Vec<Epoch>, NoRandomness> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
     use super::*;
     use crate::frame::Sealed;
@@ -1305,6 +1551,30 @@ mod tests {
         assert!(offer.stream.is_none());
     }
 
+    /// A pull that did not arrive sealed is refused `sealed_required`: a
+    /// distributor hands the org's group keys out, and a clear pull would put
+    /// one on the wire where anything on the path reads it — whatever offer
+    /// the handler was served under.
+    #[tokio::test]
+    async fn a_clear_pull_is_refused() {
+        let (distributor, _clock) = distributor(START);
+        let request = Request {
+            caller: CALLER,
+            realm: REALM,
+            procedure: distributor.procedure(),
+            payload: current_request(&prefix()),
+            token: None,
+            proofs: None,
+            deadline_ms: 0,
+            sealed: false,
+        };
+        assert_eq!(
+            distributor.handler()(request).await,
+            Err("sealed_required".to_string())
+        );
+        assert!(stored(&distributor).is_empty(), "and nothing is held");
+    }
+
     /// A holder pulls the current epoch and opens under it: the key the
     /// distributor handed to the member is the key the event was sealed with.
     #[tokio::test]
@@ -1388,6 +1658,165 @@ mod tests {
         assert_eq!(current(&unread).await, Err(MEMBERSHIP_UNKNOWN.into()));
     }
 
+    /// A node removed while its membership lookup was still running is
+    /// refused: the removed set is asked again once the answer is back, so an
+    /// answer that was true when it was asked does not admit a node the group
+    /// has removed since.
+    #[tokio::test]
+    async fn a_node_removed_during_its_lookup_is_refused() {
+        let removed = Arc::new(AtomicBool::new(false));
+        let (mut opts, clock) = options(START);
+        opts.removed = removed_set(&removed);
+        opts.membership = removing_while_asked(&removed);
+        let distributor = distributor_of(opts, &clock);
+        assert_eq!(current(&distributor).await, Err(NOT_A_MEMBER.into()));
+    }
+
+    /// A membership check that answers [`everyone`], having removed the caller
+    /// while it ran.
+    fn removing_while_asked(removed: &Arc<AtomicBool>) -> MembershipCheck {
+        let removed = Arc::clone(removed);
+        Arc::new(move |_prefix: String, caller: [u8; 32]| {
+            let answer = everyone(caller);
+            Box::pin(removed_while_answering(Arc::clone(&removed), answer)) as MembershipFuture
+        })
+    }
+
+    async fn removed_while_answering(removed: Arc<AtomicBool>, answer: Membership) -> Membership {
+        removed.store(true, Ordering::SeqCst);
+        answer
+    }
+
+    /// One caller's pulls in flight share one lookup: they all wait on the
+    /// answer the first of them is running, rather than asking the application
+    /// once each.
+    #[tokio::test]
+    async fn one_callers_pulls_share_one_lookup() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Notify::new());
+        let (mut opts, clock) = options(START);
+        opts.membership = counted_and_gated(&asked, &gate);
+        let distributor = distributor_of(opts, &clock);
+        let pulls: Vec<_> = (0..8).map(|_| spawned_pull(&distributor, CALLER)).collect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "one lookup for eight pulls"
+        );
+        gate.notify_waiters();
+        let answers = futures_answers(pulls).await;
+        assert!(
+            answers.iter().all(Result::is_ok),
+            "every pull is answered: {answers:?}"
+        );
+    }
+
+    /// One pull of this group, by `caller`, spawned so its future runs beside
+    /// another's.
+    fn spawned_pull(
+        distributor: &Distributor,
+        caller: [u8; 32],
+    ) -> tokio::task::JoinHandle<Result<Value, String>> {
+        let distributor = distributor.clone();
+        let payload = current_request(&prefix());
+        tokio::spawn(async move { pull_as(&distributor, caller, payload).await })
+    }
+
+    /// A membership check that counts its lookups and answers `in` once `gate`
+    /// wakes it.
+    fn counted_and_gated(asked: &Arc<AtomicUsize>, gate: &Arc<Notify>) -> MembershipCheck {
+        let asked = Arc::clone(asked);
+        let gate = Arc::clone(gate);
+        Arc::new(move |_prefix: String, _caller: [u8; 32]| {
+            Box::pin(counted_once(Arc::clone(&asked), Arc::clone(&gate))) as MembershipFuture
+        })
+    }
+
+    async fn counted_once(asked: Arc<AtomicUsize>, gate: Arc<Notify>) -> Membership {
+        asked.fetch_add(1, Ordering::SeqCst);
+        gate.notified().await;
+        Membership::In
+    }
+
+    /// Past [`MAX_LOOKUPS`] in flight a pull is `membership_unknown` rather
+    /// than one more lookup, so no caller can put every other member's pulls
+    /// behind an unbounded queue of lookups.
+    #[tokio::test]
+    async fn past_the_lookups_in_flight_a_pull_is_unknown() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Notify::new());
+        let (mut opts, clock) = options(START);
+        opts.membership_timeout = Duration::from_secs(30);
+        opts.membership = counted_and_held(&started, &open, &gate);
+        let distributor = distributor_of(opts, &clock);
+        let pulls: Vec<_> = (0..=MAX_LOOKUPS as u8)
+            .map(|caller| spawned_pull(&distributor, [caller; 32]))
+            .collect();
+        wait_until(|| started.load(Ordering::SeqCst) == MAX_LOOKUPS).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let refused = pulls.iter().filter(|pull| pull.is_finished()).count();
+        assert_eq!(refused, 1, "the pull past the cap started no lookup");
+        open.store(true, Ordering::SeqCst);
+        gate.notify_waiters();
+        let answers: Vec<Result<Value, String>> = futures_answers(pulls).await;
+        let unknown = answers
+            .iter()
+            .filter(|answer| **answer == Err(MEMBERSHIP_UNKNOWN.into()))
+            .count();
+        assert_eq!(unknown, 1, "and was answered membership_unknown");
+    }
+
+    /// Waits for `done` to hold, letting the tasks that make it hold run.
+    async fn wait_until(done: impl Fn() -> bool) {
+        while !done() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A membership check that counts its lookups and answers `in` once `open`
+    /// is set, parking every lookup that comes before that.
+    fn counted_and_held(
+        started: &Arc<AtomicUsize>,
+        open: &Arc<AtomicBool>,
+        gate: &Arc<Notify>,
+    ) -> MembershipCheck {
+        let started = Arc::clone(started);
+        let open = Arc::clone(open);
+        let gate = Arc::clone(gate);
+        Arc::new(move |_prefix: String, _caller: [u8; 32]| {
+            Box::pin(counted_and_waiting(
+                Arc::clone(&started),
+                Arc::clone(&open),
+                Arc::clone(&gate),
+            )) as MembershipFuture
+        })
+    }
+
+    async fn counted_and_waiting(
+        started: Arc<AtomicUsize>,
+        open: Arc<AtomicBool>,
+        gate: Arc<Notify>,
+    ) -> Membership {
+        started.fetch_add(1, Ordering::SeqCst);
+        while !open.load(Ordering::SeqCst) {
+            gate.notified().await;
+        }
+        Membership::In
+    }
+
+    /// Every spawned pull's answer, in the order they were spawned.
+    async fn futures_answers(
+        pulls: Vec<tokio::task::JoinHandle<Result<Value, String>>>,
+    ) -> Vec<Result<Value, String>> {
+        let mut answers = Vec::with_capacity(pulls.len());
+        for pull in pulls {
+            answers.push(pull.await.expect("the pull runs"));
+        }
+        answers
+    }
+
     /// A subscriber that was offline across a rotation catches up: the
     /// distributor still holds the epoch it missed, answers it, and the event
     /// sealed under it opens.
@@ -1461,6 +1890,45 @@ mod tests {
             distributor.deadline(),
             Some(epoch.accept_until + TOLERANCE_MS + 1)
         );
+    }
+
+    /// A sweeper the runtime it was started on has ended with is started
+    /// again by the next pull: the erasure is never left to the pulls alone
+    /// because the task a distributor started in one runtime is gone.
+    #[test]
+    fn a_sweeper_whose_runtime_ended_is_started_again() {
+        let (opts, clock) = options(START);
+        let distributor = distributor_of(opts, &clock);
+        let first = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        first.block_on(async {
+            current(&distributor).await.expect("the first pull");
+        });
+        drop(first);
+        assert!(!sweeping(&distributor), "the first sweeper ended with it");
+
+        let second = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        second.block_on(async {
+            current(&distributor)
+                .await
+                .expect("a pull after the runtime ended");
+        });
+        assert!(sweeping(&distributor), "a sweeper runs again");
+    }
+
+    /// Whether the distributor has a sweeper still running.
+    fn sweeping(distributor: &Distributor) -> bool {
+        let sweeper = distributor
+            .inner
+            .sweeper
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sweeper.as_ref().is_some_and(|handle| !handle.is_finished())
     }
 
     /// Past its keeping the id goes too: nothing of the epoch is held, and a
@@ -1699,19 +2167,31 @@ mod tests {
         assert_eq!(kept.id, first.id, "and the epoch members hold");
     }
 
-    /// A rotation of zero or less is refused when the distributor is made: an
-    /// epoch would publish for no time at all, so a pull of the current one
-    /// would make another, and another, with the groups locked.
+    /// A rotation outside the bounds is refused when the distributor is made:
+    /// one of zero or less would publish for no time at all, so a pull of the
+    /// current epoch would make another, and another, with the groups locked,
+    /// and one past a day would carry an epoch's times past what an `i64`
+    /// holds.
     #[test]
-    fn a_rotation_of_zero_or_less_is_refused() {
-        for rotate_after_ms in [0, -1, -DEFAULT_ROTATE_AFTER_MS] {
+    fn a_rotation_outside_the_bounds_is_refused() {
+        let outside = [0, -1, -DEFAULT_ROTATE_AFTER_MS, MAX_ROTATE_AFTER_MS + 1];
+        for rotate_after_ms in outside {
             let (mut opts, _clock) = options(START);
             opts.rotate_after_ms = rotate_after_ms;
             assert_eq!(
                 Distributor::new(opts).err(),
-                Some(Misconfigured::Rotation { rotate_after_ms })
+                Some(Misconfigured::Rotation {
+                    rotate_after_ms,
+                    longest: MAX_ROTATE_AFTER_MS,
+                })
             );
         }
+        let (mut opts, _clock) = options(START);
+        opts.rotate_after_ms = MAX_ROTATE_AFTER_MS;
+        assert!(
+            Distributor::new(opts).is_ok(),
+            "the longest rotation is a distributor's"
+        );
     }
 
     /// A cap of zero is refused too: a distributor sized for nothing refuses
@@ -1841,5 +2321,33 @@ mod tests {
         assert_eq!(Reason::from_refusal(&no_randomness.detail()), None);
         let refused = Unanswered::from(Refusal::UnknownEpoch);
         assert_eq!(refused.detail(), UNKNOWN_EPOCH);
+    }
+
+    /// A reply's key bytes are wiped once they have been sealed: a
+    /// distributor's answer carries the group's epoch keys, and dropping a
+    /// value frees its bytes without clearing them.
+    #[test]
+    fn a_replys_keys_are_wiped_after_sealing() {
+        let epoch = fresh(START, ROTATION).expect("randomness answers");
+        let mut reply = reply_value(&Reply {
+            prefix: prefix(),
+            policy: Policy::Required,
+            epochs: vec![epoch],
+        });
+        assert!(reply.get("epochs").is_some(), "the reply as it goes out");
+        reply.zeroize_bytes();
+        assert!(all_bytes_zero(&reply), "no key byte survives the wipe");
+    }
+
+    /// Whether every byte string in `v` is zero.
+    fn all_bytes_zero(v: &Value) -> bool {
+        match v {
+            Value::Bytes(bytes) => bytes.iter().all(|byte| *byte == 0),
+            Value::List(items) => items.iter().all(all_bytes_zero),
+            Value::Map(pairs) => pairs
+                .iter()
+                .all(|(key, value)| all_bytes_zero(key) && all_bytes_zero(value)),
+            _ => true,
+        }
     }
 }

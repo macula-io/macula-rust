@@ -29,6 +29,7 @@ mod versions;
 
 pub use admission::{Admission, AdmissionLimits};
 pub use call::{Call, Called, DEFAULT_CALL_TIMEOUT, MAX_CALL_TIMEOUT};
+pub(crate) use confidential::CODE_SEALED_REQUIRED;
 pub use confidential::{
     is_clear_refusal, Confidentiality, ConfidentialityError, ConfidentialityReason, Seal,
 };

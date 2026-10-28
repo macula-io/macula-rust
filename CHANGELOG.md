@@ -43,10 +43,21 @@ usually touches both, but their version numbers don't move in lockstep.
   rotation longer, so a pull of it is still answered `epoch_expired` — and a
   sweeper the first pull starts does that on the distributor's own clock, on an
   idle distributor too (`Distributor::erase_spent` does the same work on
-  demand). `Distributor::new` refuses the knobs that would leave it answering
-  at first and unable afterwards: a rotation of zero or less, a cap of zero,
-  and `Caps::epochs` below `group::chain_bound` — the epochs one group's chain
-  needs at the configured rotation, 8 at the default quarter of an hour.
+  demand). A node removed while its membership lookup ran is refused: the
+  removed set is asked again once the answer is back. The pulls in flight share
+  one membership lookup per group and caller, and past `group::MAX_LOOKUPS` of
+  them a pull is `membership_unknown` rather than one more, so one caller
+  cannot starve every other member's pulls. The handler refuses a pull that did
+  not arrive sealed (`sealed_required`) itself, whatever offer it is served
+  under. `Distributor::new` refuses the knobs that would leave it answering at
+  first and unable afterwards: a rotation outside one millisecond to
+  `group::MAX_ROTATE_AFTER_MS`, a cap of zero, and `Caps::epochs` below
+  `group::chain_bound` — the epochs one group's chain needs at the configured
+  rotation, 8 at the default quarter of an hour. One distributor serves one
+  realm: a prefix's realm segment is not matched to the realm a pull arrived in.
+  A sealed reply's plaintext, and the payload the handler made it from, are
+  wiped once the reply is sealed, so a group key does not outlive its answer in
+  freed memory.
   `Epoch::fresh`, `Epoch::following` and `Epoch::in_ahead_window` are public,
   and `group::NoRandomness` is why a node whose randomness does not answer
   makes no epoch.

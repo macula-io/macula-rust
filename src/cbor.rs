@@ -122,6 +122,22 @@ impl Value {
         }
         self
     }
+
+    /// Zeroes every byte string in the value, in place: for a payload that
+    /// carried a secret, once the secret has been sealed and nothing reads it
+    /// again. Dropping a `Vec<u8>` frees its bytes without clearing them, so a
+    /// reply holding epoch keys would otherwise leave them in freed memory.
+    pub fn zeroize_bytes(&mut self) {
+        match self {
+            Value::Bytes(bytes) => bytes.fill(0),
+            Value::List(items) => items.iter_mut().for_each(Value::zeroize_bytes),
+            Value::Map(pairs) => pairs.iter_mut().for_each(|(key, value)| {
+                key.zeroize_bytes();
+                value.zeroize_bytes();
+            }),
+            _ => {}
+        }
+    }
 }
 
 /// Why [`encode`] refused a value: one variant for each way a [`Value`] can

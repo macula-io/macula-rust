@@ -29,6 +29,7 @@ mod wire;
 pub use distributor::{
     chain_bound, Caps, Distributor, DistributorOptions, Membership, MembershipCheck,
     MembershipFuture, Misconfigured, RemovedCheck, DEFAULT_MEMBERSHIP_TIMEOUT, GROUP_KEYS_CAN,
+    MAX_LOOKUPS, MAX_ROTATE_AFTER_MS,
 };
 pub use epoch::{
     for_publish, org_of, retain_live, under, Epoch, NoRandomness, NotAGroup,
