@@ -36,7 +36,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
 
       - name: Extract version from tag
         id: version

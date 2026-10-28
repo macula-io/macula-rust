@@ -17,9 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - run: cargo fmt --all -- --check
 
   clippy:
@@ -27,9 +28,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -39,7 +41,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       # The integration tests dial macula-go's in-process stations
       # (tests/teststation), built to target/teststation first.
@@ -59,9 +64,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:
@@ -78,7 +84,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - uses: ilammy/setup-nasm@v1
       - run: "cargo test -p macula-rust --lib --locked -- keystore:: node_key::"
@@ -90,9 +99,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-linux-android,x86_64-linux-android
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          rustup target add aarch64-linux-android x86_64-linux-android
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-ndk --locked
       # The runner's NDK path is a shell variable, not in the env context.
@@ -105,7 +116,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - run: |
           cargo test -p macula-rust --locked --no-run --message-format=json \
@@ -124,7 +138,10 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
 
@@ -133,7 +150,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p macula-rust-ffi --release
       - run: |

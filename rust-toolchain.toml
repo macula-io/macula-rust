@@ -1,3 +1,13 @@
+# The Rust version every job builds with is the one named here, and nothing else.
+# A float on `stable` means a clippy or rustfmt release can redden master with no
+# commit of ours: on 2026-10-28 the last green run (40695796466) already had 30
+# rustc lines saying 1.99.1 and 8 saying 1.99.0, jobs disagreeing within one run.
+# 1.99.1 is what master was green on when this pin was made, chosen by Venus, who
+# owns this crate (macula-io/macula-rust#54).
+#
+# Every workflow runs `rustup show` in the checkout, which reads this file and
+# installs what it names, then `scripts/assert_toolchain.sh`, which fails unless
+# `rustc --version` is the version below. Do not name a toolchain in a workflow.
 [toolchain]
-channel = "stable"
-components = ["rustfmt", "clippy"]
+channel = "1.99.1"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
