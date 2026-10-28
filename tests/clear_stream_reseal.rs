@@ -12,6 +12,8 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{Mutex, MutexGuard};
+
 use common::TestStations;
 use macula_rust::cbor::Value;
 use macula_rust::frame::{StreamEncoding, StreamMode};
@@ -24,6 +26,17 @@ use macula_rust::station_link::{
     stream_handler, Confidentiality, Config, Link, LinkError, Offer, Seal, Served, Stream,
     StreamCall, StreamEvent, StreamHandler,
 };
+
+/// This file's tests take turns, a turn held until a test's stations are
+/// gone: each asserts that a stream is not stalled (a caller answered within
+/// seconds during a flood, 4 MiB through both ways), and run side by side on
+/// a CI runner's few cores, under llvm-cov, they starved each other past
+/// those guards and the harness deadline (#51). A guard measures its own
+/// test only.
+async fn one_at_a_time() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::const_new(());
+    TURN.lock().await
+}
 
 /// A link as a new node; with `keyring`, it advertises its key and, when
 /// `names_key`, names it in a sealed_required refusal.
@@ -157,6 +170,7 @@ async fn echo_first(stream: Stream) -> Result<(), String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_open_reseals_to_the_key_its_refusal_names() {
+    let _turn = one_at_a_time().await;
     for profile in [Profile::PqPure, Profile::PqHybrid] {
         let env = TestStations::start(profile);
         let keyring = Arc::new(Keyring::system(profile).unwrap());
@@ -183,6 +197,7 @@ async fn a_clear_open_reseals_to_the_key_its_refusal_names() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_client_stream_that_wrote_and_closed_replays_it_all_sealed() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqHybrid);
     let keyring = Arc::new(Keyring::system(env.profile).unwrap());
     let provider = node(&env, Some(keyring), true).await;
@@ -207,6 +222,7 @@ async fn a_clear_client_stream_that_wrote_and_closed_replays_it_all_sealed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_bidi_stream_whose_provider_waits_for_its_first_chunk_completes() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqPure);
     let keyring = Arc::new(Keyring::system(env.profile).unwrap());
     let provider = node(&env, Some(keyring), true).await;
@@ -230,6 +246,7 @@ async fn a_clear_bidi_stream_whose_provider_waits_for_its_first_chunk_completes(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stream_refusal_naming_no_key_stands_as_sealed_required() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqPure);
     let keyring = Arc::new(Keyring::system(env.profile).unwrap());
     let provider = node(&env, Some(keyring), false).await;
@@ -252,6 +269,7 @@ async fn a_stream_refusal_naming_no_key_stands_as_sealed_required() {
 /// stream and lose the refusal (macula-rust#42, Terra's finding from go#43).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_client_stream_that_wrote_hard_before_its_refusal_still_reseals() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqHybrid);
     let keyring = Arc::new(Keyring::system(env.profile).unwrap());
     let provider = node(&env, Some(keyring), true).await;
@@ -275,6 +293,7 @@ async fn a_clear_client_stream_that_wrote_hard_before_its_refusal_still_reseals(
 /// procedure on the same provider is answered meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_of_refused_opens_past_the_drain_places_does_not_stall_other_callers() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqPure);
     let keyring = Arc::new(Keyring::system(env.profile).unwrap());
     let provider = draining(&env, Some(keyring), true, 0).await;
@@ -345,6 +364,7 @@ async fn write_then_count(stream: Stream) -> Result<(), String> {
 /// sealed (Terra, from go#43's reader-takes-the-send-lock deadlock).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bidi_stream_whose_sides_both_write_4_mib_before_reading_completes() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqHybrid);
     for sealed in [false, true] {
         let keyring = Arc::new(Keyring::system(env.profile).unwrap());
@@ -404,6 +424,7 @@ async fn received(stream: &Stream) -> (usize, Value) {
 /// ended at once and what it sent was lost, though close() returned Ok.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_stream_closed_before_its_refusal_came_reaches_the_provider_sealed() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqPure);
     let keyring = Arc::new(Keyring::system(env.profile).unwrap());
     let provider = node(&env, Some(keyring), true).await;
@@ -439,6 +460,7 @@ async fn a_clear_stream_closed_before_its_refusal_came_reaches_the_provider_seal
 /// reset lost the end.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_clear_stream_that_sent_then_closed_is_delivered_and_close_returns_promptly() {
+    let _turn = one_at_a_time().await;
     let env = TestStations::start(Profile::PqPure);
     let provider = node(&env, None, false).await;
     let caller = node(&env, None, false).await;
