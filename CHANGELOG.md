@@ -32,10 +32,16 @@ usually touches both, but their version numbers don't move in lockstep.
   `removed` set that is absolute and refuses every epoch, and a live
   `membership` that a lookup which fails or times out answers
   `membership_unknown` rather than `not_a_member`. Refusals are the design's
-  five, named as macula's `group_keys_v1` vectors name them. `Epoch::fresh`,
-  `Epoch::following` and `Epoch::in_ahead_window` are public, and
-  `group::NoRandomness` is why a node whose randomness does not answer makes
-  no epoch.
+  five, named as macula's `group_keys_v1` vectors name them. Its epoch store
+  is bounded: `group::Caps` caps the groups one member may make a host hold,
+  the groups a host holds in all, and the epochs one group's chain holds, a
+  group nobody pulls releases what it held, and each cap names itself in the
+  failure (`group_capacity_member`, `group_capacity_total`, `epoch_capacity`)
+  rather than in the design's closed set of five, so a member retries a full
+  distributor instead of reading it as a reason.
+  `Epoch::fresh`, `Epoch::following` and `Epoch::in_ahead_window` are public,
+  and `group::NoRandomness` is why a node whose randomness does not answer
+  makes no epoch.
 
 ### [0.13.0] - 2026-10-28
 

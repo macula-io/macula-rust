@@ -26,8 +26,8 @@ mod keyring;
 mod wire;
 
 pub use distributor::{
-    Distributor, DistributorOptions, Membership, MembershipCheck, MembershipFuture, RemovedCheck,
-    DEFAULT_MEMBERSHIP_TIMEOUT, GROUP_KEYS_CAN,
+    Caps, Distributor, DistributorOptions, Membership, MembershipCheck, MembershipFuture,
+    RemovedCheck, DEFAULT_MEMBERSHIP_TIMEOUT, GROUP_KEYS_CAN,
 };
 pub use epoch::{
     for_publish, org_of, retain_live, under, Epoch, NoRandomness, NotAGroup,

@@ -39,6 +39,16 @@
 //! ([`Epoch`](super::Epoch)'s `Debug` redacts them). A refusal is one of the
 //! design's five, named exactly as every SDK names it: `not_a_member`,
 //! `membership_unknown`, `unknown_epoch`, `epoch_expired` and `unknown_group`.
+//!
+//! **The store is bounded.** A pull names a group, and any caller the org's
+//! grant admits may name a new one, so the epochs one host holds are what an
+//! admitted caller can make it grow. [`Caps`] holds it to a number of groups
+//! per member, a number of groups in all, and a number of epochs per group's
+//! chain; a group nobody pulls is dropped once no epoch of it is kept, so
+//! what it held comes back. Each cap names itself in the failure's detail
+//! (`group_capacity_member`, `group_capacity_total`, `epoch_capacity`) and
+//! none of them is one of the design's five, so a member reads a full
+//! distributor as a failed pull and retries, never as a reason to stop.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -111,12 +121,14 @@ pub struct DistributorOptions {
     pub membership_timeout: Duration,
     /// The application's removed set, absolute.
     pub removed: RemovedCheck,
+    /// The limits the epoch store is kept to.
+    pub caps: Caps,
 }
 
 impl DistributorOptions {
     /// The knobs for `org`'s groups answered under `policy`, with the default
-    /// rotation, the wall clock, the default membership timeout and nobody
-    /// removed.
+    /// rotation, the wall clock, the default membership timeout, nobody
+    /// removed and the default caps.
     pub fn new(org: &str, policy: Policy, membership: MembershipCheck) -> DistributorOptions {
         DistributorOptions {
             org: org.to_string(),
@@ -126,6 +138,42 @@ impl DistributorOptions {
             membership,
             membership_timeout: DEFAULT_MEMBERSHIP_TIMEOUT,
             removed: Arc::new(|_, _| false),
+            caps: Caps::default(),
+        }
+    }
+}
+
+/// The limits a distributor keeps its epoch store to, so no caller can make it
+/// hold more than it was sized for. All three are needed: the first two bound
+/// the prefixes, because a pull names one and any admitted caller may name a
+/// new one; the third bounds one group's chain.
+///
+/// A refusal from one of them is not a refusal of the design's: it names
+/// itself in the `handler_error`'s detail (`group_capacity_member`,
+/// `group_capacity_total`, `epoch_capacity`), so a member reads it as a failed
+/// pull and retries rather than as one of the five reasons, and an operator
+/// sees which limit was reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caps {
+    /// How many prefixes one caller may cause the distributor to hold.
+    pub per_member: usize,
+    /// How many prefixes the distributor holds at all.
+    pub total: usize,
+    /// How many epochs one group's chain holds.
+    ///
+    /// A chain holds about `(65 + 5) minutes / rotate_after` epochs plus two,
+    /// so the default carries a rotation of about 35 seconds and longer. A
+    /// host rotating faster than that raises this and owns the memory: a chain
+    /// is at most this many keys, and a distributor at most `total` of them.
+    pub epochs: usize,
+}
+
+impl Default for Caps {
+    fn default() -> Caps {
+        Caps {
+            per_member: 64,
+            total: 1024,
+            epochs: 128,
         }
     }
 }
@@ -146,7 +194,132 @@ struct Inner {
     membership: MembershipCheck,
     membership_timeout: Duration,
     removed: RemovedCheck,
-    groups: Mutex<HashMap<String, Vec<Epoch>>>,
+    groups: Mutex<Chains>,
+    caps: Caps,
+}
+
+/// The groups a distributor holds: each one's chain of epochs and the caller
+/// that made it, and how many prefixes each caller holds.
+#[derive(Default)]
+struct Chains {
+    chains: HashMap<String, Chain>,
+    held_by: HashMap<[u8; 32], usize>,
+}
+
+/// One group's chain, and the caller whose pull made the group be held.
+struct Chain {
+    epochs: Vec<Epoch>,
+    made_by: [u8; 32],
+}
+
+impl Chains {
+    /// The group's epochs still kept at `now`, without what is no longer kept.
+    fn kept_of(&self, prefix: &str, now: i64, rotation: i64) -> Vec<Epoch> {
+        match self.chains.get(prefix) {
+            Some(chain) => kept(&chain.epochs, now, rotation),
+            None => Vec::new(),
+        }
+    }
+
+    /// The epochs the store holds for the group, as they are: the tests hold
+    /// the store to its caps and to its erasures with it.
+    #[cfg(test)]
+    fn stored(&self, prefix: &str) -> Vec<Epoch> {
+        match self.chains.get(prefix) {
+            Some(chain) => chain.epochs.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Holds `epochs` for `prefix`, charging `caller` for a group it did not
+    /// hold yet. The groups with no epoch kept at `now` are released first, so
+    /// an idle host's capacity comes back.
+    fn hold(
+        &mut self,
+        prefix: &str,
+        epochs: Vec<Epoch>,
+        caller: [u8; 32],
+        caps: &Caps,
+        now: i64,
+        rotation: i64,
+    ) -> Result<(), Capacity> {
+        if let Some(chain) = self.chains.get_mut(prefix) {
+            chain.epochs = epochs;
+            return Ok(());
+        }
+        self.release(now, rotation);
+        let held = self.held_by.get(&caller).copied().unwrap_or(0);
+        if held >= caps.per_member {
+            return Err(Capacity::PerMember);
+        }
+        if self.chains.len() >= caps.total {
+            return Err(Capacity::Total);
+        }
+        self.held_by.insert(caller, held + 1);
+        self.chains.insert(
+            prefix.to_string(),
+            Chain {
+                epochs,
+                made_by: caller,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drops the groups no epoch of which is kept at `now` any more, and what
+    /// their callers were charged for them.
+    fn release(&mut self, now: i64, rotation: i64) {
+        let idle: Vec<String> = self
+            .chains
+            .iter()
+            .filter(|(_, chain)| !chain.epochs.iter().any(|e| kept_at(e, now, rotation)))
+            .map(|(prefix, _)| prefix.clone())
+            .collect();
+        for prefix in idle {
+            self.release_one(&prefix);
+        }
+    }
+
+    /// Drops one group's chain, and the charge its maker held for it.
+    fn release_one(&mut self, prefix: &str) {
+        let Some(made_by) = self.chains.remove(prefix).map(|chain| chain.made_by) else {
+            return;
+        };
+        self.uncharge(made_by);
+    }
+
+    /// Takes one prefix off what `caller` is charged for.
+    fn uncharge(&mut self, caller: [u8; 32]) {
+        let held = self.held_by.get(&caller).copied().unwrap_or(1);
+        match held.saturating_sub(1) {
+            0 => self.held_by.remove(&caller),
+            left => self.held_by.insert(caller, left),
+        };
+    }
+}
+
+/// Which limit refused a pull: one of a distributor's own, none of them one of
+/// the design's five refusals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Capacity {
+    /// The caller holds as many prefixes as one member may.
+    PerMember,
+    /// The distributor holds as many prefixes as it is sized for.
+    Total,
+    /// The group's chain would hold more epochs than it is sized for.
+    Epochs,
+}
+
+impl Capacity {
+    /// The name the failure carries, which a member reads as a failed pull
+    /// rather than as a refusal.
+    fn detail(self) -> &'static str {
+        match self {
+            Capacity::PerMember => "group_capacity_member",
+            Capacity::Total => "group_capacity_total",
+            Capacity::Epochs => "epoch_capacity",
+        }
+    }
 }
 
 /// Why a pull was not answered, as the design names it (section 5): exactly
@@ -185,11 +358,13 @@ impl Refusal {
     }
 }
 
-/// Why a pull has no answer: one of the design's refusals, or this node's own
-/// randomness not answering, which is no refusal of the design's and which a
-/// member retries as a failed pull.
+/// Why a pull has no answer: one of the design's refusals, one of this
+/// distributor's own limits, or this node's own randomness not answering.
+/// None but the first is a refusal of the design's, so a member retries those
+/// as a failed pull rather than being told it is out of the group.
 enum Unanswered {
     Refused(Refusal),
+    Capacity(Capacity),
     NoRandomness(NoRandomness),
 }
 
@@ -200,6 +375,7 @@ impl Unanswered {
     fn detail(&self) -> String {
         match self {
             Unanswered::Refused(refusal) => refusal.name().to_string(),
+            Unanswered::Capacity(capacity) => capacity.detail().to_string(),
             Unanswered::NoRandomness(cause) => cause.to_string(),
         }
     }
@@ -208,6 +384,12 @@ impl Unanswered {
 impl From<Refusal> for Unanswered {
     fn from(refusal: Refusal) -> Unanswered {
         Unanswered::Refused(refusal)
+    }
+}
+
+impl From<Capacity> for Unanswered {
+    fn from(capacity: Capacity) -> Unanswered {
+        Unanswered::Capacity(capacity)
     }
 }
 
@@ -230,7 +412,8 @@ impl Distributor {
                 membership: opts.membership,
                 membership_timeout: opts.membership_timeout,
                 removed: opts.removed,
-                groups: Mutex::new(HashMap::new()),
+                groups: Mutex::new(Chains::default()),
+                caps: opts.caps,
             }),
         }
     }
@@ -270,7 +453,9 @@ impl Distributor {
         self.admit(&prefix, request.caller).await?;
         let now = (self.inner.now)();
         let reply = match request.payload.get("epoch") {
-            Some(Value::Text(current)) if current == "current" => self.current(&prefix, now)?,
+            Some(Value::Text(current)) if current == "current" => {
+                self.current(&prefix, request.caller, now)?
+            }
             Some(Value::Bytes(id)) => self.past(&prefix, id, now)?,
             _ => Err(Refusal::UnknownEpoch)?,
         };
@@ -310,13 +495,21 @@ impl Distributor {
     /// the epochs list the current one and the next. The ones no longer kept
     /// are dropped here, so an epoch key is erased once no event under it can
     /// be accepted any more.
-    fn current(&self, prefix: &str, now: i64) -> Result<Reply, Unanswered> {
+    ///
+    /// The chain is kept to [`Caps::epochs`]: a pull that would grow it past
+    /// that is answered `epoch_capacity` and the store is left as it was, so
+    /// no chain outgrows what the distributor was sized for.
+    fn current(&self, prefix: &str, caller: [u8; 32], now: i64) -> Result<Reply, Unanswered> {
         let rotation = self.inner.rotate_after_ms;
+        let caps = self.inner.caps;
         let mut groups = self.lock();
-        let kept = kept(&groups.remove(prefix).unwrap_or_default(), now, rotation);
-        let epochs = ahead(advanced(kept, now, rotation)?, now, rotation)?;
+        let held = groups.kept_of(prefix, now, rotation);
+        let epochs = ahead(advanced(held, now, rotation)?, now, rotation)?;
+        if epochs.len() > caps.epochs {
+            return Err(Capacity::Epochs.into());
+        }
         let Some(current) = for_publish(&epochs, now).cloned() else {
-            groups.insert(prefix.to_string(), epochs);
+            groups.hold(prefix, epochs, caller, &caps, now, rotation)?;
             // Only a clock that went backwards leaves no epoch covering
             // `now`: no epoch of this group is issued yet, which is the
             // truth a pull is answered with.
@@ -327,9 +520,9 @@ impl Distributor {
             .filter(|epoch| epoch.issued_at == current.publish_until)
             .cloned()
             .collect::<Vec<_>>();
+        groups.hold(prefix, epochs, caller, &caps, now, rotation)?;
         let mut answered = vec![current];
         answered.extend(issued_with);
-        groups.insert(prefix.to_string(), epochs);
         Ok(self.reply(prefix, answered))
     }
 
@@ -340,8 +533,8 @@ impl Distributor {
     fn past(&self, prefix: &str, id: &[u8], now: i64) -> Result<Reply, Unanswered> {
         let rotation = self.inner.rotate_after_ms;
         let groups = self.lock();
-        let held = groups.get(prefix).map(Vec::as_slice).unwrap_or_default();
-        let Some(epoch) = kept(held, now, rotation)
+        let Some(epoch) = groups
+            .kept_of(prefix, now, rotation)
             .into_iter()
             .find(|epoch| epoch.id.as_slice() == id)
         else {
@@ -363,7 +556,7 @@ impl Distributor {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Vec<Epoch>>> {
+    fn lock(&self) -> MutexGuard<'_, Chains> {
         self.inner
             .groups
             .lock()
@@ -424,13 +617,18 @@ fn ahead(epochs: Vec<Epoch>, now: i64, rotation: i64) -> Result<Vec<Epoch>, NoRa
     }
 }
 
-/// The group's epochs still kept at `now`: until acceptance, plus one rotation
-/// past it, so a pull of one that is no longer accepted is answered
+/// Whether an epoch is still kept at `now`: until acceptance, plus one
+/// rotation past it, so a pull of one that is no longer accepted is answered
 /// `epoch_expired` for that while rather than `unknown_epoch`.
+fn kept_at(epoch: &Epoch, now: i64, rotation: i64) -> bool {
+    now <= epoch.accept_until + TOLERANCE_MS + rotation
+}
+
+/// The group's epochs still kept at `now`.
 fn kept(epochs: &[Epoch], now: i64, rotation: i64) -> Vec<Epoch> {
     epochs
         .iter()
-        .filter(|epoch| now <= epoch.accept_until + TOLERANCE_MS + rotation)
+        .filter(|epoch| kept_at(epoch, now, rotation))
         .cloned()
         .collect()
 }
@@ -531,8 +729,17 @@ mod tests {
 
     /// One pull, through the handler the pool would serve.
     async fn pull(distributor: &Distributor, payload: Value) -> Result<Value, String> {
+        pull_as(distributor, CALLER, payload).await
+    }
+
+    /// One pull, by `caller`.
+    async fn pull_as(
+        distributor: &Distributor,
+        caller: [u8; 32],
+        payload: Value,
+    ) -> Result<Value, String> {
         let request = Request {
-            caller: CALLER,
+            caller,
             realm: REALM,
             procedure: distributor.procedure(),
             payload,
@@ -544,6 +751,32 @@ mod tests {
         distributor.handler()(request).await
     }
 
+    /// A pull of another group of this org, by `caller`.
+    async fn pull_group(
+        distributor: &Distributor,
+        caller: [u8; 32],
+        name: &str,
+    ) -> Result<Value, String> {
+        pull_as(distributor, caller, current_request(&group(name))).await
+    }
+
+    /// Another group of this org, by its name.
+    fn group(name: &str) -> String {
+        format!("io.macula/{ORG}/{name}")
+    }
+
+    /// The group `name`'s current epoch.
+    async fn epoch_of(distributor: &Distributor, caller: [u8; 32], name: &str) -> Epoch {
+        let answered = pull_group(distributor, caller, name)
+            .await
+            .expect("the distributor answers");
+        let prefix = group(name);
+        parse_reply(&prefix, &answered)
+            .expect("the protocol's reply")
+            .epochs[0]
+            .clone()
+    }
+
     /// A pull of the group's current epoch.
     async fn current(distributor: &Distributor) -> Result<Reply, String> {
         let answered = pull(distributor, current_request(&prefix())).await?;
@@ -552,11 +785,7 @@ mod tests {
 
     /// The group's current epoch, which a test then hands around.
     async fn epoch_now(distributor: &Distributor) -> Epoch {
-        current(distributor)
-            .await
-            .expect("the distributor answers")
-            .epochs[0]
-            .clone()
+        epoch_of(distributor, CALLER, "chat").await
     }
 
     /// A pull of one epoch by id.
@@ -870,7 +1099,113 @@ mod tests {
     /// The epochs the distributor holds for this group.
     fn stored(distributor: &Distributor) -> Vec<Epoch> {
         let groups = distributor.lock();
-        groups.get(&prefix()).cloned().unwrap_or_default()
+        groups.stored(&prefix())
+    }
+
+    /// One member may not take the distributor's whole table: past its own cap
+    /// a new group is refused, a group it already holds costs nothing more,
+    /// and another member still has room of its own.
+    #[tokio::test]
+    async fn a_member_holds_no_more_groups_than_its_cap() {
+        let (mut opts, clock) = options(START);
+        opts.caps = Caps {
+            per_member: 2,
+            total: 4,
+            epochs: 128,
+        };
+        let distributor = distributor_of(opts, &clock);
+        assert!(pull_group(&distributor, CALLER, "one").await.is_ok());
+        assert!(
+            pull_group(&distributor, CALLER, "one").await.is_ok(),
+            "a group it already holds is not charged again"
+        );
+        assert!(pull_group(&distributor, CALLER, "two").await.is_ok());
+        assert_eq!(
+            pull_group(&distributor, CALLER, "three").await,
+            Err("group_capacity_member".into())
+        );
+        assert!(
+            pull_group(&distributor, OTHER, "three").await.is_ok(),
+            "another member's own room"
+        );
+    }
+
+    /// The distributor holds no more groups than it is sized for, whoever asks
+    /// for them.
+    #[tokio::test]
+    async fn the_distributor_holds_no_more_groups_than_its_cap() {
+        let (mut opts, clock) = options(START);
+        opts.caps = Caps {
+            per_member: 4,
+            total: 2,
+            epochs: 128,
+        };
+        let distributor = distributor_of(opts, &clock);
+        assert!(pull_group(&distributor, CALLER, "one").await.is_ok());
+        assert!(pull_group(&distributor, OTHER, "two").await.is_ok());
+        assert_eq!(
+            pull_group(&distributor, OTHER, "three").await,
+            Err("group_capacity_total".into())
+        );
+    }
+
+    /// A group nobody has pulled since its last epoch stopped being kept gives
+    /// its room back, so a host that has served many groups over time is not
+    /// full of the ones it served first.
+    #[tokio::test]
+    async fn an_idle_group_releases_the_room_it_held() {
+        let (mut opts, clock) = options(START);
+        opts.caps = Caps {
+            per_member: 1,
+            total: 8,
+            epochs: 128,
+        };
+        let distributor = distributor_of(opts, &clock);
+        assert!(pull_group(&distributor, CALLER, "one").await.is_ok());
+        assert_eq!(
+            pull_group(&distributor, CALLER, "two").await,
+            Err("group_capacity_member".into())
+        );
+
+        let idle = epoch_of(&distributor, CALLER, "one").await;
+        clock.store(
+            idle.accept_until + TOLERANCE_MS + ROTATION + 1,
+            Ordering::SeqCst,
+        );
+        assert!(
+            pull_group(&distributor, CALLER, "two").await.is_ok(),
+            "the idle group gave its room back"
+        );
+        assert!(
+            stored(&distributor).len() <= 1,
+            "and was dropped, not kept beside the new one"
+        );
+    }
+
+    /// A chain that would grow past its cap is refused, and the store keeps
+    /// what it had: no group's chain outgrows what the distributor was sized
+    /// for, and the epoch members hold is still the one it answers with.
+    #[tokio::test]
+    async fn a_chain_past_its_cap_is_refused() {
+        let (mut opts, clock) = options(START);
+        opts.caps = Caps {
+            per_member: 4,
+            total: 8,
+            epochs: 1,
+        };
+        let distributor = distributor_of(opts, &clock);
+        let first = epoch_now(&distributor).await;
+        assert_eq!(stored(&distributor).len(), 1);
+
+        clock.store(first.ahead_window().0, Ordering::SeqCst);
+        assert_eq!(
+            current(&distributor).await,
+            Err("epoch_capacity".into()),
+            "the ahead epoch would be a second"
+        );
+        let still = stored(&distributor);
+        assert_eq!(still.len(), 1, "the store keeps what it had");
+        assert_eq!(still[0].id, first.id, "and the epoch members hold");
     }
 
     /// An id the distributor does not hold, and an `epoch` field that is
