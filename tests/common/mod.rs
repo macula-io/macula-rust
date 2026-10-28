@@ -32,7 +32,9 @@ pub struct TestStations {
     pub stations: Vec<TestStation>,
     pub realm_id: [u8; 32],
     pub realm_key: Vec<u8>,
+    pub realm_name: String,
     pub org: String,
+    pub org_key_id: [u8; 32],
     child: Child,
     io: Mutex<(ChildStdin, BufReader<ChildStdout>)>,
     _deadline: Deadline,
@@ -71,7 +73,9 @@ impl TestStations {
             stations,
             realm_id: id(&info["realm_id"]),
             realm_key: hex::decode(info["realm_key"].as_str().unwrap()).unwrap(),
+            realm_name: info["realm_name"].as_str().unwrap().to_string(),
             org: info["org"].as_str().unwrap().to_string(),
+            org_key_id: id(&info["org_key_id"]),
             child,
             io: Mutex::new((stdin, stdout)),
             _deadline: Deadline::arm(),
@@ -93,6 +97,15 @@ impl TestStations {
     pub fn admit(&self, node_id: &[u8; 32]) {
         let reply = self.ask(&format!("admit {}", hex::encode(node_id)));
         assert!(reply.starts_with("admitted"), "{reply}");
+    }
+
+    /// The org's group_keys grant for `node_id`, a UCAN living an hour.
+    pub fn grant(&self, node_id: &[u8; 32]) -> String {
+        let reply = self.ask(&format!("grant {}", hex::encode(node_id)));
+        reply
+            .strip_prefix("grant ")
+            .unwrap_or_else(|| panic!("{reply}"))
+            .to_string()
     }
 
     /// How many streams the stations relay now.

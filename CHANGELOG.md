@@ -15,6 +15,16 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Added
+
+- **A group's rotation, proven live** (macula-rust#52): `tests/group_rotation.rs`
+  serves a `group::Distributor` at a one-second `rotate_after_ms` (with
+  `Caps::epochs` raised to `chain_bound(1000)`), and two members keep
+  sealing and opening the group's events across two rotations, end to end over
+  the teststation. Nothing new in the API: a member reads its rotation from the
+  epochs the distributor hands out, so an embedder that wants a faster
+  rotation sets it on its distributor.
+
 ### [0.14.0] - 2026-10-28
 
 #### Added
