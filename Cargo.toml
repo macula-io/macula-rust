@@ -118,3 +118,10 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 # Test-only, transport.rs's own tests: the stations the dialler must refuse
 # are built from aws-lc-rs's own groups.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+# Dependencies build optimised in dev and test: every stream frame is signed
+# with ML-DSA (and RSA-PSS-4096 on pq_hybrid), and an unoptimised signer made
+# the 4 MiB stream tests run past the harness deadline under llvm-cov (#51).
+# This crate stays at opt-level 0, so its coverage is measured as written.
+[profile.dev.package."*"]
+opt-level = 2
