@@ -15,6 +15,8 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.14.0] - 2026-10-28
+
 #### Added
 
 - **A sealed group's distributor** (macula-rust#46, macula's
