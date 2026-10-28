@@ -843,6 +843,9 @@ fn answered(
         .ok()
         .and_then(|_| cbor::encode(&payload).ok());
     let Some(plain) = plain else {
+        // Nothing was sealed, so the payload never reaches the wipe below and
+        // is freed as it stands: the handler's bytes go with it.
+        payload.zeroize_bytes();
         return sealed_error(signer, request, sealing, CODE_UNSENDABLE, None);
     };
     // Both the payload and its encoding carry whatever the handler made —

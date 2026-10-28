@@ -37,7 +37,9 @@
 //!   The pulls in flight share one lookup per group and caller, and past
 //!   [`MAX_LOOKUPS`] of them a pull is `membership_unknown` rather than one
 //!   more: one caller cannot put every other member's pulls behind an
-//!   unbounded queue of lookups.
+//!   unbounded queue of lookups. A caller's own share of that bound is
+//!   [`MAX_LOOKUPS_PER_CALLER`], because a node names as many groups as it
+//!   likes and a group it names need not exist for the lookup to be run.
 //!
 //! A pull names the group (`prefix`) and the epoch: `current`, or a past one
 //! by its 8-byte id. The reply carries the group's policy and the epochs: the
@@ -110,6 +112,18 @@ pub const DEFAULT_MEMBERSHIP_TIMEOUT: Duration = Duration::from_secs(12);
 /// have every other member's pulls waiting on lookups behind them. Past it a
 /// pull is answered `membership_unknown` and retried.
 pub const MAX_LOOKUPS: usize = 64;
+
+/// The most membership lookups one caller may have in flight at once,
+/// `MAX_LOOKUPS / 8`. [`MAX_LOOKUPS`] bounds the distributor; this bounds any
+/// one node's share of it, because a caller asks about as many *groups* as it
+/// can name, and naming a group the org does not have costs it nothing —
+/// membership is read before a group is held, so the prefixes need not exist.
+/// Without this cap one node takes all [`MAX_LOOKUPS`] slots by pulling eight
+/// dozen invented prefixes, and every other member waits behind them for the
+/// length of a membership check, told `membership_unknown`. At its cap a
+/// caller is answered `membership_unknown` like one past [`MAX_LOOKUPS`]: the
+/// same answer, retried, never a refusal that reads as absence.
+pub const MAX_LOOKUPS_PER_CALLER: usize = MAX_LOOKUPS / 8;
 
 /// The longest rotation a distributor serves: a day of publishing. An epoch's
 /// times are added to the distributor's clock, so `issued_at + rotation` and
@@ -381,7 +395,8 @@ struct Inner {
     /// anything, and started again if the runtime it ran on has ended.
     sweeper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The membership lookups in flight, one per group and caller, at most
-    /// [`MAX_LOOKUPS`] of them.
+    /// [`MAX_LOOKUPS`] of them and at most [`MAX_LOOKUPS_PER_CALLER`] for any
+    /// one caller.
     lookups: Mutex<InFlight>,
 }
 
@@ -1040,8 +1055,9 @@ impl Distributor {
 
     /// The caller's membership of `prefix`, read at most once for the pulls in
     /// flight: the pull that finds no lookup runs it and the others wait on the
-    /// same answer, and past [`MAX_LOOKUPS`] in flight a pull is
-    /// `membership_unknown` rather than one more lookup.
+    /// same answer, and past [`MAX_LOOKUPS`] in flight, or past this caller's
+    /// [`MAX_LOOKUPS_PER_CALLER`], a pull is `membership_unknown` rather than
+    /// one more lookup.
     async fn membership_of(&self, prefix: &str, caller: [u8; 32]) -> Membership {
         let key = (prefix.to_string(), caller);
         match self.claim_lookup(&key) {
@@ -1051,13 +1067,17 @@ impl Distributor {
         }
     }
 
-    /// The lookup this pull runs, waits on, or has no room for.
+    /// The lookup this pull runs, waits on, or has no room for: one lookup
+    /// per group and caller, at most [`MAX_LOOKUPS`] in all and at most
+    /// [`MAX_LOOKUPS_PER_CALLER`] for the caller asking.
     fn claim_lookup(&self, key: &(String, [u8; 32])) -> Claim {
         let mut lookups = self.inner.lookups();
         if let Some(lookup) = lookups.get(key) {
             return Claim::Waits(Arc::clone(lookup));
         }
-        if lookups.len() >= MAX_LOOKUPS {
+        let full = lookups.len() >= MAX_LOOKUPS
+            || lookups.keys().filter(|(_, held)| *held == key.1).count() >= MAX_LOOKUPS_PER_CALLER;
+        if full {
             return Claim::Refused;
         }
         let lookup = Arc::new(Lookup::new());
@@ -1718,8 +1738,18 @@ mod tests {
         distributor: &Distributor,
         caller: [u8; 32],
     ) -> tokio::task::JoinHandle<Result<Value, String>> {
+        spawned_group_pull(distributor, caller, "chat")
+    }
+
+    /// One pull of the group `name`, by `caller`, spawned so its future runs
+    /// beside another's.
+    fn spawned_group_pull(
+        distributor: &Distributor,
+        caller: [u8; 32],
+        name: &str,
+    ) -> tokio::task::JoinHandle<Result<Value, String>> {
         let distributor = distributor.clone();
-        let payload = current_request(&prefix());
+        let payload = current_request(&group(name));
         tokio::spawn(async move { pull_as(&distributor, caller, payload).await })
     }
 
@@ -1766,6 +1796,51 @@ mod tests {
             .filter(|answer| **answer == Err(MEMBERSHIP_UNKNOWN.into()))
             .count();
         assert_eq!(unknown, 1, "and was answered membership_unknown");
+    }
+
+    /// One caller cannot take the distributor's whole allowance: its lookups
+    /// are capped per caller as well as in all, so a caller holding its cap
+    /// across groups it invented leaves the other members their room. Naming a
+    /// group costs nothing — membership is read before any group is held — so
+    /// without this the total bound is no bound against one node.
+    #[tokio::test]
+    async fn one_caller_cannot_take_every_lookup() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Notify::new());
+        let (mut opts, clock) = options(START);
+        opts.membership_timeout = Duration::from_secs(30);
+        opts.membership = counted_and_held(&started, &open, &gate);
+        let distributor = distributor_of(opts, &clock);
+        let greedy: Vec<_> = (0..MAX_LOOKUPS_PER_CALLER)
+            .map(|n| spawned_group_pull(&distributor, CALLER, &invented(n)))
+            .collect();
+        wait_until(|| started.load(Ordering::SeqCst) == MAX_LOOKUPS_PER_CALLER).await;
+        let over = spawned_group_pull(&distributor, CALLER, &invented(MAX_LOOKUPS_PER_CALLER));
+        let other = spawned_group_pull(&distributor, OTHER, "chat");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(over.is_finished(), "the caller past its cap ran no lookup");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            MAX_LOOKUPS_PER_CALLER + 1,
+            "and another caller's pull still ran its own"
+        );
+        open.store(true, Ordering::SeqCst);
+        gate.notify_waiters();
+        let refused = futures_answers(vec![over]).await;
+        assert_eq!(refused[0], Err(MEMBERSHIP_UNKNOWN.into()));
+        let mut ran = greedy;
+        ran.push(other);
+        let held = futures_answers(ran).await;
+        assert!(
+            held.iter().all(Result::is_ok),
+            "every lookup that ran is answered: {held:?}"
+        );
+    }
+
+    /// A group `n` of this org that no test otherwise names.
+    fn invented(n: usize) -> String {
+        format!("invented{n}")
     }
 
     /// Waits for `done` to hold, letting the tasks that make it hold run.

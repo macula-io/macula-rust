@@ -47,7 +47,10 @@ usually touches both, but their version numbers don't move in lockstep.
   removed set is asked again once the answer is back. The pulls in flight share
   one membership lookup per group and caller, and past `group::MAX_LOOKUPS` of
   them a pull is `membership_unknown` rather than one more, so one caller
-  cannot starve every other member's pulls. The handler refuses a pull that did
+  cannot starve every other member's pulls; a single caller is held to
+  `group::MAX_LOOKUPS_PER_CALLER` of those, because a node names as many groups
+  as it likes and naming one costs it nothing — membership is read before a
+  group is held, so the group need not exist. The handler refuses a pull that did
   not arrive sealed (`sealed_required`) itself, whatever offer it is served
   under. `Distributor::new` refuses the knobs that would leave it answering at
   first and unable afterwards: a rotation outside one millisecond to
