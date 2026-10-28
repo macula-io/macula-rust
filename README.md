@@ -71,7 +71,7 @@ Swift. The core crate has no FFI dependency and no FFI-shaped types.
 
 ```toml
 [dependencies]
-macula-rust = "0.12"
+macula-rust = "0.13"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -190,7 +190,7 @@ compatibility layer.
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
 | Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links; `subscribe` returns once the station has acknowledged the SUBSCRIBE (REGISTER_ACK), so a publication sent after it is heard |
-| End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; `call_report` and `Stream::report` give the caller's seal report |
+| End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; a clear call or stream refused `sealed_required` with the provider's signed `seal.kem_key` is sealed once more to that key (release A0 of `DESIGN_E2E_SEALED_BY_DEFAULT.md`, on a bare link too); `call_report` and `Stream::report` give the caller's seal report |
 | UCAN (`ucan`, `Call::token`, `Offer::policy`) | ✅ | ✅ | macula 12's tokens (D7) in the node's profile: `ucan::create` mints, a call or open presents a token and its chain's proofs, and an `Offer` gated on `Policy::UcanRequired` or `RealmMemberRequired` refuses what `ucan::authorize` does not accept `unauthorized` (a stray proof `malformed_frame`) before its handler runs; held to macula v13.6.0's `ucan_v1.json` |
 | Sealed groups (`group`, `join_group`, `publish_group`, `subscribe_group`) | ✅ | — | The member side of sealed pubsub (macula 13.2, `DESIGN_E2E_SEALED_PUBSUB.md`): a group is a topic prefix whose events are sealed once under its current epoch key, which the org's distributor hands out over a sealed call to a member holding the org's grant; epochs are re-pulled at a random instant in the ahead window and erased once no event under them is accepted, and keys never touch disk. Held to macula's `group_keys_v1` payloads byte for byte, the org's grant to macula's own verdicts, and a cross-test with macula's `macula_group_keys` distributor. This crate serves no distributor. A clear event under a *required* group is refused; under any other policy it is delivered as it arrives, so a subscriber that needs every event sealed checks `Event::seal_key_id` itself |
 | Node-served content (`share_content`, `unshare_content`, `get_content`) | ✅ | ✅ | Shared on the node's own `~<node_id>/content_v1` and announced; a fetch checks the block, the manifest and every chunk against the content id, bounded (`ContentOptions`), with no realm key; manifests match macula's byte for byte (`manifest`) |

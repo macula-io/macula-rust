@@ -15,8 +15,71 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.13.0] - 2026-10-28
+
+Release A0 of sealed by default (macula#135, `DESIGN_E2E_SEALED_BY_DEFAULT.md`
+§3 and §8 step 1): the reading side only. A caller recovers by resealing to the
+key a provider names in its signed `sealed_required` refusal, so once providers
+go required (release A) a running caller is not left failing on a stale keyless
+advertisement. No node built on this release sends `seal.kem_key` unless a test
+asks it to, and no default changes.
+
+#### Added
+
+- **A clear call refused `sealed_required` with the provider's signed key is
+  sealed once more to that key** (macula-rust#42). The refusal's ERROR carries
+  the non-critical tbs extension `seal.kem_key`
+  (`frame::SEAL_KEM_KEY_EXT`, read into `VerifiedReply::kem_key`); the link
+  checks the key's length against the profile and seals the same payload to it
+  under a new request id, within the same timeout, on a bare `Link`, a direct
+  dial and an explicit target alike, at most once per call.
+  `Link::call_resealing` returns
+  `Called`, the outcome and the key it resealed to; the pool writes that key
+  into the provider's remembered candidate, where it beats the candidate's
+  keyless advertisement for that advertisement's lifetime. A refusal without
+  the extension, or with a key of the wrong length, is `sealed_required` as
+  before.
+- **A clear stream refused `sealed_required` with the provider's key reopens
+  sealed behind the same handle.** A clear open still sends every owner action
+  at once and keeps an ordered copy of what it sent (chunks and the owner's
+  STREAM_END) until the provider's first frame; on a refusal naming a key
+  (`VerifiedStreamFrame::kem_key`) the stream reopens sealed under a new request
+  id, replays the copy numbered from 0, then the queued actions, in order. Any
+  other first frame ends the copy; past the inbox bound (16 MiB default) it is
+  dropped and a later refusal is `sealed_required`. Writes are never held, so a
+  clear client stream or bidi whose provider waits for the caller's data still
+  completes.
+- Provider side, for tests until release A makes it the rule:
+  `frame::sign_sealed_required` and `sign_stream_sealed_required` sign a refusal
+  carrying the keyring's current key, and `station_link::Config`'s
+  `refusal_names_key` turns that on for a serving link. Its `refusal_drains`
+  (default 16) caps the streams a link drains at once after such a refusal, a
+  quarter of them, at least one, per caller.
+- Tests against macula's `sealed_required` refusal vectors naming the KEM key,
+  per profile, and in-process ones for the call, the stream replay, the
+  waiting-provider stream and the explicit target, which hold under CI-runner
+  load.
+
+#### Security
+
+- Three transitive dependencies past their advisories, lockfile only:
+  `ctutils` 0.4.6 for RUSTSEC-2026-0385 (non-constant-time mask generation
+  and u128 comparisons, under `sha2` and the keyring's `hmac`/`hkdf`),
+  `rustls-webpki` 0.103.16 for RUSTSEC-2026-0382 (a chain through a distrusted
+  intermediate) and `webpki-root-certs` 1.0.10 for RUSTSEC-2026-0383.
+
+#### Changed
+
+- `frame::act_on_ext` takes the extensions known in that object, and
+  `frame::ext_value` reads one; `seal.kem_key` is known in those two refusals
+  only, and anywhere else is an unknown extension.
+
 #### Fixed
 
+- A `sealed_required` refusal drains the caller's writes and is counted before
+  it goes out, and a write waiting on a peer that reads no more gives way. A
+  provider's handler reads what its caller sent before closing (#45), and a
+  draining handler keeps its session place and inbox charge until it returns.
 - The README's Rust examples compile against the crate: they are doctests now
   (`ReadmeDoctests` in `src/lib.rs`, under `cfg(doctest)` only), so `cargo test`
   in CI and before every publish fails when one stops building
@@ -909,6 +972,16 @@ did, but the two have moved at different paces ever since).
 
 
 ### [Unreleased]
+
+### [ffi-0.11.0] - 2026-10-28
+
+#### Changed
+
+- Built on `macula-rust` 0.13.0, release A0 of sealed by default: a clear call
+  or stream the provider refuses `sealed_required` with its signed key is
+  sealed once more to that key inside the core crate, so a binding's call
+  reaches a provider that has gone required. The FFI surface is unchanged; a
+  refusal that names no key is still `sealed_required`.
 
 ### [ffi-0.10.0] - 2026-10-14
 
