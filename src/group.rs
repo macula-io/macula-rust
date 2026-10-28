@@ -6,8 +6,9 @@
 //! `macula_group_epoch`, `macula_group_event`, `macula_group_keyring` and
 //! `macula_group_keys`: epochs and their times, sealing and opening an event,
 //! the pull's payloads, the keyring a node holds its groups' epochs in, and the
-//! distributor that serves them. Epoch keys are held in memory only, erased
-//! when no event under them can be accepted any more, and never printed.
+//! distributor that serves them. Epoch keys are held in memory only, erased as
+//! soon as no event under them can be accepted any more — on the distributor's
+//! own clock, not at the group's next pull — and never printed.
 //!
 //! [`Keyring`] is the member side, behind [`Pool::join_group`], and
 //! [`Distributor`] is the other half, served through [`Pool::serve`] with
@@ -26,8 +27,8 @@ mod keyring;
 mod wire;
 
 pub use distributor::{
-    Caps, Distributor, DistributorOptions, Membership, MembershipCheck, MembershipFuture,
-    RemovedCheck, DEFAULT_MEMBERSHIP_TIMEOUT, GROUP_KEYS_CAN,
+    chain_bound, Caps, Distributor, DistributorOptions, Membership, MembershipCheck,
+    MembershipFuture, Misconfigured, RemovedCheck, DEFAULT_MEMBERSHIP_TIMEOUT, GROUP_KEYS_CAN,
 };
 pub use epoch::{
     for_publish, org_of, retain_live, under, Epoch, NoRandomness, NotAGroup,

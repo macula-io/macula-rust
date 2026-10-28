@@ -49,11 +49,30 @@
 //! (`too_many_groups_member`, `too_many_groups`, `too_many_epochs`) and
 //! none of them is one of the design's five, so a member reads a full
 //! distributor as a failed pull and retries, never as a reason to stop.
+//!
+//! **A key is erased as soon as no event under it can be accepted**, and not
+//! at the group's next pull: an epoch past its acceptance keeps only its id,
+//! so a pull of it is still answered `epoch_expired` rather than
+//! `unknown_epoch`, and that id is dropped a rotation later. The sweeper
+//! started by the first pull that holds anything sleeps to the earliest of
+//! those instants on the distributor's own clock, so the erasure happens on
+//! an idle distributor too; [`Distributor::erase_spent`] does the same work
+//! for an application that would rather time it.
+//!
+//! **The knobs are checked when the distributor is made.** A rotation of zero
+//! or less, a cap of zero, and an epoch cap below what one group's chain needs
+//! at the configured rotation are each refused by [`Distributor::new`]: every
+//! one of them leaves a distributor that answers its first pulls and then
+//! cannot answer any, so an operator reads which one it is at construction
+//! rather than from a member's failed pulls seventy minutes later.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tokio::time::timeout;
 
 use crate::cbor::Value;
@@ -64,7 +83,7 @@ use crate::ucan::Policy as Grant;
 
 use super::epoch::{for_publish, fresh, org_of, wall_clock, NoRandomness, TOLERANCE_MS};
 use super::wire::{procedure, reply_value, Policy, Reply};
-use super::{Epoch, DEFAULT_ROTATE_AFTER_MS};
+use super::{Epoch, DEFAULT_ROTATE_AFTER_MS, EVENT_LIFE_MS, ID_SIZE};
 
 /// The capability an org's grant carries for its groups' keys (section 3).
 pub const GROUP_KEYS_CAN: &str = "group_keys";
@@ -109,7 +128,9 @@ pub struct DistributorOptions {
     pub org: String,
     /// The policy every one of its groups is answered with.
     pub policy: Policy,
-    /// How long an epoch publishes, in milliseconds.
+    /// How long an epoch publishes, in milliseconds. It must be positive: an
+    /// epoch that publishes for no time at all is one a pull of the current
+    /// epoch makes again for ever.
     pub rotate_after_ms: i64,
     /// The clock its epochs' times are read from.
     pub now: Clock,
@@ -167,10 +188,14 @@ pub struct Caps {
     pub total: usize,
     /// How many epochs one group's chain holds.
     ///
-    /// A chain holds about `(65 + 5) minutes / rotate_after` epochs plus two,
-    /// so the default carries a rotation of about 35 seconds and longer. A
-    /// host rotating faster than that raises this and owns the memory: a chain
-    /// is at most this many keys, and a distributor at most `total` of them.
+    /// A chain is at most [`chain_bound`] epochs long at a given rotation,
+    /// which is 8 at the default quarter of an hour, so the default carries a
+    /// rotation of 34 seconds and longer. A host rotating faster than that
+    /// raises this to at least `chain_bound(rotate_after_ms)` and owns the
+    /// memory: a chain is at most this many keys, and a distributor at most
+    /// `total` of them. [`Distributor::new`] refuses a chain cap below what
+    /// its rotation needs, because such a distributor answers for about
+    /// seventy minutes and then refuses every pull for good.
     pub epochs: usize,
 }
 
@@ -181,6 +206,106 @@ impl Default for Caps {
             total: 1024,
             epochs: 128,
         }
+    }
+}
+
+/// The most epochs one group's chain holds at `rotate_after_ms`: the epochs
+/// whose events can still be accepted, the one publishing, the one the ahead
+/// window hands out, and a third of a rotation of slack.
+///
+/// A chain, from its newest epoch back, spans a rotation of publishing, the
+/// event life and the tolerance an event is accepted for, and one more
+/// rotation of keeping. The bound is what [`Distributor::new`] holds
+/// [`Caps::epochs`] to, and what an application rotating faster than the
+/// default asks this for to size its own.
+///
+/// `rotate_after_ms` is positive, as a distributor's is: a rotation of zero or
+/// less is refused before this is asked, and answers the bound of a one
+/// millisecond rotation here.
+pub fn chain_bound(rotate_after_ms: i64) -> usize {
+    let rotation = i128::from(rotate_after_ms.max(1));
+    let life = i128::from(EVENT_LIFE_MS + TOLERANCE_MS);
+    let span = 3 * life + 7 * rotation;
+    let per_rotation = 3 * rotation;
+    let in_thirds = span / per_rotation + i128::from(span % per_rotation != 0);
+    usize::try_from(in_thirds + 1).unwrap_or(usize::MAX)
+}
+
+/// Why a distributor was not made: knobs that leave one answering its first
+/// pulls and then unable to answer any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Misconfigured {
+    /// A rotation of zero or less: an epoch would publish for no time at all,
+    /// so a pull of the current epoch would make another for ever.
+    Rotation { rotate_after_ms: i64 },
+    /// A cap of zero: a distributor sized for nothing refuses every pull.
+    NoRoom { cap: &'static str },
+    /// [`Caps::epochs`] below [`chain_bound`]: the chain would fill in about
+    /// seventy minutes and refuse every pull for good after that.
+    ChainBound {
+        epochs: usize,
+        needed: usize,
+        rotate_after_ms: i64,
+    },
+}
+
+impl fmt::Display for Misconfigured {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Misconfigured::Rotation { rotate_after_ms } => write!(
+                f,
+                "rotate_after_ms is {rotate_after_ms}: an epoch must publish for a positive time",
+            ),
+            Misconfigured::NoRoom { cap } => {
+                write!(
+                    f,
+                    "caps.{cap} is zero: a distributor sized for nothing refuses every pull"
+                )
+            }
+            Misconfigured::ChainBound {
+                epochs,
+                needed,
+                rotate_after_ms,
+            } => write!(
+                f,
+                "caps.epochs is {epochs}, below the {needed} epochs a chain needs at a \
+                 {rotate_after_ms} ms rotation: it would fill and then refuse every pull",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Misconfigured {}
+
+/// Refuses the knobs that would leave a distributor answering at first and
+/// then unable to answer at all.
+fn check(opts: &DistributorOptions) -> Result<(), Misconfigured> {
+    let rotate_after_ms = opts.rotate_after_ms;
+    if rotate_after_ms <= 0 {
+        return Err(Misconfigured::Rotation { rotate_after_ms });
+    }
+    if let Some(cap) = first_zero_cap(opts.caps) {
+        return Err(Misconfigured::NoRoom { cap });
+    }
+    let needed = chain_bound(rotate_after_ms);
+    match opts.caps.epochs < needed {
+        true => Err(Misconfigured::ChainBound {
+            epochs: opts.caps.epochs,
+            needed,
+            rotate_after_ms,
+        }),
+        false => Ok(()),
+    }
+}
+
+/// The first of the three caps that is zero, which is a distributor that
+/// would hold nothing.
+fn first_zero_cap(caps: Caps) -> Option<&'static str> {
+    match caps {
+        Caps { per_member: 0, .. } => Some("per_member"),
+        Caps { total: 0, .. } => Some("total"),
+        Caps { epochs: 0, .. } => Some("epochs"),
+        _ => None,
     }
 }
 
@@ -202,6 +327,54 @@ struct Inner {
     removed: RemovedCheck,
     groups: Mutex<Chains>,
     caps: Caps,
+    /// Told when an epoch was held and when the last handle is dropped, so
+    /// the sweeper re-reads the instant it waits for and leaves rather than
+    /// sleeping past both.
+    woken: Arc<Notify>,
+    /// Set once the sweeper is started: one task sweeps for every handle of a
+    /// distributor, and none before something is held.
+    sweeping: AtomicBool,
+}
+
+impl Inner {
+    /// The lock the groups are held under. A panic under it leaves the epochs
+    /// as they were rather than poisoned: the whole state is replaced by what
+    /// a pull makes of it, so there is nothing half-written to doubt.
+    fn lock(&self) -> MutexGuard<'_, Chains> {
+        self.groups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The earliest instant at which one of the held epochs stops being what
+    /// it is, if anything is held at all.
+    fn deadline(&self) -> Option<i64> {
+        self.lock().deadline(self.rotate_after_ms)
+    }
+
+    /// The times a store operation is made at: this distributor's clock, and
+    /// the rotation its epochs publish for.
+    fn times(&self) -> Times {
+        Times {
+            now: (self.now)(),
+            rotation: self.rotate_after_ms,
+        }
+    }
+
+    /// Erases the epoch keys whose acceptance has ended, and drops what is
+    /// kept no longer: what the sweeper does when its deadline comes.
+    fn sweep(&self) {
+        let times = self.times();
+        self.lock().reap(times);
+    }
+}
+
+impl Drop for Inner {
+    /// Wakes the sweeper so it finds no handle to upgrade and leaves, rather
+    /// than sleeping until an epoch's acceptance ends.
+    fn drop(&mut self) {
+        self.woken.notify_one();
+    }
 }
 
 /// The groups a distributor holds: each one's chain of epochs and the caller
@@ -212,48 +385,204 @@ struct Chains {
     held_by: HashMap<[u8; 32], usize>,
 }
 
-/// One group's chain, and the caller whose pull made the group be held.
+/// One group's chain, oldest epoch first, and the caller whose pull made the
+/// group be held.
 struct Chain {
-    epochs: Vec<Epoch>,
+    epochs: Vec<Held>,
     made_by: [u8; 32],
 }
 
+/// What a chain holds of one epoch: its key while an event under it can still
+/// be accepted, and only its id once none can.
+enum Held {
+    /// The epoch, key and all, while an event under it can be sealed or
+    /// opened.
+    Keyed(Epoch),
+    /// An epoch whose acceptance has ended: the id a pull of it is answered
+    /// `epoch_expired` with, and nothing else.
+    Spent(Spent),
+}
+
+/// An epoch past its acceptance, as it is kept: never its key.
+#[derive(Debug, Clone, Copy)]
+struct Spent {
+    id: [u8; ID_SIZE],
+    accept_until: i64,
+}
+
+/// The moment a store is read or written at: the distributor's now, and how
+/// long its epochs publish, which is how long past acceptance an epoch is
+/// still kept.
+#[derive(Debug, Clone, Copy)]
+struct Times {
+    now: i64,
+    rotation: i64,
+}
+
+impl Held {
+    /// The epoch's id, which is kept however its key fares.
+    fn id(&self) -> [u8; ID_SIZE] {
+        match self {
+            Held::Keyed(epoch) => epoch.id,
+            Held::Spent(spent) => spent.id,
+        }
+    }
+
+    /// The last instant an event under this epoch is accepted.
+    fn accept_until(&self) -> i64 {
+        match self {
+            Held::Keyed(epoch) => epoch.accept_until,
+            Held::Spent(spent) => spent.accept_until,
+        }
+    }
+
+    /// The epoch while an event under it can still be accepted, which is the
+    /// only while its key is held.
+    fn key_at(&self, now: i64) -> Option<Epoch> {
+        match self {
+            Held::Keyed(epoch) if epoch.acceptable(now) => Some(epoch.clone()),
+            _ => None,
+        }
+    }
+
+    /// What is kept of an epoch no longer accepted, while it is kept at all.
+    fn spent_at(&self, times: Times) -> Option<Spent> {
+        let accept_until = self.accept_until();
+        match times.now {
+            past if past > accept_until + TOLERANCE_MS
+                && past <= kept_until(accept_until, times.rotation) =>
+            {
+                Some(Spent {
+                    id: self.id(),
+                    accept_until,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// What this entry is at `times`: the epoch while it is accepted, its id
+    /// once it is not, and nothing once that is kept no longer.
+    fn next_at(&self, times: Times) -> Option<Held> {
+        if let Some(epoch) = self.key_at(times.now) {
+            return Some(Held::Keyed(epoch));
+        }
+        self.spent_at(times).map(Held::Spent)
+    }
+
+    /// The first instant at which this entry stops being what it is now:
+    /// when the epoch's acceptance ends, and a rotation later for the id kept
+    /// of it.
+    fn next_change(&self, rotation: i64) -> i64 {
+        let acceptance_ends = self.accept_until() + TOLERANCE_MS + 1;
+        match self {
+            Held::Keyed(_) => acceptance_ends,
+            Held::Spent(_) => acceptance_ends + rotation,
+        }
+    }
+}
+
+impl Chain {
+    /// The epochs still accepted at `times`, and what is kept of those past
+    /// that, in the order they were issued in.
+    fn at(&self, times: Times) -> (Vec<Epoch>, Vec<Spent>) {
+        let keyed = self
+            .epochs
+            .iter()
+            .filter_map(|held| held.key_at(times.now))
+            .collect();
+        let spent = self
+            .epochs
+            .iter()
+            .filter_map(|held| held.spent_at(times))
+            .collect();
+        (keyed, spent)
+    }
+}
+
+/// The last instant an epoch accepted until `accept_until` is kept at all:
+/// a rotation past its acceptance, so a pull of it is answered `epoch_expired`
+/// for a while rather than `unknown_epoch` at once.
+fn kept_until(accept_until: i64, rotation: i64) -> i64 {
+    accept_until + TOLERANCE_MS + rotation
+}
+
 impl Chains {
-    /// The group's epochs still kept at `now`, without what is no longer kept.
-    fn kept_of(&self, prefix: &str, now: i64, rotation: i64) -> Vec<Epoch> {
+    /// What the group holds at `times`: the epochs still accepted, and the ids
+    /// of those past that are kept a while longer.
+    fn at(&self, prefix: &str, times: Times) -> (Vec<Epoch>, Vec<Spent>) {
         match self.chains.get(prefix) {
-            Some(chain) => kept(&chain.epochs, now, rotation),
-            None => Vec::new(),
+            Some(chain) => chain.at(times),
+            None => (Vec::new(), Vec::new()),
         }
     }
 
     /// The epochs the store holds for the group, as they are: the tests hold
-    /// the store to its caps and to its erasures with it.
+    /// the store to its caps and to its erasures with it. `None` is an epoch
+    /// whose key is gone and whose id is all that is kept of it.
     #[cfg(test)]
-    fn stored(&self, prefix: &str) -> Vec<Epoch> {
+    fn stored(&self, prefix: &str) -> Vec<Option<Epoch>> {
         match self.chains.get(prefix) {
-            Some(chain) => chain.epochs.clone(),
+            Some(chain) => chain
+                .epochs
+                .iter()
+                .map(|held| match held {
+                    Held::Keyed(epoch) => Some(epoch.clone()),
+                    Held::Spent(_) => None,
+                })
+                .collect(),
             None => Vec::new(),
         }
     }
 
-    /// Holds `epochs` for `prefix`, charging `caller` for a group it did not
-    /// hold yet. The groups with no epoch kept at `now` are released first, so
-    /// an idle host's capacity comes back.
+    /// The earliest instant at which one of the held epochs stops being what
+    /// it is, if any is held.
+    fn deadline(&self, rotation: i64) -> Option<i64> {
+        self.chains
+            .values()
+            .flat_map(|chain| chain.epochs.iter())
+            .map(|held| held.next_change(rotation))
+            .min()
+    }
+
+    /// Holds what the group is at `times`, charging `caller` for a group it
+    /// did not hold yet. The groups with nothing left are reaped first, so an
+    /// idle host's capacity comes back.
+    ///
+    /// The chain is kept to [`Caps::epochs`]: what would grow it past that is
+    /// refused and the store is left as it was.
     fn hold(
         &mut self,
         prefix: &str,
         epochs: Vec<Epoch>,
+        spent: Vec<Spent>,
         caller: [u8; 32],
         caps: &Caps,
-        now: i64,
-        rotation: i64,
+        times: Times,
     ) -> Result<(), Capacity> {
-        if let Some(chain) = self.chains.get_mut(prefix) {
-            chain.epochs = epochs;
-            return Ok(());
+        let entries = entries_of(epochs, spent);
+        if entries.len() > caps.epochs {
+            return Err(Capacity::Epochs);
         }
-        self.release(now, rotation);
+        self.reap(times);
+        match self.chains.get_mut(prefix) {
+            Some(chain) => {
+                chain.epochs = entries;
+                Ok(())
+            }
+            None => self.charge(prefix, entries, caller, caps),
+        }
+    }
+
+    /// Takes a new group's chain, charging `caller` for it: past either cap it
+    /// is not held.
+    fn charge(
+        &mut self,
+        prefix: &str,
+        epochs: Vec<Held>,
+        caller: [u8; 32],
+        caps: &Caps,
+    ) -> Result<(), Capacity> {
         let held = self.held_by.get(&caller).copied().unwrap_or(0);
         if held >= caps.per_member {
             return Err(Capacity::PerMember);
@@ -272,13 +601,22 @@ impl Chains {
         Ok(())
     }
 
-    /// Drops the groups no epoch of which is kept at `now` any more, and what
-    /// their callers were charged for them.
-    fn release(&mut self, now: i64, rotation: i64) {
+    /// Rewrites every group's chain to what it is at `times`, and releases the
+    /// groups with nothing left with the room their caller held for them: an
+    /// epoch past its acceptance keeps only its id, and one kept no longer is
+    /// dropped, so its key is erased.
+    fn reap(&mut self, times: Times) {
+        for chain in self.chains.values_mut() {
+            chain.epochs = chain
+                .epochs
+                .iter()
+                .filter_map(|held| held.next_at(times))
+                .collect();
+        }
         let idle: Vec<String> = self
             .chains
             .iter()
-            .filter(|(_, chain)| !chain.epochs.iter().any(|e| kept_at(e, now, rotation)))
+            .filter(|(_, chain)| chain.epochs.is_empty())
             .map(|(prefix, _)| prefix.clone())
             .collect();
         for prefix in idle {
@@ -302,6 +640,14 @@ impl Chains {
             left => self.held_by.insert(caller, left),
         };
     }
+}
+
+/// What a chain holds: the ids of the epochs past their acceptance before the
+/// epochs still under theirs, which is the order they were issued in.
+fn entries_of(epochs: Vec<Epoch>, spent: Vec<Spent>) -> Vec<Held> {
+    let older = spent.into_iter().map(Held::Spent);
+    let live = epochs.into_iter().map(Held::Keyed);
+    older.chain(live).collect()
 }
 
 /// Which limit refused a pull: one of a distributor's own, none of them one of
@@ -408,8 +754,13 @@ impl From<NoRandomness> for Unanswered {
 impl Distributor {
     /// A distributor of `opts`' org's groups, holding no epoch yet: a group's
     /// first pull makes its current epoch at once.
-    pub fn new(opts: DistributorOptions) -> Distributor {
-        Distributor {
+    ///
+    /// The knobs are checked here rather than at the pull that would break on
+    /// them ([`Misconfigured`]): a distributor is refused rather than made
+    /// into one that answers for seventy minutes and then refuses every pull.
+    pub fn new(opts: DistributorOptions) -> Result<Distributor, Misconfigured> {
+        check(&opts)?;
+        Ok(Distributor {
             inner: Arc::new(Inner {
                 org: opts.org,
                 policy: opts.policy,
@@ -420,8 +771,25 @@ impl Distributor {
                 removed: opts.removed,
                 groups: Mutex::new(Chains::default()),
                 caps: opts.caps,
+                woken: Arc::new(Notify::new()),
+                sweeping: AtomicBool::new(false),
             }),
-        }
+        })
+    }
+
+    /// Erases the keys of every epoch whose acceptance has ended, keeping only
+    /// their ids, and drops what is kept no longer: what the sweeper does at
+    /// its deadline, for an application that would rather the erasure
+    /// happened at a moment of its own.
+    pub fn erase_spent(&self) {
+        self.inner.sweep();
+    }
+
+    /// The instant the sweeper waits for, which is when the first held epoch
+    /// stops being what it is.
+    #[cfg(test)]
+    fn deadline(&self) -> Option<i64> {
+        self.inner.deadline()
     }
 
     /// The procedure this distributor serves: `<org>/group_keys_v1`.
@@ -496,60 +864,61 @@ impl Distributor {
         }
     }
 
-    /// The group's epochs to a pull of its current one: the ones still kept,
-    /// advanced to `now`, with the next inside the current's ahead window, and
-    /// the epochs list the current one and the next. The ones no longer kept
-    /// are dropped here, so an epoch key is erased once no event under it can
-    /// be accepted any more.
+    /// The group's epochs to a pull of its current one: the ones still
+    /// accepted, advanced to `now`, with the next inside the current's ahead
+    /// window; the ones past their acceptance are kept beside them as their
+    /// ids alone, so an epoch key goes as soon as no event under it can be
+    /// accepted.
     ///
     /// The chain is kept to [`Caps::epochs`]: a pull that would grow it past
     /// that is answered `too_many_epochs` and the store is left as it was, so
     /// no chain outgrows what the distributor was sized for.
     fn current(&self, prefix: &str, caller: [u8; 32], now: i64) -> Result<Reply, Unanswered> {
-        let rotation = self.inner.rotate_after_ms;
+        let times = Times {
+            now,
+            rotation: self.inner.rotate_after_ms,
+        };
         let caps = self.inner.caps;
         let mut groups = self.lock();
-        let held = groups.kept_of(prefix, now, rotation);
-        let epochs = ahead(advanced(held, now, rotation)?, now, rotation)?;
-        if epochs.len() > caps.epochs {
-            return Err(Capacity::Epochs.into());
-        }
-        let Some(current) = for_publish(&epochs, now).cloned() else {
-            groups.hold(prefix, epochs, caller, &caps, now, rotation)?;
-            // Only a clock that went backwards leaves no epoch covering
-            // `now`: no epoch of this group is issued yet, which is the
-            // truth a pull is answered with.
+        let (keyed, spent) = groups.at(prefix, times);
+        let epochs = ahead(advanced(keyed, times)?, times)?;
+        let current = for_publish(&epochs, now).cloned();
+        let issued_with = issued_with(&epochs, current.as_ref());
+        groups.hold(prefix, epochs, spent, caller, &caps, times)?;
+        drop(groups);
+        self.note_held();
+        // Only a clock that went backwards leaves no epoch covering `now`: no
+        // epoch of this group is issued yet, which is the truth a pull is
+        // answered with.
+        let Some(current) = current else {
             return Err(Refusal::UnknownEpoch.into());
         };
-        let issued_with = epochs
-            .iter()
-            .filter(|epoch| epoch.issued_at == current.publish_until)
-            .cloned()
-            .collect::<Vec<_>>();
-        groups.hold(prefix, epochs, caller, &caps, now, rotation)?;
         let mut answered = vec![current];
         answered.extend(issued_with);
         Ok(self.reply(prefix, answered))
     }
 
     /// The group's epoch `id` to a pull of a past one: answered while it is
-    /// still accepted, `epoch_expired` while it is kept past that so a
+    /// still accepted, `epoch_expired` while its id is kept past that so a
     /// subscriber learns why it could not catch up, and `unknown_epoch` once
-    /// it is held no longer (a distributor that restarted holds none).
+    /// nothing of it is held (a distributor that restarted holds none).
     fn past(&self, prefix: &str, id: &[u8], now: i64) -> Result<Reply, Unanswered> {
-        let rotation = self.inner.rotate_after_ms;
-        let groups = self.lock();
-        let Some(epoch) = groups
-            .kept_of(prefix, now, rotation)
-            .into_iter()
-            .find(|epoch| epoch.id.as_slice() == id)
-        else {
-            return Err(Refusal::UnknownEpoch.into());
+        let times = Times {
+            now,
+            rotation: self.inner.rotate_after_ms,
         };
-        if !epoch.acceptable(now) {
-            return Err(Refusal::EpochExpired.into());
+        let (keyed, spent) = {
+            let groups = self.lock();
+            groups.at(prefix, times)
+        };
+        let found = keyed.into_iter().find(|epoch| epoch.id.as_slice() == id);
+        if let Some(epoch) = found {
+            return Ok(self.reply(prefix, vec![epoch]));
         }
-        Ok(self.reply(prefix, vec![epoch]))
+        match spent.iter().any(|spent| spent.id.as_slice() == id) {
+            true => Err(Refusal::EpochExpired.into()),
+            false => Err(Refusal::UnknownEpoch.into()),
+        }
     }
 
     /// The reply for `prefix` with `epochs`, under the policy this distributor
@@ -562,12 +931,72 @@ impl Distributor {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Chains> {
-        self.inner
-            .groups
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Something was held: the sweeper is told to re-read the instant it waits
+    /// for, and is started the first time it is told, so a distributor made
+    /// and never pulled starts no task.
+    fn note_held(&self) {
+        self.inner.woken.notify_one();
+        if self.inner.sweeping.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let woken = Arc::clone(&self.inner.woken);
+        let distributor = Arc::downgrade(&self.inner);
+        tokio::spawn(sweep_until_dropped(distributor, woken));
     }
+
+    fn lock(&self) -> MutexGuard<'_, Chains> {
+        self.inner.lock()
+    }
+}
+
+/// The epochs issued when `current` stopped publishing: the next one, which a
+/// pull inside the ahead window carries too.
+fn issued_with(epochs: &[Epoch], current: Option<&Epoch>) -> Vec<Epoch> {
+    let Some(current) = current else {
+        return Vec::new();
+    };
+    epochs
+        .iter()
+        .filter(|epoch| epoch.issued_at == current.publish_until)
+        .cloned()
+        .collect()
+}
+
+/// Erases the keys of the epochs whose acceptance has ended, and again at each
+/// later instant one does, until the last handle to the distributor is gone.
+///
+/// It holds no handle of its own, only a `Weak` and the waker it parks on, so
+/// it never keeps a dropped distributor alive; and it sleeps to the earliest
+/// such instant rather than to a tick, so an idle distributor's keys go as soon
+/// as they are of no use.
+async fn sweep_until_dropped(distributor: Weak<Inner>, woken: Arc<Notify>) {
+    loop {
+        let Some(inner) = distributor.upgrade() else {
+            return;
+        };
+        let now = (inner.now)();
+        let deadline = inner.deadline();
+        drop(inner);
+        match deadline {
+            Some(at) => {
+                let sleeping = tokio::time::sleep(left_ms(at, now));
+                tokio::select! {
+                    _ = woken.notified() => {}
+                    _ = sleeping => {}
+                }
+            }
+            None => woken.notified().await,
+        }
+        let Some(inner) = distributor.upgrade() else {
+            return;
+        };
+        inner.sweep();
+    }
+}
+
+/// The time left until `at`, never less than none.
+fn left_ms(at: i64, now: i64) -> Duration {
+    Duration::from_millis(u64::try_from(at.saturating_sub(now)).unwrap_or(0))
 }
 
 /// One pull answered as a handler's future: the RESULT, or the detail of the
@@ -579,69 +1008,53 @@ async fn answering(distributor: Distributor, request: Request) -> Result<Value, 
         .map_err(|unanswered| unanswered.detail())
 }
 
-/// The group's epochs up to one current at `now`: contiguous after the newest,
-/// or a fresh one when the group sat idle for a whole rotation.
-fn advanced(epochs: Vec<Epoch>, now: i64, rotation: i64) -> Result<Vec<Epoch>, NoRandomness> {
+/// The group's epochs up to one current at `times`: contiguous after the
+/// newest, or a fresh one when the group sat idle for a whole rotation.
+fn advanced(epochs: Vec<Epoch>, times: Times) -> Result<Vec<Epoch>, NoRandomness> {
     let Some(newest) = epochs.last().cloned() else {
-        return Ok(vec![fresh(now, rotation)?]);
+        return Ok(vec![fresh(times.now, times.rotation)?]);
     };
-    if now < newest.publish_until {
+    if times.now < newest.publish_until {
         return Ok(epochs);
     }
-    advanced_past(epochs, newest, now, rotation)
+    advanced_past(epochs, newest, times)
 }
 
 /// `epochs` whose newest stopped publishing at `newest.publish_until`, which
-/// is at or before `now`: one more epoch appended, and the same asked again.
+/// is at or before `times.now`: one more epoch appended, and the same asked
+/// again.
 fn advanced_past(
     mut epochs: Vec<Epoch>,
     newest: Epoch,
-    now: i64,
-    rotation: i64,
+    times: Times,
 ) -> Result<Vec<Epoch>, NoRandomness> {
-    let made = match now - newest.publish_until >= rotation {
-        true => fresh(now, rotation)?,
-        false => newest.following(rotation)?,
+    let made = match times.now - newest.publish_until >= times.rotation {
+        true => fresh(times.now, times.rotation)?,
+        false => newest.following(times.rotation)?,
     };
     epochs.push(made);
-    advanced(epochs, now, rotation)
+    advanced(epochs, times)
 }
 
-/// `epochs` with the next one appended when `now` is inside the newest's ahead
-/// window, so a pull there hands out the epoch the group is about to publish
-/// under and every holder re-pulls before it is needed.
-fn ahead(epochs: Vec<Epoch>, now: i64, rotation: i64) -> Result<Vec<Epoch>, NoRandomness> {
+/// `epochs` with the next one appended when `times.now` is inside the newest's
+/// ahead window, so a pull there hands out the epoch the group is about to
+/// publish under and every holder re-pulls before it is needed.
+fn ahead(epochs: Vec<Epoch>, times: Times) -> Result<Vec<Epoch>, NoRandomness> {
     let Some(newest) = epochs.last().cloned() else {
         return Ok(epochs);
     };
-    match newest.in_ahead_window(now) {
+    match newest.in_ahead_window(times.now) {
         true => {
-            let next = newest.following(rotation)?;
+            let next = newest.following(times.rotation)?;
             Ok(epochs.into_iter().chain([next]).collect())
         }
         false => Ok(epochs),
     }
 }
 
-/// Whether an epoch is still kept at `now`: until acceptance, plus one
-/// rotation past it, so a pull of one that is no longer accepted is answered
-/// `epoch_expired` for that while rather than `unknown_epoch`.
-fn kept_at(epoch: &Epoch, now: i64, rotation: i64) -> bool {
-    now <= epoch.accept_until + TOLERANCE_MS + rotation
-}
-
-/// The group's epochs still kept at `now`.
-fn kept(epochs: &[Epoch], now: i64, rotation: i64) -> Vec<Epoch> {
-    epochs
-        .iter()
-        .filter(|epoch| kept_at(epoch, now, rotation))
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+    use std::sync::atomic::AtomicI64;
 
     use super::*;
     use crate::frame::Sealed;
@@ -724,7 +1137,7 @@ mod tests {
     fn distributor_of(mut opts: DistributorOptions, clock: &Arc<AtomicI64>) -> Distributor {
         let read = Arc::clone(clock);
         opts.now = Arc::new(move || read.load(Ordering::SeqCst));
-        Distributor::new(opts)
+        Distributor::new(opts).expect("the knobs are a distributor's")
     }
 
     /// A distributor reading a clock that starts at `start`.
@@ -1020,6 +1433,55 @@ mod tests {
         assert_ne!(epoch_now(&distributor).await.id, epoch.id);
     }
 
+    /// The key of an epoch goes when its acceptance ends, and not at the
+    /// group's next pull: the id kept of it still tells a member
+    /// `epoch_expired` rather than `unknown_epoch`.
+    #[tokio::test]
+    async fn a_key_is_erased_once_its_acceptance_ends() {
+        let (distributor, clock) = distributor(START);
+        let epoch = epoch_now(&distributor).await;
+
+        clock.store(epoch.accept_until + TOLERANCE_MS + 1, Ordering::SeqCst);
+        distributor.erase_spent();
+
+        let held = stored(&distributor);
+        assert_eq!(held.len(), 1, "the epoch is still kept");
+        assert!(held[0].is_none(), "as its id alone, never its key");
+        assert_eq!(by_id(&distributor, &epoch.id).await, Err(EXPIRED.into()));
+    }
+
+    /// The sweeper's instant is the first acceptance to end, so an idle
+    /// distributor erases a key as soon as nothing under it can be accepted,
+    /// rather than when a member next pulls.
+    #[tokio::test]
+    async fn the_sweeper_waits_for_the_first_acceptance_to_end() {
+        let (distributor, _clock) = distributor(START);
+        let epoch = epoch_now(&distributor).await;
+        assert_eq!(
+            distributor.deadline(),
+            Some(epoch.accept_until + TOLERANCE_MS + 1)
+        );
+    }
+
+    /// Past its keeping the id goes too: nothing of the epoch is held, and a
+    /// pull of it is `unknown_epoch`.
+    #[tokio::test]
+    async fn nothing_of_an_epoch_is_kept_past_its_keeping() {
+        let (distributor, clock) = distributor(START);
+        let epoch = epoch_now(&distributor).await;
+
+        clock.store(
+            epoch.accept_until + TOLERANCE_MS + ROTATION + 1,
+            Ordering::SeqCst,
+        );
+        distributor.erase_spent();
+        assert!(stored(&distributor).is_empty(), "nothing is kept of it");
+        assert_eq!(
+            by_id(&distributor, &epoch.id).await,
+            Err(UNKNOWN_EPOCH.into())
+        );
+    }
+
     /// A restarted distributor holds no epoch: the one a member asks for is
     /// `unknown_epoch`, and the current one is a fresh chain it made at once.
     #[tokio::test]
@@ -1098,12 +1560,14 @@ mod tests {
         let now = epoch_now(&distributor).await;
         let held = stored(&distributor);
         assert_eq!(held.len(), 1, "only the epoch that covers now is kept");
-        assert_eq!(held[0].id, now.id);
-        assert_ne!(held[0].id, first.id);
+        let kept = held[0].clone().expect("its key, while it is accepted");
+        assert_eq!(kept.id, now.id);
+        assert_ne!(kept.id, first.id);
     }
 
-    /// The epochs the distributor holds for this group.
-    fn stored(distributor: &Distributor) -> Vec<Epoch> {
+    /// The epochs the distributor holds for this group, each `None` once only
+    /// its id is kept of it.
+    fn stored(distributor: &Distributor) -> Vec<Option<Epoch>> {
         let groups = distributor.lock();
         groups.stored(&prefix())
     }
@@ -1191,27 +1655,138 @@ mod tests {
     /// A chain that would grow past its cap is refused, and the store keeps
     /// what it had: no group's chain outgrows what the distributor was sized
     /// for, and the epoch members hold is still the one it answers with.
-    #[tokio::test]
-    async fn a_chain_past_its_cap_is_refused() {
-        let (mut opts, clock) = options(START);
-        opts.caps = Caps {
+    ///
+    /// [`Distributor::new`] refuses a cap below what the rotation needs, so
+    /// this holds the store itself against a chain sized below that: the
+    /// refusal is the last line the runtime keeps, and it keeps it.
+    #[test]
+    fn a_chain_past_its_cap_is_refused() {
+        let caps = Caps {
             per_member: 4,
             total: 8,
             epochs: 1,
         };
-        let distributor = distributor_of(opts, &clock);
-        let first = epoch_now(&distributor).await;
-        assert_eq!(stored(&distributor).len(), 1);
+        let mut chains = Chains::default();
+        let first = fresh(START, ROTATION).expect("randomness answers");
+        let times = Times {
+            now: START,
+            rotation: ROTATION,
+        };
+        chains
+            .hold(
+                &prefix(),
+                vec![first.clone()],
+                Vec::new(),
+                CALLER,
+                &caps,
+                times,
+            )
+            .expect("one epoch fits");
 
-        clock.store(first.ahead_window().0, Ordering::SeqCst);
+        let grown = vec![
+            first.clone(),
+            fresh(START + ROTATION, ROTATION).expect("randomness answers"),
+        ];
+        let refused = chains.hold(&prefix(), grown, Vec::new(), CALLER, &caps, times);
         assert_eq!(
-            current(&distributor).await,
-            Err("too_many_epochs".into()),
-            "the ahead epoch would be a second"
+            refused,
+            Err(Capacity::Epochs),
+            "the second epoch is one too many"
         );
-        let still = stored(&distributor);
+        let still = chains.stored(&prefix());
         assert_eq!(still.len(), 1, "the store keeps what it had");
-        assert_eq!(still[0].id, first.id, "and the epoch members hold");
+        let kept = still[0].clone().expect("the epoch it held");
+        assert_eq!(kept.id, first.id, "and the epoch members hold");
+    }
+
+    /// A rotation of zero or less is refused when the distributor is made: an
+    /// epoch would publish for no time at all, so a pull of the current one
+    /// would make another, and another, with the groups locked.
+    #[test]
+    fn a_rotation_of_zero_or_less_is_refused() {
+        for rotate_after_ms in [0, -1, -DEFAULT_ROTATE_AFTER_MS] {
+            let (mut opts, _clock) = options(START);
+            opts.rotate_after_ms = rotate_after_ms;
+            assert_eq!(
+                Distributor::new(opts).err(),
+                Some(Misconfigured::Rotation { rotate_after_ms })
+            );
+        }
+    }
+
+    /// A cap of zero is refused too: a distributor sized for nothing refuses
+    /// every pull, and the operator reads that when it is made.
+    #[test]
+    fn a_cap_of_zero_is_refused() {
+        let zeros = [
+            (
+                Caps {
+                    per_member: 0,
+                    ..Caps::default()
+                },
+                "per_member",
+            ),
+            (
+                Caps {
+                    total: 0,
+                    ..Caps::default()
+                },
+                "total",
+            ),
+            (
+                Caps {
+                    epochs: 0,
+                    ..Caps::default()
+                },
+                "epochs",
+            ),
+        ];
+        for (caps, cap) in zeros {
+            let (mut opts, _clock) = options(START);
+            opts.caps = caps;
+            assert_eq!(
+                Distributor::new(opts).err(),
+                Some(Misconfigured::NoRoom { cap })
+            );
+        }
+    }
+
+    /// An epoch cap below what one group's chain needs at the rotation is
+    /// refused, and raised to that bound it is a distributor: the chain would
+    /// otherwise fill in about seventy minutes and refuse every pull for good.
+    #[test]
+    fn an_epoch_cap_below_the_chain_bound_is_refused() {
+        let (mut opts, _clock) = options(START);
+        opts.rotate_after_ms = 33_000;
+        assert_eq!(
+            Distributor::new(opts).err(),
+            Some(Misconfigured::ChainBound {
+                epochs: 128,
+                needed: 131,
+                rotate_after_ms: 33_000,
+            })
+        );
+
+        let (mut opts, _clock) = options(START);
+        opts.rotate_after_ms = 33_000;
+        opts.caps = Caps {
+            epochs: 131,
+            ..Caps::default()
+        };
+        assert!(
+            Distributor::new(opts).is_ok(),
+            "raised to what the rotation needs"
+        );
+    }
+
+    /// The bound is what a chain really needs: 8 at the default quarter of an
+    /// hour, 127 at a 34-second rotation and 131 at 33, so the default caps
+    /// carry a rotation of 34 seconds and longer.
+    #[test]
+    fn the_chain_bound_is_what_one_chain_needs() {
+        assert_eq!(chain_bound(DEFAULT_ROTATE_AFTER_MS), 8);
+        assert_eq!(chain_bound(34_000), 127);
+        assert_eq!(chain_bound(33_000), 131);
     }
 
     /// An id the distributor does not hold, and an `epoch` field that is

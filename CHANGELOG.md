@@ -38,7 +38,15 @@ usually touches both, but their version numbers don't move in lockstep.
   group nobody pulls releases what it held, and each cap names itself in the
   failure (`too_many_groups_member`, `too_many_groups`, `too_many_epochs`)
   rather than in the design's closed set of five, so a member retries a full
-  distributor instead of reading it as a reason.
+  distributor instead of reading it as a reason. An epoch's key is erased as
+  soon as no event under it can be accepted any more — its id alone is kept a
+  rotation longer, so a pull of it is still answered `epoch_expired` — and a
+  sweeper the first pull starts does that on the distributor's own clock, on an
+  idle distributor too (`Distributor::erase_spent` does the same work on
+  demand). `Distributor::new` refuses the knobs that would leave it answering
+  at first and unable afterwards: a rotation of zero or less, a cap of zero,
+  and `Caps::epochs` below `group::chain_bound` — the epochs one group's chain
+  needs at the configured rotation, 8 at the default quarter of an hour.
   `Epoch::fresh`, `Epoch::following` and `Epoch::in_ahead_window` are public,
   and `group::NoRandomness` is why a node whose randomness does not answer
   makes no epoch.
