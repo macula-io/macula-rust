@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,10 +21,12 @@ use macula_rust::record::{self, new_node_record, NodeRecordOptions, RecordType};
 use macula_rust::seal;
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    handler, stream_handler, Call, ConfidentialityError, ConfidentialityReason, Config, Link,
-    LinkError, Offer, Publication, Request, Seal, Stream, StreamCall, StreamEvent,
+    handler, stream_handler, Admission, AdmissionLimits, Call, ConfidentialityError,
+    ConfidentialityReason, Config, Link, LinkError, Offer, Publication, Request, Seal, Stream,
+    StreamCall, StreamEvent,
 };
 use macula_rust::transport::Target;
+use tokio::sync::Semaphore;
 
 /// A link as a new node: its own identity key and issuer.
 async fn node(env: &TestStations, station: usize) -> Link {
@@ -574,4 +577,104 @@ async fn eventually_true(ok: impl Fn() -> bool) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("never held");
+}
+
+/// A provider whose admission lets a caller hold one session at a time.
+async fn one_session_provider(env: &TestStations) -> Link {
+    let identity = Arc::new(NodeKey::generate_identity(env.profile, PUZZLE_DIFFICULTY).unwrap());
+    let issuer = StatementIssuer::with_wall_clock(identity.clone()).unwrap();
+    let mut cfg = Config::new(env.target(0), identity, issuer);
+    let limits = AdmissionLimits {
+        sessions_per_caller: 1,
+        ..AdmissionLimits::default()
+    };
+    cfg.admission = Some(Arc::new(Admission::new(limits)));
+    Link::dial(cfg).await.unwrap()
+}
+
+/// Says it is in, reads to the caller's end, then waits for a permit of
+/// `gate` before it returns.
+fn held_after_end(
+    realm: [u8; 32],
+    procedure: &str,
+    gate: Arc<Semaphore>,
+    ended: Arc<AtomicUsize>,
+) -> Offer {
+    let handler = move |stream: Stream| {
+        let (gate, ended) = (gate.clone(), ended.clone());
+        async move {
+            stream.send(b"in").await.map_err(|e| e.to_string())?;
+            read_to_end(&stream).await;
+            ended.fetch_add(1, Ordering::SeqCst);
+            let _permit = gate.acquire().await.map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    };
+    Offer::stream(realm, procedure, StreamMode::Bidi, stream_handler(handler))
+}
+
+/// Reads `stream` until the caller's end, or until it ends.
+async fn read_to_end(stream: &Stream) {
+    while let Ok(event) = stream.recv().await {
+        if matches!(event, StreamEvent::End { .. }) {
+            return;
+        }
+    }
+}
+
+/// A stream of `call` the provider admits, opened again until it does.
+async fn admitted_eventually(caller: &Link, call: impl Fn() -> StreamCall) -> Stream {
+    for _ in 0..40 {
+        let s = caller.open_stream(call()).await.unwrap();
+        if admitted(&s).await.is_ok() {
+            return s;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("never admitted");
+}
+
+/// Whether the provider admitted `stream`: its handler's first frame, or the
+/// code it was refused with.
+async fn admitted(stream: &Stream) -> Result<(), String> {
+    match stream.recv().await {
+        Ok(StreamEvent::Data { .. }) => Ok(()),
+        Err(LinkError::Stream { code, .. }) => Err(code),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_draining_after_its_caller_ended_keeps_the_caller_s_session_place() {
+    let env = TestStations::start(Profile::PqPure);
+    let provider = one_session_provider(&env).await;
+    let caller = node(&env, 0).await;
+    let procedure = record::own_procedure(&provider.node_id(), "held");
+    let gate = Arc::new(Semaphore::new(0));
+    let ended = Arc::new(AtomicUsize::new(0));
+    let offer = held_after_end(env.realm_id, &procedure, gate.clone(), ended.clone());
+    let _served = provider.serve(offer).await.unwrap();
+    let open = || clear_stream_call(&env, &procedure, provider.node_id(), StreamMode::Bidi);
+
+    // The caller opens and ends at once; its handler still runs.
+    let first = caller.open_stream(open()).await.unwrap();
+    assert_eq!(admitted(&first).await, Ok(()));
+    let _ = first.close().await;
+    eventually("the handler read the caller's end", || {
+        ended.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // Its session place is still taken.
+    let second = caller.open_stream(open()).await.unwrap();
+    assert_eq!(
+        admitted(&second).await,
+        Err("too_many_sessions".to_string())
+    );
+
+    // Once the handler returns, the place is free again.
+    gate.add_permits(2);
+    let third = admitted_eventually(&caller, open).await;
+    let _ = third.close().await;
+    eventually("every stream released", || env.relayed() == 0).await;
 }

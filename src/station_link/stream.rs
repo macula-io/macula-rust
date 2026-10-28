@@ -296,7 +296,7 @@ impl Stream {
         loop {
             let live = self.live().await;
             live.ended_or_reopening().await;
-            let moved = live.side().reopening;
+            let moved = live.moved();
             match moved {
                 true => continue,
                 false => return,
@@ -440,7 +440,8 @@ impl StreamInner {
         let mut side = self.side();
         if let Some((event, size)) = side.inbox.pop_front() {
             side.held -= size;
-            drop(side);
+            // Under the side's lock, so settle never misses what this gives
+            // back.
             self.release_inbox(size);
             return Some(Ok(event));
         }
@@ -590,6 +591,14 @@ impl StreamInner {
         self.notify.notify_waiters();
         self.adopt_when_done(reopen.sealed_to(&self.link, key, refused));
         true
+    }
+
+    /// Whether a reseal is taking the stream off this session or has
+    /// carried it onto a successor: adopted after a wait on it returned, it
+    /// leaves `reopening` false.
+    fn moved(&self) -> bool {
+        let side = self.side();
+        side.reopening || side.successor.is_some()
     }
 
     /// Whether this session has ended or a reseal is taking the stream off
@@ -800,21 +809,14 @@ impl StreamInner {
     }
 
     /// Releases the stream once: its sending side finished after this side's
-    /// last frame and reset otherwise, its reader stopped, what its inbox
-    /// held and its session's place given back.
+    /// last frame and reset otherwise, its reader stopped. A served stream's
+    /// budget stays until its handler is done ([`StreamInner::settle`]).
     pub(super) fn end(this: &Arc<StreamInner>, err: Option<LinkError>) {
         let Some(graceful) = this.mark_ended(err) else {
             return;
         };
         if !graceful {
             StreamInner::reset_sending(this);
-        }
-        if let Some(budget) = this.budget().take() {
-            // The admission gets back all the inbox holds; the session keeps
-            // its own count, which reading what is still queued runs down.
-            let held = this.side().held;
-            budget.admission.release_inbox(budget.caller, held);
-            drop(budget.place);
         }
         this.link
             .lock()
@@ -823,6 +825,20 @@ impl StreamInner {
         let _ = this.done_tx.send_replace(true);
         this.notify.notify_waiters();
         this.notify.notify_one();
+    }
+}
+
+impl StreamInner {
+    /// Gives a served stream's session place, and what its inbox still holds,
+    /// back to the admission once its handler is done: a handler draining
+    /// after the stream ended still counts against its caller's bounds.
+    fn settle(&self) {
+        let side = self.side();
+        let Some(budget) = self.budget().take() else {
+            return;
+        };
+        budget.admission.release_inbox(budget.caller, side.held);
+        drop(budget.place);
     }
 }
 
@@ -1126,6 +1142,7 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     });
     if !hold_stream(&inner, &s) {
         StreamInner::end(&s, Some(LinkError::Closed));
+        s.settle();
         let _ = recv.stop(0u32.into());
         return;
     }
@@ -1312,10 +1329,16 @@ fn naming_key(s: &StreamInner, code: &str, message: &str) -> Option<Vec<u8>> {
     cbor::encode(&signed).ok()
 }
 
+/// Runs the handler for the session, then gives the session's budget back.
+async fn serve(s: Arc<StreamInner>, offer: StreamOffer) {
+    handle(&s, offer).await;
+    s.settle();
+}
+
 /// Runs the handler for the session, and ends the stream as the handler
 /// leaves it: closed when it returns `Ok` without ending it, aborted with its
 /// error or panic. A handler still running when the stream ends is dropped.
-async fn serve(s: Arc<StreamInner>, offer: StreamOffer) {
+async fn handle(s: &Arc<StreamInner>, offer: StreamOffer) {
     let stream = Stream { inner: s.clone() };
     let mut running = tokio::spawn((offer.handler)(stream.clone()));
     let mut done = s.done_tx.subscribe();
@@ -1324,7 +1347,7 @@ async fn serve(s: Arc<StreamInner>, offer: StreamOffer) {
         _ = done.wait_for(|ended| *ended) => None,
     };
     let Some(outcome) = outcome else {
-        return outlived(&s, running).await;
+        return outlived(s, running).await;
     };
     match outcome {
         Ok(Ok(())) => {
