@@ -11,6 +11,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,10 +22,11 @@ use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::pool::{Call, Opts, Pool, StreamCall};
 use macula_rust::profile::Profile;
 use macula_rust::record;
-use macula_rust::seal::Keyring;
+use macula_rust::seal::{Clock, Keyring, KEY_LIFETIME_MS, RETIRED_KEY_KEPT_MS};
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    handler, stream_handler, Confidentiality, Config, Link, Offer, Served, Stream, StreamEvent,
+    handler, stream_handler, Confidentiality, Config, Link, LinkError, Offer, Served, Stream,
+    StreamEvent,
 };
 use macula_rust::transport::Target;
 
@@ -151,5 +153,111 @@ async fn a_pool_that_resealed_a_clear_call_or_stream_seals_the_next_first_time()
     assert_eq!(counted(&keyed, "call_refused_sealed_required"), 1);
     assert!(watched(&pool, open).await);
     assert_eq!(counted(&keyed, "stream_refused_sealed_required"), 1);
+    pool.close().await;
+}
+
+/// A clock that stands still until `armed`, then moves on by a key's
+/// lifetime and its keeping at every read: a key the keyring names is
+/// forgotten two reads later, so a reopen sealed to the key a refusal named
+/// is refused sealed_refused.
+fn forgetting_clock(armed: Arc<AtomicBool>) -> Clock {
+    let now = AtomicI64::new(1_790_000_000_000);
+    let step = KEY_LIFETIME_MS + RETIRED_KEY_KEPT_MS + 1;
+    Arc::new(move || match armed.load(Ordering::SeqCst) {
+        true => now.fetch_add(step, Ordering::SeqCst) + step,
+        false => now.load(Ordering::SeqCst),
+    })
+}
+
+/// Replies the bytes the caller sent, once it has ended its sending.
+async fn count_bytes(stream: Stream) -> Result<(), String> {
+    let mut total = 0i128;
+    while let Ok(event) = stream.recv().await {
+        match event {
+            StreamEvent::Data {
+                body: Value::Bytes(b),
+                ..
+            } => total += b.len() as i128,
+            StreamEvent::End { .. } => break,
+            _ => {}
+        }
+    }
+    stream
+        .reply(Value::Int(total))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Opens `open` on `pool`, sends five bytes and its end, and gives the
+/// provider's answer.
+async fn uploaded(pool: &Pool, open: StreamCall) -> Result<StreamEvent, LinkError> {
+    let stream = pool.open_stream(open).await.unwrap();
+    for chunk in ["ab", "cde"] {
+        stream.send(chunk.as_bytes()).await?;
+    }
+    stream.close_send().await?;
+    tokio::time::timeout(Duration::from_secs(10), stream.recv())
+        .await
+        .expect("an answer within ten seconds")
+}
+
+/// Serves `procedure` as a client stream counting what it is sent.
+async fn serve_count(link: &Link, procedure: &str, required: bool) -> Served {
+    let mut offer = Offer::stream(
+        REALM,
+        procedure,
+        StreamMode::ClientStream,
+        stream_handler(count_bytes),
+    );
+    if required {
+        offer.confidential = Confidentiality::Required;
+    }
+    link.serve(offer).await.unwrap()
+}
+
+/// Fable's review of #42, finding 1: a sealed_refused that reached the
+/// reopened session before its replay carried the stream onto a third
+/// session without the copy, every write after it answered Ok. The copy
+/// arrives, or the stream ends with an error; never a stream short of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reopen_refused_sealed_refused_never_loses_the_copy() {
+    let profile = Profile::PqHybrid;
+    let lab = Lab::start(profile);
+    let station = lab.station("reopen refused");
+    let identity = Arc::new(NodeKey::generate_identity(profile, PUZZLE_DIFFICULTY).unwrap());
+    let count = record::own_procedure(&identity.node_id().unwrap(), "count");
+    let open = StreamCall {
+        realm: REALM,
+        procedure: count.clone(),
+        mode: StreamMode::ClientStream,
+        ..StreamCall::default()
+    };
+
+    // The pool remembers the provider keyless, so it opens in the clear.
+    let keyless = provider(&station, identity.clone(), None).await;
+    let served = serve_count(&keyless, &count, false).await;
+    let pool = caller(profile, &station).await;
+    let answer = uploaded(&pool, open.clone()).await.unwrap();
+    assert_eq!(
+        answer,
+        StreamEvent::Reply {
+            payload: Value::Int(5)
+        }
+    );
+    served.stop().await.unwrap();
+    keyless.close("keying").await.unwrap();
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let keyring = Arc::new(Keyring::new(profile, forgetting_clock(armed.clone())).unwrap());
+    let keyed = provider(&station, identity, Some(keyring)).await;
+    let _served = serve_count(&keyed, &count, true).await;
+    armed.store(true, Ordering::SeqCst);
+    match uploaded(&pool, open).await {
+        Ok(StreamEvent::Reply { payload }) => assert_eq!(payload, Value::Int(5)),
+        Ok(other) => panic!("{other:?}"),
+        Err(_) => {}
+    }
+    assert_eq!(counted(&keyed, "stream_refused_sealed_required"), 1);
+    assert!(counted(&keyed, "stream_refused_sealed_refused") >= 1);
     pool.close().await;
 }

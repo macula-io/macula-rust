@@ -63,6 +63,73 @@ const STREAM_INBOX: usize = 16 * 1024 * 1024;
 /// Streams one link drains at a time after a sealed_required refusal.
 pub(super) const DRAINS: usize = 16;
 
+/// The share of a link's drains one caller may hold: a quarter, so a caller
+/// at its session cap cannot take them all and leave every other caller's
+/// refusal to close at once.
+const DRAINS_PER_CALLER_SHARE: usize = 4;
+
+/// A link's places for streams being drained after a sealed_required
+/// refusal: `total` in all and a quarter of them, at least one, per caller.
+pub(super) struct Drains {
+    total: usize,
+    per_caller: usize,
+    held: Mutex<DrainsHeld>,
+}
+
+#[derive(Default)]
+struct DrainsHeld {
+    total: usize,
+    callers: std::collections::HashMap<[u8; 32], usize>,
+}
+
+impl Drains {
+    pub(super) fn new(total: usize) -> Drains {
+        Drains {
+            total,
+            per_caller: (total / DRAINS_PER_CALLER_SHARE).max(1),
+            held: Mutex::new(DrainsHeld::default()),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, DrainsHeld> {
+        self.held.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A drain place for `caller`, or `None` when the link's or the
+    /// caller's are all held. Dropping the place gives it back.
+    fn take(self: &Arc<Self>, caller: [u8; 32]) -> Option<DrainPlace> {
+        let mut held = self.held();
+        let by_caller = held.callers.get(&caller).copied().unwrap_or(0);
+        if held.total >= self.total || by_caller >= self.per_caller {
+            return None;
+        }
+        held.total += 1;
+        held.callers.insert(caller, by_caller + 1);
+        Some(DrainPlace {
+            drains: self.clone(),
+            caller,
+        })
+    }
+}
+
+/// A refused stream's drain place, given back when dropped.
+struct DrainPlace {
+    drains: Arc<Drains>,
+    caller: [u8; 32],
+}
+
+impl Drop for DrainPlace {
+    fn drop(&mut self) {
+        let mut held = self.drains.held();
+        held.total -= 1;
+        let left = held.callers.get(&self.caller).copied().unwrap_or(1) - 1;
+        match left {
+            0 => held.callers.remove(&self.caller),
+            n => held.callers.insert(self.caller, n),
+        };
+    }
+}
+
 /// How long a refused stream's drain waits for the caller's sending to end.
 const DRAIN_WAIT: Duration = Duration::from_secs(5);
 
@@ -684,9 +751,12 @@ impl StreamInner {
     /// Returns once this session's reseal has ended, either way.
     async fn reopen_awaited(&self) {
         let notified = self.notify.notified();
-        // Checked again once registered, so the reseal's end is not missed
-        // between the two.
-        if self.side().reopening {
+        tokio::pin!(notified);
+        // Registered before the check, so the reseal's end, which wakes
+        // every waiter, is not missed between the two.
+        notified.as_mut().enable();
+        let reopening = self.side().reopening;
+        if reopening {
             notified.await;
         }
     }
@@ -886,7 +956,14 @@ async fn reopened(
         return Err(refused);
     }
     let until = tokio::time::Instant::now() + Duration::from_millis(left);
-    let reseal = r.learnt.and_then(|learnt| learnt(&key));
+    // A reopen with a copy to replay holds no reseal of its own: a
+    // sealed_refused that beat the replay would carry the stream onto a third
+    // session without the copy. Refused, it ends the stream with why.
+    let replaying = !r.sent.is_empty();
+    let reseal = r
+        .learnt
+        .and_then(|learnt| learnt(&key))
+        .filter(|_| !replaying);
     let call = StreamCall {
         seal: Some(Seal::To(key)),
         deadline: Duration::from_millis(left),
@@ -1265,7 +1342,8 @@ async fn refuse(s: &Arc<StreamInner>, code: &str, message: &str, mut recv: quinn
 /// stopping its sending at once would have the station reset the stream and
 /// lose the refusal the caller reseals from (DESIGN_E2E_SEALED_BY_DEFAULT
 /// section 3). The drain holds the caller's session place and one of the
-/// link's [`DRAINS`]; with none left, the stream is released at once.
+/// link's [`Drains`], within the caller's share; with none left, the stream
+/// is released at once.
 async fn refuse_sealed_required(
     s: &Arc<StreamInner>,
     message: &str,
@@ -1274,7 +1352,7 @@ async fn refuse_sealed_required(
 ) {
     // Decided and counted before the refusal goes out: the caller may reseal
     // and finish before this task runs again.
-    let draining = s.link.drains.clone().try_acquire_owned().ok();
+    let draining = s.link.drains.take(s.open.caller);
     match draining {
         Some(_) => s.link.count("stream_refusal_drained"),
         None => s.link.count("stream_refusal_drains_full"),
@@ -1607,5 +1685,35 @@ fn settles(fields: &StreamFields, sealed: bool) -> bool {
         StreamFields::Data { .. } | StreamFields::Reply { .. } => true,
         StreamFields::End { .. } => !sealed,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fable's review of #42: one caller at its session cap could hold every
+    /// drain, so every other caller's refusal closed at once.
+    #[test]
+    fn one_caller_holds_at_most_a_quarter_of_the_drains() {
+        let drains = Arc::new(Drains::new(DRAINS));
+        let (flooder, other) = ([1u8; 32], [2u8; 32]);
+        let held: Vec<_> = (0..DRAINS).filter_map(|_| drains.take(flooder)).collect();
+        assert_eq!(held.len(), DRAINS / DRAINS_PER_CALLER_SHARE);
+        assert!(drains.take(other).is_some(), "another caller still drains");
+        drop(held);
+        assert_eq!(drains.held().callers.get(&flooder), None);
+    }
+
+    #[test]
+    fn the_link_s_drains_bound_every_caller_together() {
+        let drains = Arc::new(Drains::new(2));
+        let a = drains.take([1u8; 32]);
+        let b = drains.take([2u8; 32]);
+        assert!(a.is_some() && b.is_some());
+        assert!(drains.take([3u8; 32]).is_none());
+        drop(a);
+        assert!(drains.take([3u8; 32]).is_some());
+        assert!(Arc::new(Drains::new(0)).take([1u8; 32]).is_none());
     }
 }
