@@ -71,7 +71,7 @@ const DRAIN_WAIT: Duration = Duration::from_secs(5);
 const HANDLER_DRAIN: Duration = Duration::from_secs(5);
 
 /// How long a close waits for the peer to end its side.
-pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// How far ahead a STREAM_OPEN's deadline lies when its [`StreamCall`] names
 /// none, as macula's default.
@@ -275,7 +275,7 @@ impl Stream {
     }
 
     /// Ends the stream on both sides: once the peer has read the end and
-    /// ended its side too, or [`CLOSE_WAIT`] on. Until then the stream reads
+    /// ended its side too, or 5 seconds on. Until then the stream reads
     /// on, so a clear open's refusal still on its way reseals it and replays
     /// the close on the session it reopens on, and this side does not stop
     /// its receiving while the peer may still write.
@@ -1255,13 +1255,16 @@ async fn refuse_sealed_required(
     mut recv: quinn::RecvStream,
     place: SessionPlace,
 ) {
+    // Decided and counted before the refusal goes out: the caller may reseal
+    // and finish before this task runs again.
+    let draining = s.link.drains.clone().try_acquire_owned().ok();
+    match draining {
+        Some(_) => s.link.count("stream_refusal_drained"),
+        None => s.link.count("stream_refusal_drains_full"),
+    }
     answer_refusal(s, CODE_SEALED_REQUIRED, message).await;
-    match s.link.drains.clone().try_acquire_owned() {
-        Ok(_drain) => {
-            s.link.count("stream_refusal_drained");
-            let _ = tokio::time::timeout(DRAIN_WAIT, drain(&mut recv)).await;
-        }
-        Err(_) => s.link.count("stream_refusal_drains_full"),
+    if draining.is_some() {
+        let _ = tokio::time::timeout(DRAIN_WAIT, drain(&mut recv)).await;
     }
     let _ = recv.stop(0u32.into());
     drop(place);
