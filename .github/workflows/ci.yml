@@ -84,7 +84,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      # `shell: bash`, or this step proves nothing: pwsh hands the script to a
+      # child and exits 0 whatever it printed, so the job passes without the
+      # check running (review of macula-io/macula-rust#54). Git Bash ships on
+      # the Windows runner, and `rustup show` still reads rust-toolchain.toml.
       - name: Rust, as rust-toolchain.toml pins it
+        shell: bash
         run: |
           rustup show
           scripts/assert_toolchain.sh
