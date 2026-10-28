@@ -50,6 +50,27 @@ jobs:
       - run: ./scripts/build-teststation.sh
       - run: cargo test --workspace --all-features --locked
 
+  coverage:
+    # A change that drops line coverage below the floor fails here (#50). The
+    # floor is master's measured line coverage, rounded down to a whole
+    # percent; it only goes up, in a commit that says why (README, Testing).
+    name: coverage floor (lines)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      - run: cargo install cargo-llvm-cov --locked --version 0.6.21
+      - run: ./scripts/build-teststation.sh
+      - run: cargo llvm-cov --workspace --all-features --locked --summary-only --fail-under-lines 89
+
   windows-keystore:
     # A node key on Windows lives in Credential Manager only (#19): a real
     # round trip through it, and a key file refused.

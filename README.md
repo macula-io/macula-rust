@@ -282,6 +282,17 @@ stations, realms and orgs as each test asks, and reports what a station sees
 relays). A test fails, not skips, when the helper is missing. No network is
 needed. Go ≥ 1.27 builds the helper.
 
+CI holds line coverage to a floor (the `coverage` job, #50): the same tests
+under `cargo llvm-cov`, failing below 89% of lines. The floor is master's
+measured value rounded down, 89.34% on 28 October 2026. It only goes up, in a
+commit that says why. To see where a change stands:
+
+```bash
+cargo install cargo-llvm-cov --locked --version 0.6.21
+rustup component add llvm-tools-preview
+cargo llvm-cov --workspace --all-features --summary-only
+```
+
 `tests/live.rs` runs against one real station and is ignored unless asked:
 
 ```bash
