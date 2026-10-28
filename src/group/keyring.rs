@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::cbor::Value;
 use crate::seal::Clock;
 
-use super::epoch::{for_publish, org_of, retain_live, under};
+use super::epoch::{for_publish, org_of, retain_live, under, wall_clock};
 use super::wire::{
     by_id_request, current_request, parse_reply, procedure, zeroize_reply, Policy, Reply,
 };
@@ -756,16 +756,6 @@ fn abort(timer: Option<JoinHandle<()>>) {
 
 fn millis(delay: i64) -> Duration {
     Duration::from_millis(u64::try_from(delay).unwrap_or(0))
-}
-
-/// The wall clock in Unix milliseconds.
-fn wall_clock() -> Clock {
-    Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-    })
 }
 
 /// A draw from `[0, 1)`, from the crate's own randomness.

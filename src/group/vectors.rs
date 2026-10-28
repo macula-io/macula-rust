@@ -155,15 +155,24 @@ fn every_org_grant_case_reaches_macula_s_verdict() {
     assert_eq!(seen, 12, "six cases in each of two profiles");
 }
 
-/// The refusals a distributor names are exactly the ones this crate maps, so
-/// a refusal it sends is never read as a failure of another kind.
+/// The refusals a distributor names are exactly the ones macula's vectors pin
+/// and this crate maps, so a refusal this crate's own distributor sends is
+/// never read as a failure of another kind.
 #[test]
 fn the_refusals_are_the_closed_set() {
     let v = vectors();
     let refusals = v["refusals"].as_array().unwrap();
     assert_eq!(refusals.len(), 5, "the distributor's own five");
-    for r in refusals {
-        let name = r.as_str().unwrap();
+    let named: Vec<&str> = refusals.iter().map(|r| r.as_str().unwrap()).collect();
+    let distributor: Vec<&str> = super::distributor::Refusal::ALL
+        .iter()
+        .map(|refusal| refusal.name())
+        .collect();
+    assert_eq!(
+        distributor, named,
+        "the refusals this crate's distributor names"
+    );
+    for name in &named {
         let reason = Reason::from_refusal(name).unwrap_or_else(|| panic!("no reason {name}"));
         assert_eq!(
             reason.name(),

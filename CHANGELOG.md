@@ -15,6 +15,28 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Added
+
+- **A sealed group's distributor** (macula-rust#46, macula's
+  `macula_group_keys`, `DESIGN_E2E_SEALED_PUBSUB.md` §3 and §5):
+  `group::Distributor` serves an org's `<org>/group_keys_v1` through
+  `Pool::serve` with `Distributor::offer`, which is sealed only
+  (`Confidentiality::Required`, so a clear pull is refused `sealed_required`)
+  and gated on the org key's `group_keys` UCAN
+  (`ucan::Policy::RealmMemberRequired`), both checked by the pool before the
+  handler runs. A node with `kem_advertise` off refuses to serve it rather
+  than advertise a distributor no member could pull from safely. It answers
+  the current epoch and the next one inside its ahead window, and a past epoch
+  by id while it still holds it; epochs are contiguous, kept in memory only
+  and never printed. Admission is the application's, asked per group — a
+  `removed` set that is absolute and refuses every epoch, and a live
+  `membership` that a lookup which fails or times out answers
+  `membership_unknown` rather than `not_a_member`. Refusals are the design's
+  five, named as macula's `group_keys_v1` vectors name them. `Epoch::fresh`,
+  `Epoch::following` and `Epoch::in_ahead_window` are public, and
+  `group::NoRandomness` is why a node whose randomness does not answer makes
+  no epoch.
+
 ### [0.13.0] - 2026-10-28
 
 Release A0 of sealed by default (macula#135, `DESIGN_E2E_SEALED_BY_DEFAULT.md`

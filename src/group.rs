@@ -1,27 +1,37 @@
-//! The member side of sealed groups (macula 13.2,
+//! Sealed groups (macula 13.2,
 //! `docs/design/DESIGN_E2E_SEALED_PUBSUB.md`): a group is a topic prefix whose
 //! events are sealed under the group's current epoch key, which the org's
 //! distributor hands out over a sealed call, `<org>/group_keys_v1`, to members
 //! holding the org's grant. This is the Rust counterpart of macula's
-//! `macula_group_epoch`, `macula_group_event` and `macula_group_keyring`:
-//! epochs and their times, sealing and opening an event, the pull's payloads,
-//! and the keyring a node holds its groups' epochs in. Epoch keys are held in
-//! memory only, erased when no event under them can be accepted any more, and
-//! never printed.
+//! `macula_group_epoch`, `macula_group_event`, `macula_group_keyring` and
+//! `macula_group_keys`: epochs and their times, sealing and opening an event,
+//! the pull's payloads, the keyring a node holds its groups' epochs in, and the
+//! distributor that serves them. Epoch keys are held in memory only, erased
+//! when no event under them can be accepted any more, and never printed.
 //!
-//! Member side only: this crate serves no distributor.
+//! [`Keyring`] is the member side, behind [`Pool::join_group`], and
+//! [`Distributor`] is the other half, served through [`Pool::serve`] with
+//! [`Distributor::offer`].
+//!
+//! [`Pool::join_group`]: crate::pool::Pool::join_group
+//! [`Pool::serve`]: crate::pool::Pool::serve
 
 use std::error::Error;
 use std::fmt;
 
+mod distributor;
 mod epoch;
 mod event;
 mod keyring;
 mod wire;
 
+pub use distributor::{
+    Distributor, DistributorOptions, Membership, MembershipCheck, MembershipFuture, RemovedCheck,
+    DEFAULT_MEMBERSHIP_TIMEOUT, GROUP_KEYS_CAN,
+};
 pub use epoch::{
-    for_publish, org_of, retain_live, under, Epoch, NotAGroup, DEFAULT_ROTATE_AFTER_MS,
-    EVENT_LIFE_MS, ID_SIZE, KEY_SIZE, TOLERANCE_MS,
+    for_publish, org_of, retain_live, under, Epoch, NoRandomness, NotAGroup,
+    DEFAULT_ROTATE_AFTER_MS, EVENT_LIFE_MS, ID_SIZE, KEY_SIZE, TOLERANCE_MS,
 };
 pub use event::{open_event, seal_event, Fields};
 pub use keyring::{JoinOptions, Keyring, Options, Pull, PullError, Puller};

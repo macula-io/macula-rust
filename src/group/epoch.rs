@@ -5,6 +5,8 @@ use std::fmt;
 
 use macula_mldsa::Zeroizing;
 
+use crate::seal::Clock;
+
 /// How long an epoch publishes by default, in milliseconds.
 pub const DEFAULT_ROTATE_AFTER_MS: i64 = 15 * 60_000;
 
@@ -77,6 +79,20 @@ impl Epoch {
         from + ((to - from) as f64 * fraction) as i64
     }
 
+    /// Whether `now` is inside this epoch's ahead window: from there on a pull
+    /// is also handed the next epoch, and every holder re-pulls.
+    pub fn in_ahead_window(&self, now: i64) -> bool {
+        let (from, to) = self.ahead_window();
+        (from..to).contains(&now)
+    }
+
+    /// The epoch that follows this one: issued when this one stops publishing,
+    /// so a group's epochs are contiguous and the next one is holdable before
+    /// this one's `publish_until`.
+    pub fn following(&self, rotate_after: i64) -> Result<Epoch, NoRandomness> {
+        fresh(self.publish_until, rotate_after)
+    }
+
     /// Whether an event under this epoch is accepted at `now`: until its
     /// `accept_until`, with the 5-minute clock tolerance.
     pub fn acceptable(&self, now: i64) -> bool {
@@ -119,6 +135,50 @@ pub fn for_publish(held: &[Epoch], now: i64) -> Option<&Epoch> {
     held.iter()
         .filter(|e| e.issued_at <= now && now < e.publish_until)
         .max_by_key(|e| e.issued_at)
+}
+
+/// An epoch a distributor makes: a random 32-byte key and a random 8-byte id,
+/// independent of every other epoch's, issued at `at` and publishing for
+/// `rotate_after`.
+///
+/// The system's randomness is the only source: an epoch key is never drawn
+/// from anything weaker, so a node whose randomness does not answer makes no
+/// epoch.
+pub fn fresh(at: i64, rotate_after: i64) -> Result<Epoch, NoRandomness> {
+    let mut key = [0u8; KEY_SIZE];
+    let mut id = [0u8; ID_SIZE];
+    aws_lc_rs::rand::fill(&mut key).map_err(|_| NoRandomness)?;
+    aws_lc_rs::rand::fill(&mut id).map_err(|_| NoRandomness)?;
+    Ok(Epoch::new(
+        id,
+        key,
+        at,
+        at + rotate_after,
+        at + rotate_after + EVENT_LIFE_MS,
+    ))
+}
+
+/// The system's randomness did not answer, so no epoch was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoRandomness;
+
+impl fmt::Display for NoRandomness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the system's randomness did not answer, so no epoch was made")
+    }
+}
+
+impl std::error::Error for NoRandomness {}
+
+/// The wall clock, in Unix milliseconds: what a node's times are read from
+/// unless it is given another.
+pub(crate) fn wall_clock() -> Clock {
+    std::sync::Arc::new(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    })
 }
 
 /// Drops the held epochs no longer of use at `now`.

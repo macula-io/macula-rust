@@ -112,10 +112,8 @@ pub fn parse_reply(prefix: &str, v: &Value) -> Result<Reply, GroupError> {
 }
 
 /// The RESULT payload for `r`, as a distributor answers it and as the vectors
-/// pin it. Only a distributor builds one, and this crate serves none: it is
-/// here for the vectors and the tests that hold this crate to them, which is
-/// why it is not public.
-#[cfg(test)]
+/// pin it. Only a [`Distributor`](super::Distributor) builds one, which is why
+/// it is not public: a member reads a reply, and nothing else here writes one.
 pub(crate) fn reply_value(r: &Reply) -> Value {
     let epochs = r
         .epochs
