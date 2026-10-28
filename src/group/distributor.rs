@@ -46,7 +46,7 @@
 //! per member, a number of groups in all, and a number of epochs per group's
 //! chain; a group nobody pulls is dropped once no epoch of it is kept, so
 //! what it held comes back. Each cap names itself in the failure's detail
-//! (`group_capacity_member`, `group_capacity_total`, `epoch_capacity`) and
+//! (`too_many_groups_member`, `too_many_groups`, `too_many_epochs`) and
 //! none of them is one of the design's five, so a member reads a full
 //! distributor as a failed pull and retries, never as a reason to stop.
 
@@ -149,10 +149,16 @@ impl DistributorOptions {
 /// new one; the third bounds one group's chain.
 ///
 /// A refusal from one of them is not a refusal of the design's: it names
-/// itself in the `handler_error`'s detail (`group_capacity_member`,
-/// `group_capacity_total`, `epoch_capacity`), so a member reads it as a failed
+/// itself in the `handler_error`'s detail (`too_many_groups_member`,
+/// `too_many_groups`, `too_many_epochs`), so a member reads it as a failed
 /// pull and retries rather than as one of the five reasons, and an operator
 /// sees which limit was reached.
+///
+/// The total's name is macula's own: its `macula_group_keys` refuses a new
+/// group `too_many_groups` past `max_groups` (1024, the same default), so a
+/// member and an operator read one name for one condition whatever SDK served
+/// it. The other two are the bounds macula does not keep yet, and take the
+/// same family's shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps {
     /// How many prefixes one caller may cause the distributor to hold.
@@ -315,9 +321,9 @@ impl Capacity {
     /// rather than as a refusal.
     fn detail(self) -> &'static str {
         match self {
-            Capacity::PerMember => "group_capacity_member",
-            Capacity::Total => "group_capacity_total",
-            Capacity::Epochs => "epoch_capacity",
+            Capacity::PerMember => "too_many_groups_member",
+            Capacity::Total => "too_many_groups",
+            Capacity::Epochs => "too_many_epochs",
         }
     }
 }
@@ -497,7 +503,7 @@ impl Distributor {
     /// be accepted any more.
     ///
     /// The chain is kept to [`Caps::epochs`]: a pull that would grow it past
-    /// that is answered `epoch_capacity` and the store is left as it was, so
+    /// that is answered `too_many_epochs` and the store is left as it was, so
     /// no chain outgrows what the distributor was sized for.
     fn current(&self, prefix: &str, caller: [u8; 32], now: i64) -> Result<Reply, Unanswered> {
         let rotation = self.inner.rotate_after_ms;
@@ -1122,7 +1128,7 @@ mod tests {
         assert!(pull_group(&distributor, CALLER, "two").await.is_ok());
         assert_eq!(
             pull_group(&distributor, CALLER, "three").await,
-            Err("group_capacity_member".into())
+            Err("too_many_groups_member".into())
         );
         assert!(
             pull_group(&distributor, OTHER, "three").await.is_ok(),
@@ -1145,7 +1151,7 @@ mod tests {
         assert!(pull_group(&distributor, OTHER, "two").await.is_ok());
         assert_eq!(
             pull_group(&distributor, OTHER, "three").await,
-            Err("group_capacity_total".into())
+            Err("too_many_groups".into())
         );
     }
 
@@ -1164,7 +1170,7 @@ mod tests {
         assert!(pull_group(&distributor, CALLER, "one").await.is_ok());
         assert_eq!(
             pull_group(&distributor, CALLER, "two").await,
-            Err("group_capacity_member".into())
+            Err("too_many_groups_member".into())
         );
 
         let idle = epoch_of(&distributor, CALLER, "one").await;
@@ -1200,7 +1206,7 @@ mod tests {
         clock.store(first.ahead_window().0, Ordering::SeqCst);
         assert_eq!(
             current(&distributor).await,
-            Err("epoch_capacity".into()),
+            Err("too_many_epochs".into()),
             "the ahead epoch would be a second"
         );
         let still = stored(&distributor);

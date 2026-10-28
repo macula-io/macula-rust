@@ -36,7 +36,7 @@ usually touches both, but their version numbers don't move in lockstep.
   is bounded: `group::Caps` caps the groups one member may make a host hold,
   the groups a host holds in all, and the epochs one group's chain holds, a
   group nobody pulls releases what it held, and each cap names itself in the
-  failure (`group_capacity_member`, `group_capacity_total`, `epoch_capacity`)
+  failure (`too_many_groups_member`, `too_many_groups`, `too_many_epochs`)
   rather than in the design's closed set of five, so a member retries a full
   distributor instead of reading it as a reason.
   `Epoch::fresh`, `Epoch::following` and `Epoch::in_ahead_window` are public,
