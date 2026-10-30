@@ -186,9 +186,6 @@ async fn stalled_reader(env: &TestStations) -> Stalled {
         "the reader opens an event before the stall: {first:?}"
     );
 
-    // Once the epochs rotate past the keys the reader holds, an event names
-    // one it has to pull, and the pull stalls: publish until one does, so the
-    // test goes on with a pull in flight.
     // Once the reader's own refresh pull stalls, it holds no key it does
     // not hold now, and an event published after that waits on its pull.
     stall.on.store(true, Ordering::SeqCst);

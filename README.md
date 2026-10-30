@@ -71,7 +71,7 @@ Swift. The core crate has no FFI dependency and no FFI-shaped types.
 
 ```toml
 [dependencies]
-macula-rust = "0.13"
+macula-rust = "0.15"
 tokio = { version = "1", features = ["full"] }
 ```
 

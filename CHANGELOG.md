@@ -15,6 +15,8 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.15.0] - 2026-10-30
+
 #### Breaking
 
 - **`Subscription::recv` yields a `Delivery`** (macula-station#129, phase 1):
@@ -1090,6 +1092,8 @@ did, but the two have moved at different paces ever since).
 
 
 ### [Unreleased]
+
+### [ffi-0.12.0] - 2026-10-30
 
 #### Breaking
 
