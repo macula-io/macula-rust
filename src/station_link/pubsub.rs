@@ -169,12 +169,20 @@ const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
 pub(super) struct Unconfirmed {
     sent: VecDeque<(u64, SignedPublication, usize)>,
     bytes: usize,
+    /// Taken once the link ended: nothing takes from it again, so it holds
+    /// nothing more.
+    taken: bool,
 }
 
 impl Unconfirmed {
     /// Holds `p`, sent as frame `number` of `bytes` bytes, making room past
-    /// the caps by letting go of the oldest: answers how many it let go.
-    fn hold(&mut self, number: u64, p: SignedPublication, bytes: usize) -> u64 {
+    /// the caps by letting go of the oldest: answers how many it let go, or
+    /// `None` once taken, when a publication held here would never be sent
+    /// again nor counted.
+    fn hold(&mut self, number: u64, p: SignedPublication, bytes: usize) -> Option<u64> {
+        if self.taken {
+            return None;
+        }
         self.sent.push_back((number, p, bytes));
         self.bytes += bytes;
         let mut let_go = 0;
@@ -183,7 +191,7 @@ impl Unconfirmed {
         {
             let_go += self.let_go_oldest();
         }
-        let_go
+        Some(let_go)
     }
 
     /// Lets go of every publication sent before frame `number`: the station
@@ -204,6 +212,7 @@ impl Unconfirmed {
 
     /// Every publication still held, oldest first, leaving none.
     fn take(&mut self) -> Vec<SignedPublication> {
+        self.taken = true;
         self.bytes = 0;
         self.sent.drain(..).map(|(_, p, _)| p).collect()
     }
@@ -212,8 +221,19 @@ impl Unconfirmed {
 impl Inner {
     /// Holds `p`, sent as frame `number`, until the station is known to have
     /// read it; one let go to make room is counted, not silent.
-    fn hold_unconfirmed(&self, number: u64, p: SignedPublication, bytes: usize) {
-        let let_go = self.lock().unconfirmed.hold(number, p, bytes);
+    /// [`LinkError::Closed`] once the pool took what the ended link held: the
+    /// publication may not have arrived, and the caller sends it elsewhere.
+    fn hold_unconfirmed(
+        &self,
+        number: u64,
+        p: SignedPublication,
+        bytes: usize,
+    ) -> Result<(), LinkError> {
+        let let_go = self
+            .lock()
+            .unconfirmed
+            .hold(number, p, bytes)
+            .ok_or(LinkError::Closed)?;
         if let_go > 0 {
             *self
                 .lock()
@@ -221,6 +241,7 @@ impl Inner {
                 .entry("publication_unconfirmed_let_go".into())
                 .or_default() += let_go;
         }
+        Ok(())
     }
 
     /// The station answered frame `number`: every publication sent before it
@@ -611,9 +632,10 @@ impl Link {
             .control
             .write_numbered(&encoded, MAX_FRAME_BYTES)
             .await?;
+        // The link may have ended while the frame was written, and the pool
+        // taken what it held: then this one is the caller's to send again.
         self.inner
-            .hold_unconfirmed(number, p.clone(), encoded.len());
-        Ok(())
+            .hold_unconfirmed(number, p.clone(), encoded.len())
     }
 
     /// Takes the publications sent on this link that the station is not
@@ -851,7 +873,7 @@ mod tests {
     fn a_pong_confirms_only_the_publications_sent_before_its_ping() {
         let mut u = Unconfirmed::default();
         for n in [1, 2, 4] {
-            assert_eq!(u.hold(n, signed(n), 10), 0);
+            assert_eq!(u.hold(n, signed(n), 10), Some(0));
         }
         // The ping went out as frame 3: frames 1 and 2 were read before it.
         u.confirm_before(3);
@@ -864,16 +886,27 @@ mod tests {
     fn past_a_cap_the_oldest_is_let_go_and_counted() {
         let mut u = Unconfirmed::default();
         for n in 0..MAX_UNCONFIRMED as u64 {
-            assert_eq!(u.hold(n, signed(n), 1), 0);
+            assert_eq!(u.hold(n, signed(n), 1), Some(0));
         }
-        assert_eq!(u.hold(9_999, signed(9_999), 1), 1);
+        assert_eq!(u.hold(9_999, signed(9_999), 1), Some(1));
         assert_eq!(u.sent.front().map(|(n, _, _)| *n), Some(1));
 
         let mut u = Unconfirmed::default();
-        assert_eq!(u.hold(1, signed(1), MAX_UNCONFIRMED_BYTES), 0);
-        assert_eq!(u.hold(2, signed(2), 1), 1);
+        assert_eq!(u.hold(1, signed(1), MAX_UNCONFIRMED_BYTES), Some(0));
+        assert_eq!(u.hold(2, signed(2), 1), Some(1));
         // One over the byte cap on its own is still held: it was sent.
-        assert_eq!(u.hold(3, signed(3), MAX_UNCONFIRMED_BYTES + 1), 1);
+        assert_eq!(u.hold(3, signed(3), MAX_UNCONFIRMED_BYTES + 1), Some(1));
         assert_eq!(held(&mut u), vec![3]);
+    }
+
+    #[test]
+    fn a_publication_sent_after_the_take_is_refused_not_held() {
+        let mut u = Unconfirmed::default();
+        assert_eq!(u.hold(1, signed(1), 10), Some(0));
+        assert_eq!(held(&mut u), vec![1]);
+        // Written as the link ended, held after the pool took the rest: the
+        // caller hears it, as nothing would take it from here.
+        assert_eq!(u.hold(2, signed(2), 10), None);
+        assert_eq!(held(&mut u), Vec::<u64>::new());
     }
 }

@@ -28,6 +28,8 @@ usually touches both, but their version numbers don't move in lockstep.
   (4096 waiting) is counted in the new `Pool::unsent_publications`; one a
   link let go past its own caps (4096 or 32 MiB unconfirmed) is counted as
   `publication_unconfirmed_let_go` in its unrouted counters.
+  The pong says the station read a publication, not that it passed it on:
+  a station's own drops are outside this.
   `tests/pool_resend.rs` loses the packets through a UDP relay and checks
   both outcomes.
 - **A group's rotation, proven live** (macula-rust#52): `tests/group_rotation.rs`
