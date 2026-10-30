@@ -17,6 +17,7 @@
 
 mod call;
 mod content;
+mod delivery;
 mod group;
 mod member;
 mod pubsub;
@@ -28,6 +29,7 @@ use crate::station_link::SignedPublication;
 pub use crate::station_link::{ConfidentialityError, ConfidentialityReason, Report, ReportError};
 pub use call::{Call, Provider, StreamCall};
 pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
+pub use delivery::{Delivery, Gap, Interruption};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};
 

@@ -42,7 +42,7 @@ pub use pool::{
     own_procedure, FfiConfidentiality, FfiLinkStatus, FfiPool, FfiPoolOptions, FfiProvider,
     FfiRealmKey, FfiRecord, FfiSeed,
 };
-pub use pubsub::{FfiEvent, FfiSubscription};
+pub use pubsub::{FfiDelivery, FfiEvent, FfiSubscription};
 pub use serve::{FfiCallHandler, FfiRequest, FfiServed};
 pub use stream::{FfiStream, FfiStreamEncoding, FfiStreamEvent, FfiStreamHandler, FfiStreamMode};
 pub use ucan::{ucan_proof_id, FfiCapability, FfiPolicy, FfiUcan, FfiUcanOptions};

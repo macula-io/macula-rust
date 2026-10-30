@@ -803,6 +803,8 @@ fn unreachable(e: &LinkError) -> bool {
         LinkError::CallTimeout
             | LinkError::Closed
             | LinkError::LivenessLost
+            | LinkError::IdleTimeout
+            | LinkError::ClosedByStation(_)
             | LinkError::Io(_)
             | LinkError::Goodbye(_)
             | LinkError::StatusExpired

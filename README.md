@@ -189,7 +189,7 @@ compatibility layer.
 | Calls by direct dial (`call`, `providers`) | ✅ | ✅ | Candidates tried freshest first; errors arrive as `LinkError::Provider` / `LinkError::Relay` |
 | A node's own namespace (`record::own_procedure`) | ✅ | ✅ | `~<node_id>/<name>`: served and called with no org and no realm key |
 | Streams (`open_stream`, `Offer::stream`) | ✅ | ✅ | Server, client and bidi; a QUIC stream per session, released on every path |
-| Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links; `subscribe` returns once the station has acknowledged the SUBSCRIBE (REGISTER_ACK), so a publication sent after it is heard; one the station had not yet read when its link ended is sent again on the next link up (a subscriber that already had it delivers it once), and one that cannot be is counted in `Pool::unsent_publications`, never dropped silently |
+| Publish/subscribe | ✅ | ✅ | Signed publications, delivered once across links; a subscription no link carried for a while is told so in order (`Delivery::Interrupted`, then `Delivery::Gap`); `subscribe` returns once the station has acknowledged the SUBSCRIBE (REGISTER_ACK), so a publication sent after it is heard; one the station had not yet read when its link ended is sent again on the next link up (a subscriber that already had it delivers it once), and one that cannot be is counted in `Pool::unsent_publications`, never dropped silently |
 | End-to-end sealing (`seal`, `Confidentiality`) | ✅ | ✅ | Seal scheme 1 for calls and streams: a caller seals to the key an advertisement names; a provider with `kem_advertise` names its keyring's key (rotated daily, a replaced key kept 30 minutes), refuses what it cannot open `sealed_refused` and, when required, every clear request `sealed_required`; a clear call or stream refused `sealed_required` with the provider's signed `seal.kem_key` is sealed once more to that key (release A0 of `DESIGN_E2E_SEALED_BY_DEFAULT.md`, on a bare link too); `call_report` and `Stream::report` give the caller's seal report |
 | UCAN (`ucan`, `Call::token`, `Offer::policy`) | ✅ | ✅ | macula 12's tokens (D7) in the node's profile: `ucan::create` mints, a call or open presents a token and its chain's proofs, and an `Offer` gated on `Policy::UcanRequired` or `RealmMemberRequired` refuses what `ucan::authorize` does not accept `unauthorized` (a stray proof `malformed_frame`) before its handler runs; held to macula v13.6.0's `ucan_v1.json` |
 | Sealed groups (`group`, `join_group`, `publish_group`, `subscribe_group`, `Distributor`) | ✅ | ✅ | Sealed pubsub (macula 13.2, `DESIGN_E2E_SEALED_PUBSUB.md`): a group is a topic prefix whose events are sealed once under its current epoch key, which the org's distributor hands out over a sealed call to a member holding the org's grant; epochs are re-pulled at a random instant in the ahead window and erased as soon as no event under them is accepted — on the distributor's own clock, not at the group's next pull — and keys never touch disk. The member side is the keyring; the other half is `group::Distributor`, the org's `<org>/group_keys_v1` served through `Pool::serve` with a `Distributor::offer`, which is sealed only and gated on the org's `group_keys` grant, and asks the application's `removed` and `membership` — both per group, the removed set again after the membership answer — before it hands a key to a node, sharing one lookup per group and caller among the pulls in flight and refusing past `MAX_LOOKUPS` of them — and past `MAX_LOOKUPS_PER_CALLER` for any one caller, so no node takes the whole allowance by naming groups that need not exist, and its epoch store is capped per member, in total and per chain (`Caps`), the chain cap refused at construction when it is below what the rotation needs (`chain_bound`), so no caller can make a host hold more than it was sized for. Held to macula's `group_keys_v1` payloads byte for byte, the org's grant to macula's own verdicts, and a cross-test with macula's `macula_group_keys` distributor. A clear event under a *required* group is refused; under any other policy it is delivered as it arrives, so a subscriber that needs every event sealed checks `Event::seal_key_id` itself |
@@ -201,6 +201,50 @@ The link and the pool are ported from macula-go v0.12.0's `stationlink` and
 `pool`, and every wire format is checked against macula-go's and macula's own
 vectors (`tests/vectors/`). `unsafe_code = "forbid"` holds across the
 workspace; the unsafe code is inside dependencies (quinn, aws-lc-rs).
+
+## When a subscription may have missed events
+
+A subscription runs on every link the pool holds. When a station's link
+ends (two missed liveness probes, an idle timeout, the station closing it),
+whatever that station had written to the link is gone with it. If another
+link still carries the subscription, nothing is lost: that link carried every
+event. If none does, `Subscription::recv` says so, in order, on the same
+stream as the events:
+
+```rust
+use macula_rust::pool::{Delivery, Subscription};
+
+async fn follow(mut sub: Subscription) {
+    while let Some(delivery) = sub.recv().await {
+        match delivery {
+            Delivery::Event(event) => println!("{:?}", event.payload),
+            // No link carries the subscription: events from i.from_ms on
+            // may be missed until a Gap follows.
+            Delivery::Interrupted(i) => println!("interrupted: {}", i.reason),
+            // A station carries it again: resync what it follows, as events
+            // between g.from_ms and g.to_ms may have been missed.
+            Delivery::Gap(g) => println!("resync {}..{}", g.from_ms, g.to_ms),
+        }
+    }
+}
+```
+
+`Interrupted` arrives once when the last link carrying the subscription ends,
+`Gap` once when a station accepts it again, before any event that link
+hears. Neither arrives while another link still carries the subscription,
+for an outage a link survives (QUIC retransmits; nothing is lost), at the
+first subscribe, or after `unsubscribe` or the pool's close. A re-subscribe
+every station refuses leaves the subscription interrupted, with no `Gap`.
+`reason` names why the link ended, as every macula SDK names it:
+`liveness_lost`, `closed`, `goodbye`, `status_expired`, `binding_expired`,
+`malformed_frame`, `idle_timeout`, `closed_by_station`, `connection_lost`.
+
+The times are this node's clock, and an event's `published_at` is its
+publisher's: answer a `Gap` by resyncing, never by dropping events whose
+`published_at` falls outside it. Not covered: events a station refused to
+write to a backpressured link while it stayed up, a subscription a station
+drops while the link stays up, and publications lost before they reached a
+station (those are sent again, or counted in `Pool::unsent_publications`).
 
 ## Payloads
 

@@ -1,21 +1,24 @@
 //! PubSub through the pool: a subscription on every link the pool holds and
 //! every link it dials later, each event delivered once whichever links hear
-//! it; a publication signed once and sent on the first replication_factor
-//! links.
+//! it, and a notice when no link carried it for a while (see
+//! [`Delivery`]); a publication signed once and sent on the first
+//! replication_factor links.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::frame::Payload;
-use crate::station_link::{self, Event, Link, LinkError, Publication, SignedPublication};
+use crate::station_link::{self, now_ms, Event, Link, LinkError, Publication, SignedPublication};
 
+use super::delivery::{Coverage, Delivery};
 use super::{Pool, PoolError, PoolInner};
 
 /// How many events a subscription holds that its reader has not taken; one
-/// arriving at a full subscription is dropped and counted.
+/// arriving at a full subscription is dropped and counted. A notice is never
+/// dropped: at most one waits per time the subscription lost its links.
 const SUBSCRIPTION_BUFFER: usize = 256;
 
 static NEXT_SUBSCRIPTION: AtomicU64 = AtomicU64::new(1);
@@ -25,7 +28,7 @@ static NEXT_SUBSCRIPTION: AtomicU64 = AtomicU64::new(1);
 /// or the pool closes.
 pub struct Subscription {
     inner: Arc<SubInner>,
-    events: mpsc::Receiver<Event>,
+    events: mpsc::UnboundedReceiver<Delivery>,
     unsubscribed: bool,
 }
 
@@ -38,13 +41,19 @@ pub(super) struct SubInner {
     /// plain subscription, which delivers payloads as they arrive.
     group: Option<String>,
     held: Mutex<Held>,
+    /// How many events wait for the reader, against [`SUBSCRIPTION_BUFFER`].
+    queued: AtomicUsize,
     dropped: AtomicU64,
     refused: AtomicU64,
 }
 
 struct Held {
     /// `None` once the subscription ended.
-    events: Option<mpsc::Sender<Event>>,
+    events: Option<mpsc::UnboundedSender<Delivery>>,
+    /// The links that carry the subscription, and the notice owed when none
+    /// does. Changed under this lock, with the notice sent under it, so the
+    /// notices keep their place among the events.
+    coverage: Coverage,
     /// Each link's forwarder, by link serial: told to stop, it unsubscribes
     /// on its link and says how that went.
     on_links: HashMap<u64, Forwarder>,
@@ -79,7 +88,7 @@ impl Pool {
         topic: &str,
         group: Option<String>,
     ) -> Result<Subscription, PoolError> {
-        let (events_tx, events) = mpsc::channel(SUBSCRIPTION_BUFFER);
+        let (events_tx, events) = mpsc::unbounded_channel();
         let sub = Arc::new(SubInner {
             id: NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed),
             pool: Arc::downgrade(&self.inner),
@@ -89,8 +98,10 @@ impl Pool {
             refused: AtomicU64::new(0),
             held: Mutex::new(Held {
                 events: Some(events_tx),
+                coverage: Coverage::default(),
                 on_links: HashMap::new(),
             }),
+            queued: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
         });
         register(&self.inner, &sub)?;
@@ -140,10 +151,15 @@ impl Pool {
 }
 
 impl Subscription {
-    /// The next event, once, whichever links heard it; `None` once the
-    /// subscription or the pool has ended.
-    pub async fn recv(&mut self) -> Option<Event> {
-        self.events.recv().await
+    /// The next delivery: an event, once, whichever links heard it, or a
+    /// notice that events may have been missed ([`Delivery`]); `None` once
+    /// the subscription or the pool has ended.
+    pub async fn recv(&mut self) -> Option<Delivery> {
+        let delivery = self.events.recv().await?;
+        if let Delivery::Event(_) = delivery {
+            self.inner.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        Some(delivery)
     }
 
     /// How many events arrived while the subscription was full.
@@ -201,13 +217,18 @@ impl SubInner {
     /// Delivers one event: opened under the subscription's group when it has
     /// one, counted refused when the group refuses it, and counted dropped
     /// when the subscription is full.
-    async fn deliver(self: &Arc<Self>, events: &mpsc::Sender<Event>, event: Event) {
+    async fn deliver(self: &Arc<Self>, events: &mpsc::UnboundedSender<Delivery>, event: Event) {
         let Some(event) = self.delivered(event).await else {
             self.refused.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        if events.try_send(event).is_err() {
+        if self.queued.fetch_add(1, Ordering::Relaxed) >= SUBSCRIPTION_BUFFER {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
             self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if events.send(Delivery::Event(event)).is_err() {
+            self.queued.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -252,13 +273,45 @@ impl SubInner {
 
     /// Keeps `forwarder` as the one for the link with `serial`, when the
     /// subscription still runs and that link has none yet; whether it did.
+    /// The link covers the subscription from now: a [`Delivery::Gap`] owed
+    /// goes out here, before the forwarder delivers anything that link
+    /// heard.
     fn keep_forwarder(&self, serial: u64, forwarder: Forwarder) -> bool {
         let mut held = self.lock();
-        let wanted = held.events.is_some() && !held.on_links.contains_key(&serial);
-        if wanted {
-            held.on_links.insert(serial, forwarder);
+        let Some(events) = held.events.clone() else {
+            return false;
+        };
+        if held.on_links.contains_key(&serial) {
+            return false;
         }
-        wanted
+        held.on_links.insert(serial, forwarder);
+        let now = u64::try_from(now_ms()).unwrap_or(0);
+        if let Some(gap) = held.coverage.covers(serial, now) {
+            let _ = events.send(gap);
+        }
+        true
+    }
+
+    /// The subscription on `link` ended: when the link did, a
+    /// [`Delivery::Interrupted`] goes out if no other link carries the
+    /// subscription, unless the subscription or its pool is ending.
+    fn left_link(&self, link: &Link) {
+        let pool_closing = self.pool.upgrade().is_none_or(|pool| pool.lock().closed);
+        let mut held = self.lock();
+        held.on_links.remove(&link.serial());
+        let Some(ended) = link.error() else {
+            held.coverage.left(link.serial());
+            return;
+        };
+        let notice = held
+            .coverage
+            .ended(link.serial(), link.last_heard_ms(), ended.end_reason());
+        let Some(events) = held.events.as_ref().filter(|_| !pool_closing) else {
+            return;
+        };
+        if let Some(notice) = notice {
+            let _ = events.send(notice);
+        }
     }
 
     /// [`SubInner::attach`], for a task of its own.
@@ -288,7 +341,7 @@ impl SubInner {
         }
         tokio::spawn(forward(
             self.clone(),
-            link.serial(),
+            link.clone(),
             on_link,
             events,
             stopped,
@@ -322,9 +375,9 @@ async fn stop_forwarders(forwarders: HashMap<u64, Forwarder>) -> Result<(), Link
 
 async fn forward(
     sub: Arc<SubInner>,
-    serial: u64,
+    link: Link,
     mut on_link: station_link::Subscription,
-    events: mpsc::Sender<Event>,
+    events: mpsc::UnboundedSender<Delivery>,
     mut stop: oneshot::Receiver<()>,
     unsubscribed: oneshot::Sender<Result<(), LinkError>>,
 ) {
@@ -341,6 +394,6 @@ async fn forward(
         }
     }
     // The link ended: a link dialed again gets the subscription back.
-    sub.lock().on_links.remove(&serial);
+    sub.left_link(&link);
     let _ = unsubscribed.send(Ok(()));
 }

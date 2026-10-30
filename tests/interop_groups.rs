@@ -25,7 +25,7 @@ use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::group::{Group, Reason};
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Opts, Pool, Seed};
+use macula_rust::pool::{Delivery, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
 
 fn var(name: &str) -> String {
@@ -148,7 +148,10 @@ async fn a_rust_member_and_macula_open_each_others_events_under_one_epoch() {
             .await
             .ok()
             .flatten()
-            .and_then(|event| opened_text(&event, "from erlang"));
+            .and_then(|delivery| match delivery {
+                Delivery::Event(event) => opened_text(&event, "from erlang"),
+                _ => None,
+            });
     }
     let epoch = heard.expect("an event from erlang");
     println!("opened from erlang under {}", hex_of(&epoch));

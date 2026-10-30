@@ -1,13 +1,13 @@
 //! PubSub through the pool: a publication signed once and sent on the
 //! pool's links, and a subscription on every link, each event delivered
-//! once. The foreign side reads a subscription with
+//! once, and a notice when it may have missed some. The foreign side reads a subscription with
 //! [`FfiSubscription::next`] in a loop of its own, which fits a mobile app's
 //! lifecycle better than a native background loop would.
 
 use std::sync::Arc;
 
 use macula_rust::frame::Payload;
-use macula_rust::pool::Subscription;
+use macula_rust::pool::{Delivery, Subscription};
 use macula_rust::station_link::{Event, Publication};
 use tokio::sync::Mutex;
 
@@ -70,6 +70,52 @@ impl TryFrom<Event> for FfiEvent {
     }
 }
 
+/// One item a subscription delivers, in order: an event, or a notice that
+/// events may have been missed (macula-station#129).
+///
+/// `Interrupted` arrives once when no link carries the subscription any
+/// more: events from `from_ms` on may be missed. `Gap` arrives once when a
+/// link carries it again, before any event that link heard: events between
+/// `from_ms` and `to_ms` may have been missed, so resync what it follows.
+/// The times are this node's clock and `reason` names why the link ended
+/// (`liveness_lost`, `closed_by_station`, `idle_timeout`, ...).
+#[derive(uniffi::Enum, Debug, Clone, PartialEq)]
+pub enum FfiDelivery {
+    Event {
+        event: FfiEvent,
+    },
+    Interrupted {
+        from_ms: u64,
+        reason: String,
+    },
+    Gap {
+        from_ms: u64,
+        to_ms: u64,
+        reason: String,
+    },
+}
+
+impl TryFrom<Delivery> for FfiDelivery {
+    type Error = FfiError;
+
+    fn try_from(d: Delivery) -> Result<Self, FfiError> {
+        Ok(match d {
+            Delivery::Event(e) => FfiDelivery::Event {
+                event: e.try_into()?,
+            },
+            Delivery::Interrupted(i) => FfiDelivery::Interrupted {
+                from_ms: i.from_ms,
+                reason: i.reason,
+            },
+            Delivery::Gap(g) => FfiDelivery::Gap {
+                from_ms: g.from_ms,
+                to_ms: g.to_ms,
+                reason: g.reason,
+            },
+        })
+    }
+}
+
 /// The node's subscription to a realm and topic, until
 /// [`unsubscribe`](Self::unsubscribe).
 #[derive(uniffi::Object)]
@@ -110,9 +156,10 @@ impl FfiPool {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiSubscription {
-    /// The next event, or `None` when none arrives within `timeout_ms`.
-    /// [`FfiError::Closed`] once the subscription or its pool has ended.
-    pub async fn next(&self, timeout_ms: u64) -> Result<Option<FfiEvent>, FfiError> {
+    /// The next delivery (an event or a notice, [`FfiDelivery`]), or `None`
+    /// when none arrives within `timeout_ms`. [`FfiError::Closed`] once the
+    /// subscription or its pool has ended.
+    pub async fn next(&self, timeout_ms: u64) -> Result<Option<FfiDelivery>, FfiError> {
         let mut held = self.0.lock().await;
         let sub = held.as_mut().ok_or(FfiError::Closed)?;
         match tokio::time::timeout(millis(timeout_ms), sub.recv()).await {
@@ -121,7 +168,7 @@ impl FfiSubscription {
                 *held = None;
                 Err(FfiError::Closed)
             }
-            Ok(Some(event)) => Ok(Some(event.try_into()?)),
+            Ok(Some(delivery)) => Ok(Some(delivery.try_into()?)),
         }
     }
 

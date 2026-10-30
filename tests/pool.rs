@@ -16,8 +16,8 @@ use macula_rust::cbor::Value;
 use macula_rust::frame::{Payload, StreamMode};
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
 use macula_rust::pool::{
-    Call, Confidentiality, ConfidentialityError, ConfidentialityReason, Offer, Opts, Pool,
-    PoolError, Seed, StreamCall,
+    Call, Confidentiality, ConfidentialityError, ConfidentialityReason, Delivery, Offer, Opts,
+    Pool, PoolError, Seed, StreamCall,
 };
 use macula_rust::profile::Profile;
 use macula_rust::record::{
@@ -182,7 +182,10 @@ async fn heard(
         .unwrap();
     let mut n = 0;
     let until = tokio::time::Instant::now() + Duration::from_secs(1);
-    while let Ok(Some(event)) = tokio::time::timeout_at(until, sub.recv()).await {
+    while let Ok(Some(delivery)) = tokio::time::timeout_at(until, sub.recv()).await {
+        let Delivery::Event(event) = delivery else {
+            continue;
+        };
         if event.payload == Payload::Clear(Value::text(text)) {
             n += 1;
         }

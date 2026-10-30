@@ -15,6 +15,35 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Breaking
+
+- **`Subscription::recv` yields a `Delivery`** (macula-station#129, phase 1):
+  `Delivery::Event(Event)` as before, and two notices on the same stream, in
+  order, when the subscription may have missed events. `Interrupted { from_ms,
+  reason }` arrives once when the last link carrying the subscription ends:
+  whatever its station wrote to that link is gone. `Gap { from_ms, to_ms,
+  reason }` arrives once when a station accepts the subscription again, before
+  any event that link hears: resync what it follows. Neither arrives while
+  another link still carries the subscription, for an outage a link survives,
+  at the first subscribe, or after `unsubscribe` or the pool's close; a
+  re-subscribe every station refuses leaves it interrupted. A notice is never
+  dropped; events past the subscription's 256 still count in `dropped()`.
+  Replace `sub.recv()` reading an `Event` with a match on `Delivery`. Same rule
+  as `macula` (Erlang) and `macula-go`.
+- **`LinkError::IdleTimeout` and `LinkError::ClosedByStation`**: a link whose
+  QUIC connection idled out, or that the station closed or reset, ends with
+  these where it ended with `LinkError::Io` before. A call on such a link
+  still tries the next candidate.
+
+#### Added
+
+- `LinkError::end_reason()` names why a link ended as every macula SDK does
+  (`liveness_lost`, `closed`, `goodbye`, `status_expired`, `binding_expired`,
+  `malformed_frame`, `idle_timeout`, `closed_by_station`, `connection_lost`),
+  and `Link::last_heard_ms()` is when a link last read a frame from its
+  station.
+- README: "When a subscription may have missed events".
+
 ### [0.14.1] - 2026-10-30
 
 #### Added
@@ -1051,6 +1080,14 @@ did, but the two have moved at different paces ever since).
 
 
 ### [Unreleased]
+
+#### Breaking
+
+- **`FfiSubscription::next` yields an `FfiDelivery`** (macula-station#129):
+  `Event { event }`, or a notice that the subscription may have missed events,
+  `Interrupted { from_ms, reason }` and then `Gap { from_ms, to_ms, reason }`,
+  as `macula-rust`'s `Subscription::recv` delivers them. Answer a `Gap` by
+  resyncing what the subscription follows.
 
 ### [ffi-0.11.0] - 2026-10-28
 

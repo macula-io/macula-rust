@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
+use macula_rust::pool::Delivery;
 use macula_rust::station_link::Publication;
 
 const TOPIC: &str = "acme/demo/greeting_sent_v1";
@@ -31,12 +32,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ttl_ms: None,
     })
     .await?;
-    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
-        println!(
-            "{} published {:?}",
-            common::hex(&event.publisher),
-            event.payload
-        );
+    while let Ok(Some(delivery)) = tokio::time::timeout(Duration::from_secs(2), sub.recv()).await {
+        match delivery {
+            Delivery::Event(event) => println!(
+                "{} published {:?}",
+                common::hex(&event.publisher),
+                event.payload
+            ),
+            // No link carried the subscription for a while: resync what it
+            // follows, as events in between may be missed.
+            Delivery::Interrupted(i) => println!("interrupted ({}) since {}", i.reason, i.from_ms),
+            Delivery::Gap(g) => println!("may have missed {}..{}: resync", g.from_ms, g.to_ms),
+        }
     }
     sub.unsubscribe().await?;
     pool.close().await;

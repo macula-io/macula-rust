@@ -15,17 +15,55 @@ pub(super) async fn read_frame(
     recv: &mut quinn::RecvStream,
     max: usize,
 ) -> Result<Vec<u8>, LinkError> {
+    read_frame_or(recv, max, |e| LinkError::Io(e.to_string())).await
+}
+
+/// The next frame on the control stream, as [`read_frame`] reads it, a read
+/// that fails because the connection ended saying how it ended.
+pub(super) async fn read_control_frame(
+    recv: &mut quinn::RecvStream,
+    max: usize,
+) -> Result<Vec<u8>, LinkError> {
+    read_frame_or(recv, max, control_read_failed).await
+}
+
+async fn read_frame_or(
+    recv: &mut quinn::RecvStream,
+    max: usize,
+    failed: fn(quinn::ReadExactError) -> LinkError,
+) -> Result<Vec<u8>, LinkError> {
     let mut header = [0u8; 4];
-    recv.read_exact(&mut header)
-        .await
-        .map_err(|e| LinkError::Io(e.to_string()))?;
+    recv.read_exact(&mut header).await.map_err(failed)?;
     let length = u32::from_be_bytes(header) as usize;
     length_within(length, max)?;
     let mut payload = vec![0u8; length];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(|e| LinkError::Io(e.to_string()))?;
+    recv.read_exact(&mut payload).await.map_err(failed)?;
     Ok(payload)
+}
+
+/// A control stream read that failed: one that failed because its
+/// connection ended says how ([`connection_ended`]).
+fn control_read_failed(e: quinn::ReadExactError) -> LinkError {
+    match e {
+        quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(c)) => {
+            connection_ended(c)
+        }
+        other => LinkError::Io(other.to_string()),
+    }
+}
+
+/// How a link's QUIC connection ended: idled out ([`LinkError::IdleTimeout`]),
+/// closed or reset by the station ([`LinkError::ClosedByStation`]), or
+/// anything else ([`LinkError::Io`]).
+pub(super) fn connection_ended(c: quinn::ConnectionError) -> LinkError {
+    use quinn::ConnectionError;
+    match c {
+        ConnectionError::TimedOut => LinkError::IdleTimeout,
+        ConnectionError::ApplicationClosed(_)
+        | ConnectionError::ConnectionClosed(_)
+        | ConnectionError::Reset => LinkError::ClosedByStation(c.to_string()),
+        other => LinkError::Io(other.to_string()),
+    }
 }
 
 /// Refuses a length header over `max`, read from the four header bytes alone.

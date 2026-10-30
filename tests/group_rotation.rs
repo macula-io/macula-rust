@@ -19,7 +19,7 @@ use macula_rust::group::{
     chain_bound, Distributor, DistributorOptions, Group, Membership, MembershipCheck, Policy,
 };
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Opts, Pool, Seed, Subscription};
+use macula_rust::pool::{Delivery, Opts, Pool, Seed, Subscription};
 use macula_rust::profile::Profile;
 
 /// How long the test group's epochs publish.
@@ -84,7 +84,10 @@ async fn member(env: &TestStations, prefix: &str, distributor: [u8; 32]) -> (Poo
 /// The epoch the next event opened under, when it is `wanted`; `None` when
 /// the event is another one or none came within `left`.
 async fn heard(sub: &mut Subscription, wanted: &str, left: Duration) -> Option<[u8; 8]> {
-    let event = tokio::time::timeout(left, sub.recv()).await.ok()??;
+    let delivery = tokio::time::timeout(left, sub.recv()).await.ok()??;
+    let Delivery::Event(event) = delivery else {
+        panic!("the subscription lost its link: {delivery:?}");
+    };
     if let Some(reason) = event.unopened {
         panic!("an event did not open: {reason}");
     }

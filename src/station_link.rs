@@ -62,7 +62,9 @@ use crate::statement_issuer::{
 };
 use crate::transport::{self, DialError, Target};
 
-use framing::{read_frame, FrameWriter, HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES};
+use framing::{
+    read_control_frame, read_frame, FrameWriter, HANDSHAKE_FRAME_BYTES, MAX_FRAME_BYTES,
+};
 
 /// How long the handshake may take, as macula's 30 seconds.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,6 +115,12 @@ pub enum LinkError {
     Goodbye(String),
     /// The station missed two liveness probes in a row.
     LivenessLost,
+    /// The QUIC connection went idle past its timeout: nothing arrived from
+    /// the station for that long.
+    IdleTimeout,
+    /// The station closed or reset the QUIC connection, as it does on a
+    /// restart, with what it said.
+    ClosedByStation(String),
     /// No verified reply answered the call within its timeout.
     CallTimeout,
     /// A provider's ERROR for the call.
@@ -231,6 +239,26 @@ impl fmt::Display for LinkError {
 
 impl std::error::Error for LinkError {}
 
+impl LinkError {
+    /// Why a link ended, by the name every macula SDK gives it (macula-station#129):
+    /// `liveness_lost`, `closed`, `goodbye`, `status_expired`,
+    /// `binding_expired`, `malformed_frame`, `idle_timeout`,
+    /// `closed_by_station`, and `connection_lost` for any other.
+    pub fn end_reason(&self) -> &'static str {
+        match self {
+            LinkError::LivenessLost => "liveness_lost",
+            LinkError::Closed => "closed",
+            LinkError::Goodbye(_) => "goodbye",
+            LinkError::StatusExpired => "status_expired",
+            LinkError::BindingExpired => "binding_expired",
+            LinkError::Frame(_) | LinkError::FrameTooLarge(_) => "malformed_frame",
+            LinkError::IdleTimeout => "idle_timeout",
+            LinkError::ClosedByStation(_) => "closed_by_station",
+            _ => "connection_lost",
+        }
+    }
+}
+
 impl From<FrameError> for LinkError {
     fn from(e: FrameError) -> Self {
         LinkError::Frame(e)
@@ -337,6 +365,9 @@ struct Inner {
     pong_in_flight: AtomicBool,
     pongs_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<[u8; frame::LIVENESS_NONCE_SIZE]>>,
     status_deadline: AtomicI64,
+    /// When the link last read a frame from its station, in Unix
+    /// milliseconds (macula-station#129).
+    last_heard: AtomicI64,
     publication_seq: Arc<PublicationSeq>,
     admission: Arc<Admission>,
     dedup: Arc<EventDedup>,
@@ -437,6 +468,12 @@ impl Link {
     /// The profile the link runs.
     pub fn profile(&self) -> Profile {
         self.inner.profile
+    }
+
+    /// When the link last read a frame from its station, in Unix
+    /// milliseconds: the handshake's end, until the first frame after it.
+    pub fn last_heard_ms(&self) -> u64 {
+        u64::try_from(self.inner.last_heard.load(Ordering::SeqCst)).unwrap_or(0)
     }
 
     /// Why the link ended, or `None` while it runs.
@@ -603,6 +640,8 @@ fn new_inner(
         key: cfg.identity.clone(),
         self_id,
         status_deadline: AtomicI64::new(station.status_expires_at + STATUS_GRACE_MS),
+        // The handshake's last frame came from the station just now.
+        last_heard: AtomicI64::new(now_ms()),
         station_capabilities: capabilities,
         pongs,
         pong_in_flight: AtomicBool::new(false),
@@ -776,10 +815,11 @@ async fn read_control(inner: Arc<Inner>, mut recv: quinn::RecvStream) {
     loop {
         let payload = tokio::select! {
             _ = done.wait_for(|ended| *ended) => return,
-            payload = read_frame(&mut recv, MAX_FRAME_BYTES) => payload,
+            payload = read_control_frame(&mut recv, MAX_FRAME_BYTES) => payload,
         };
         let outcome = match payload {
-            Ok(payload) => received(&inner, &payload),
+            Ok(payload) => received(&inner, &payload)
+                .map(|()| inner.last_heard.store(now_ms(), Ordering::SeqCst)),
             Err(e) => Err(e),
         };
         if let Err(e) = outcome {
@@ -990,7 +1030,7 @@ async fn watch_connection(link: std::sync::Weak<Inner>) {
     };
     let cause = connection.closed().await;
     if let Some(inner) = link.upgrade() {
-        inner.end(LinkError::Io(cause.to_string()));
+        inner.end(framing::connection_ended(cause));
     }
 }
 

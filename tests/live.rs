@@ -14,7 +14,7 @@ use std::time::Duration;
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Call, Opts, Pool, Seed};
+use macula_rust::pool::{Call, Delivery, Opts, Pool, Seed};
 use macula_rust::profile::Profile;
 use macula_rust::record::RecordType;
 use macula_rust::station_link::{handshake_counters, Publication};
@@ -131,8 +131,8 @@ async fn the_pool_hears_its_own_publication() {
     let event = tokio::time::timeout(Duration::from_secs(10), sub.recv()).await;
     let _ = sub.unsubscribe().await;
     pool.close().await;
-    assert_eq!(
-        event.unwrap().unwrap().payload,
-        Payload::Clear(Value::text("heard"))
-    );
+    let Some(Delivery::Event(event)) = event.unwrap() else {
+        panic!("no event");
+    };
+    assert_eq!(event.payload, Payload::Clear(Value::text("heard")));
 }

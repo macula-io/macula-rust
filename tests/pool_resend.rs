@@ -17,7 +17,7 @@ use common::lab::{Lab, LabStation};
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Opts, Pool, Seed, Subscription};
+use macula_rust::pool::{Delivery, Opts, Pool, Seed, Subscription};
 use macula_rust::profile::Profile;
 use macula_rust::station_link::Publication;
 
@@ -76,7 +76,10 @@ fn edit(text: &str) -> Publication {
 async fn heard(sub: &mut Subscription, text: &str, limit: Duration) -> usize {
     let until = tokio::time::Instant::now() + limit;
     let mut n = 0;
-    while let Ok(Some(event)) = tokio::time::timeout_at(until, sub.recv()).await {
+    while let Ok(Some(delivery)) = tokio::time::timeout_at(until, sub.recv()).await {
+        let Delivery::Event(event) = delivery else {
+            continue;
+        };
         if event.payload == Payload::Clear(Value::text(text)) {
             n += 1;
         }

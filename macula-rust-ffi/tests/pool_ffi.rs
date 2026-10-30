@@ -12,8 +12,8 @@ use std::time::Duration;
 use common::lab::{Lab, LabStation};
 use macula_rust::profile::Profile;
 use macula_rust_ffi::{
-    own_procedure, FfiCallHandler, FfiConfidentiality, FfiContentOptions, FfiError, FfiNodeKey,
-    FfiPool, FfiPoolOptions, FfiProfile, FfiRealmKey, FfiRequest, FfiSeed, FfiStream,
+    own_procedure, FfiCallHandler, FfiConfidentiality, FfiContentOptions, FfiDelivery, FfiError,
+    FfiNodeKey, FfiPool, FfiPoolOptions, FfiProfile, FfiRealmKey, FfiRequest, FfiSeed, FfiStream,
     FfiStreamEvent, FfiStreamHandler, FfiStreamMode, FfiValue,
 };
 use macula_rust_ffi::{ucan_proof_id, FfiCapability, FfiPolicy, FfiUcan, FfiUcanOptions};
@@ -299,7 +299,9 @@ async fn a_subscription_hears_a_publication_once() {
         )
         .await
         .unwrap();
-    let event = sub.next(5_000).await.unwrap().expect("the publication");
+    let Some(FfiDelivery::Event { event }) = sub.next(5_000).await.unwrap() else {
+        panic!("the publication");
+    };
     assert_eq!(event.payload, FfiValue::Text("hello".into()));
     assert_eq!(event.publisher, publisher.node_id());
     assert_eq!(event.topic, TOPIC);
