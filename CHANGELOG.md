@@ -44,6 +44,16 @@ usually touches both, but their version numbers don't move in lockstep.
   station.
 - README: "When a subscription may have missed events".
 
+#### Fixed
+
+- **A reply after its call gave up no longer hangs the link** (#58): matching
+  a RESULT or ERROR that no call waited for any more counted it as
+  `unmatched_reply` while still holding the link's state lock, which took
+  the same lock again. The link's reader stopped for good, and every caller
+  of the link blocked its thread. A reply arriving within a millisecond after
+  the caller's wait ended, as one answered at the request's deadline can, was
+  enough. Present in every release from 0.4.0 through 0.14.1.
+
 ### [0.14.1] - 2026-10-30
 
 #### Added

@@ -259,12 +259,15 @@ pub(super) fn replied(inner: &Arc<Inner>, v: &Value) {
         inner.count("malformed_reply");
         return;
     };
-    let (request, seal) = match inner.lock().pending.get(&request_id) {
-        Some(p) => (p.request.clone(), p.seal.clone()),
-        None => {
-            inner.count("unmatched_reply");
-            return;
-        }
+    // The state lock is let go before counting, which takes it again.
+    let pending = inner
+        .lock()
+        .pending
+        .get(&request_id)
+        .map(|p| (p.request.clone(), p.seal.clone()));
+    let Some((request, seal)) = pending else {
+        inner.count("unmatched_reply");
+        return;
     };
     let Some(outcome) = verified_outcome(inner, v, &request, seal.as_ref()) else {
         inner.count("unverified_reply");
