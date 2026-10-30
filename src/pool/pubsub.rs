@@ -337,6 +337,10 @@ impl SubInner {
         if held.on_links.contains_key(&serial) {
             return false;
         }
+        // A link that ended may not be counted yet: the respawned link can
+        // be accepted before the ended one's watch_link_end task runs. No
+        // test from outside can force that order, so this fold is untested
+        // on its own; the watch's fold is (tests/pool_gap_group.rs).
         held.fold_ended(closing);
         held.on_links.insert(serial, forwarder);
         let now = u64::try_from(now_ms()).unwrap_or(0);
