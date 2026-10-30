@@ -139,8 +139,9 @@ fn gap(d: Delivery) -> Gap {
 async fn the_only_link_ending_is_one_interrupted_then_one_gap() {
     let lab = Lab::start(Profile::PqPure);
     let a = lab.station("gap single");
+    // Before the subscribe: the accepting ack is heard inside it.
+    let subscribing = now_ms();
     let (listener, mut sub) = listening(&lab, &[&a]).await;
-    let subscribed = now_ms();
     let publisher = connect(seeds(&[&a])).await;
 
     let dropped = now_ms();
@@ -148,8 +149,8 @@ async fn the_only_link_ending_is_one_interrupted_then_one_gap() {
     let i = interruption(next_notice(&mut sub, Duration::from_secs(10)).await);
     assert_eq!(i.reason, "closed_by_station");
     assert!(
-        (subscribed..=dropped).contains(&i.from_ms),
-        "from {} is between the accepting ack {subscribed} and the end {dropped}",
+        (subscribing..=dropped).contains(&i.from_ms),
+        "from {} is between the subscribe {subscribing} and the end {dropped}",
         i.from_ms
     );
     let g = gap(next_notice(&mut sub, Duration::from_secs(10)).await);
