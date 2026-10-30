@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::cbor::Value;
+use crate::cbor::{self, Value};
 use crate::frame::{self, Payload, PublicationSpec};
 use crate::node_key::NodeKey;
 
-use super::{now_ms, Inner, Link, LinkError, REGISTER_ACK_TIMEOUT};
+use super::{now_ms, Inner, Link, LinkError, MAX_FRAME_BYTES, REGISTER_ACK_TIMEOUT};
 
 /// How many events a subscription holds that its reader has not taken; an
 /// event arriving at a full subscription is dropped and counted.
@@ -104,6 +104,8 @@ impl EventDedup {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignedPublication {
     frame: Value,
+    /// The last moment a subscriber accepts it, in Unix milliseconds.
+    accepted_until: u64,
 }
 
 impl SignedPublication {
@@ -126,6 +128,7 @@ impl SignedPublication {
         published_at: u64,
         p: Publication,
     ) -> Result<SignedPublication, LinkError> {
+        let accepted_until = frame::accepted_until(published_at, p.ttl_ms);
         let frame = frame::sign_publish(
             &PublicationSpec {
                 realm: p.realm,
@@ -137,7 +140,93 @@ impl SignedPublication {
             },
             key,
         )?;
-        Ok(SignedPublication { frame })
+        Ok(SignedPublication {
+            frame,
+            accepted_until,
+        })
+    }
+
+    /// The last moment, in Unix milliseconds, a subscriber accepts it: past
+    /// it, sending it again delivers nothing.
+    pub fn accepted_until(&self) -> u64 {
+        self.accepted_until
+    }
+}
+
+/// At most this many publications a link sent are held until the station is
+/// known to have read them, and at most [`MAX_UNCONFIRMED_BYTES`] of them.
+const MAX_UNCONFIRMED: usize = 4096;
+const MAX_UNCONFIRMED_BYTES: usize = 32 * 1024 * 1024;
+
+/// The publications a link sent that the station is not yet known to have
+/// read, oldest first, each with its frame number on the control stream and
+/// its size (macula-rust#57). QUIC delivers the control stream in order but
+/// the protocol acknowledges no PUBLISH: the station answering a frame sent
+/// after one (a liveness_pong) is what says it read that one. Should the
+/// link end first, what is still held may never have arrived, and the pool
+/// sends it again on another link.
+#[derive(Default)]
+pub(super) struct Unconfirmed {
+    sent: VecDeque<(u64, SignedPublication, usize)>,
+    bytes: usize,
+}
+
+impl Unconfirmed {
+    /// Holds `p`, sent as frame `number` of `bytes` bytes, making room past
+    /// the caps by letting go of the oldest: answers how many it let go.
+    fn hold(&mut self, number: u64, p: SignedPublication, bytes: usize) -> u64 {
+        self.sent.push_back((number, p, bytes));
+        self.bytes += bytes;
+        let mut let_go = 0;
+        while self.sent.len() > MAX_UNCONFIRMED
+            || (self.bytes > MAX_UNCONFIRMED_BYTES && self.sent.len() > 1)
+        {
+            let_go += self.let_go_oldest();
+        }
+        let_go
+    }
+
+    /// Lets go of every publication sent before frame `number`: the station
+    /// answered that frame, so it read them.
+    fn confirm_before(&mut self, number: u64) {
+        while self.sent.front().is_some_and(|(n, _, _)| *n < number) {
+            self.let_go_oldest();
+        }
+    }
+
+    /// Lets go of the oldest publication held: answers 1, or 0 when none is.
+    fn let_go_oldest(&mut self) -> u64 {
+        self.sent.pop_front().map_or(0, |(_, _, size)| {
+            self.bytes -= size;
+            1
+        })
+    }
+
+    /// Every publication still held, oldest first, leaving none.
+    fn take(&mut self) -> Vec<SignedPublication> {
+        self.bytes = 0;
+        self.sent.drain(..).map(|(_, p, _)| p).collect()
+    }
+}
+
+impl Inner {
+    /// Holds `p`, sent as frame `number`, until the station is known to have
+    /// read it; one let go to make room is counted, not silent.
+    fn hold_unconfirmed(&self, number: u64, p: SignedPublication, bytes: usize) {
+        let let_go = self.lock().unconfirmed.hold(number, p, bytes);
+        if let_go > 0 {
+            *self
+                .lock()
+                .unrouted
+                .entry("publication_unconfirmed_let_go".into())
+                .or_default() += let_go;
+        }
+    }
+
+    /// The station answered frame `number`: every publication sent before it
+    /// was read.
+    pub(super) fn confirm_before(&self, number: u64) {
+        self.lock().unconfirmed.confirm_before(number);
     }
 }
 
@@ -515,7 +604,25 @@ impl Link {
 
     /// Sends a publication signed once for several links, as it is.
     pub async fn publish_signed(&self, p: &SignedPublication) -> Result<(), LinkError> {
-        self.inner.send_control(&p.frame).await
+        let encoded = cbor::encode(&p.frame)
+            .map_err(|e| LinkError::Frame(frame::FrameError::Payload(e.to_string())))?;
+        let number = self
+            .inner
+            .control
+            .write_numbered(&encoded, MAX_FRAME_BYTES)
+            .await?;
+        self.inner
+            .hold_unconfirmed(number, p.clone(), encoded.len());
+        Ok(())
+    }
+
+    /// Takes the publications sent on this link that the station is not
+    /// known to have read, oldest first. Once the link ended, these may never
+    /// have arrived: the pool sends them again on another link, where a
+    /// subscriber that did receive one delivers it once all the same (it is
+    /// the same signed publication).
+    pub fn take_unconfirmed(&self) -> Vec<SignedPublication> {
+        self.inner.lock().unconfirmed.take()
     }
 
     /// Subscribes to `topic` in `realm`, once the station has accepted it,
@@ -727,5 +834,46 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(())).unwrap();
         assert_eq!(within(rx, limit).await, Heard::Answer(Ok(())));
+    }
+
+    fn signed(n: u64) -> SignedPublication {
+        SignedPublication {
+            frame: Value::Null,
+            accepted_until: n,
+        }
+    }
+
+    fn held(u: &mut Unconfirmed) -> Vec<u64> {
+        u.take().iter().map(|p| p.accepted_until).collect()
+    }
+
+    #[test]
+    fn a_pong_confirms_only_the_publications_sent_before_its_ping() {
+        let mut u = Unconfirmed::default();
+        for n in [1, 2, 4] {
+            assert_eq!(u.hold(n, signed(n), 10), 0);
+        }
+        // The ping went out as frame 3: frames 1 and 2 were read before it.
+        u.confirm_before(3);
+        assert_eq!(u.bytes, 10);
+        assert_eq!(held(&mut u), vec![4]);
+        assert_eq!((u.sent.len(), u.bytes), (0, 0));
+    }
+
+    #[test]
+    fn past_a_cap_the_oldest_is_let_go_and_counted() {
+        let mut u = Unconfirmed::default();
+        for n in 0..MAX_UNCONFIRMED as u64 {
+            assert_eq!(u.hold(n, signed(n), 1), 0);
+        }
+        assert_eq!(u.hold(9_999, signed(9_999), 1), 1);
+        assert_eq!(u.sent.front().map(|(n, _, _)| *n), Some(1));
+
+        let mut u = Unconfirmed::default();
+        assert_eq!(u.hold(1, signed(1), MAX_UNCONFIRMED_BYTES), 0);
+        assert_eq!(u.hold(2, signed(2), 1), 1);
+        // One over the byte cap on its own is still held: it was sent.
+        assert_eq!(u.hold(3, signed(3), MAX_UNCONFIRMED_BYTES + 1), 1);
+        assert_eq!(held(&mut u), vec![3]);
     }
 }

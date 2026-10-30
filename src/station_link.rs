@@ -368,6 +368,10 @@ struct State {
     withdrawals: pubsub::Withdrawals,
     served: HashMap<([u8; 32], String), serve::ServedEntry>,
     streams: Vec<std::sync::Weak<stream::StreamInner>>,
+    /// The publications sent on this link the station is not yet known to
+    /// have read (macula-rust#57), for the pool to send again if the link
+    /// ends first.
+    unconfirmed: pubsub::Unconfirmed,
 }
 
 impl Link {
@@ -625,6 +629,7 @@ fn new_inner(
             withdrawals: HashMap::new(),
             served: HashMap::new(),
             streams: Vec::new(),
+            unconfirmed: pubsub::Unconfirmed::default(),
         }),
         done_tx,
         done_rx,
@@ -671,9 +676,15 @@ impl Inner {
 
     /// A frame on the control stream, as it is.
     async fn send_control(&self, v: &Value) -> Result<(), LinkError> {
+        self.send_control_numbered(v).await.map(|_| ())
+    }
+
+    /// A frame on the control stream, as it is, answering its number on the
+    /// stream (see [`framing::FrameWriter::write_numbered`]).
+    async fn send_control_numbered(&self, v: &Value) -> Result<u64, LinkError> {
         let encoded =
             cbor::encode(v).map_err(|e| LinkError::Frame(FrameError::Payload(e.to_string())))?;
-        self.control.write(&encoded, MAX_FRAME_BYTES).await
+        self.control.write_numbered(&encoded, MAX_FRAME_BYTES).await
     }
 
     /// Ends the link once, with `err`: pending calls, subscriptions, served

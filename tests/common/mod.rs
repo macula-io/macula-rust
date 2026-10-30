@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+pub mod blackhole;
 pub mod lab;
 
 use std::io::{BufRead, BufReader, Write};

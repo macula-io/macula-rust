@@ -17,6 +17,19 @@ usually touches both, but their version numbers don't move in lockstep.
 
 #### Added
 
+- **A publication a link lost is sent again** (macula-rust#57): a link
+  holds each publication it sent until a later `liveness_pong` says the
+  station read it; should the link end first (a path that lost every packet
+  until QUIC's idle timeout or the liveness probe gave up), the pool sends
+  what it still held on a link that is up, or on the next one up. A
+  subscriber that did receive one delivers it once, as before: it is the
+  same signed publication. One that cannot be sent again before subscribers
+  would refuse it, is still waiting when the pool closes, or does not fit
+  (4096 waiting) is counted in the new `Pool::unsent_publications`; one a
+  link let go past its own caps (4096 or 32 MiB unconfirmed) is counted as
+  `publication_unconfirmed_let_go` in its unrouted counters.
+  `tests/pool_resend.rs` loses the packets through a UDP relay and checks
+  both outcomes.
 - **A group's rotation, proven live** (macula-rust#52): `tests/group_rotation.rs`
   serves a `group::Distributor` at a one-second `rotate_after_ms` (with
   `Caps::epochs` raised to `chain_bound(1000)`), and two members keep

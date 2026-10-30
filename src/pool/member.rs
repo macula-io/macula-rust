@@ -200,6 +200,10 @@ async fn hold(pool: &Weak<PoolInner>, m: &Member, retired: &mut watch::Receiver<
         h.error = ended.clone();
     });
     event(pool, m, false, ended);
+    // What the link had not delivered goes out again on another (#57).
+    if let Some(inner) = pool.upgrade() {
+        inner.send_again(link.take_unconfirmed()).await;
+    }
 }
 
 fn event(pool: &Weak<PoolInner>, m: &Member, up: bool, error: Option<LinkError>) {

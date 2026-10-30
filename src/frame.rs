@@ -34,7 +34,8 @@ pub use envelope::{
     MAX_EXTENSION_NAME_BYTES, MAX_FRAME_TYPE_BYTES, QUIC_CODE_UNKNOWN_FRAME_TYPE, SEAL_KEM_KEY_EXT,
 };
 pub use publication::{
-    delivered_via, sign_publish, verify_publication, Payload, PublicationSpec, VerifiedPublication,
+    accepted_until, delivered_via, sign_publish, verify_publication, Payload, PublicationSpec,
+    VerifiedPublication,
 };
 pub use register_ack::{read_register_ack, Answered, RegisterAck, RegisterKind};
 pub use reply::{

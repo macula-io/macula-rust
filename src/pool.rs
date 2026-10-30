@@ -20,6 +20,7 @@ mod content;
 mod group;
 mod member;
 mod pubsub;
+mod resend;
 mod serve;
 
 pub use crate::station_link::Confidentiality;
@@ -268,6 +269,8 @@ pub(crate) struct PoolInner {
     state: Mutex<State>,
     ticks: tokio::task::JoinHandle<()>,
     content: content::Sharer,
+    /// Publications accepted and never delivered (see [`Pool::unsent_publications`]).
+    unsent: std::sync::atomic::AtomicU64,
 }
 
 struct State {
@@ -276,6 +279,8 @@ struct State {
     served: HashMap<u64, Arc<serve::ServedInner>>,
     remember: HashMap<call::ResolvedKey, call::Candidate>,
     closed: bool,
+    /// What ended links had not delivered, for the next link up.
+    waiting: resend::Waiting,
 }
 
 /// What a closing pool ends: its links and its subscriptions.
@@ -330,9 +335,11 @@ impl Pool {
                 served: HashMap::new(),
                 remember: HashMap::new(),
                 closed: false,
+                waiting: resend::Waiting::new(),
             }),
             ticks,
             content: content::Sharer::default(),
+            unsent: std::sync::atomic::AtomicU64::new(0),
             opts,
         });
         let pool = Pool { inner };
@@ -398,6 +405,7 @@ impl Pool {
         for m in &members {
             m.stopped().await;
         }
+        self.inner.give_up_waiting();
         for sub in subs.into_values() {
             let _ = sub.end().await;
         }
@@ -433,7 +441,6 @@ impl PoolInner {
         ))
     }
 
-    /// The links up now, in the pool's selection order.
     /// Sends a signed publication on the first `replication_factor` links, in
     /// the pool's selection order, succeeding when one of them takes it.
     pub(super) async fn send_signed(&self, signed: &SignedPublication) -> Result<(), PoolError> {
@@ -455,6 +462,7 @@ impl PoolInner {
         Ok(())
     }
 
+    /// The links up now, in the pool's selection order.
     fn links(&self) -> Vec<Link> {
         let members = self.lock().members.clone();
         let mut up: Vec<Link> = members.iter().filter_map(|m| m.current()).collect();

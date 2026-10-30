@@ -169,6 +169,13 @@ pub fn delivered_via(event: &Value) -> &'static str {
     }
 }
 
+/// The last moment, in Unix milliseconds, a subscriber accepts a publication
+/// made at `published_at` with `ttl_ms`: its time to live, then the clock
+/// tolerance.
+pub fn accepted_until(published_at: u64, ttl_ms: Option<u64>) -> u64 {
+    published_at + ttl_ms.unwrap_or(DEFAULT_TTL_MS) + TOLERANCE_MS
+}
+
 /// Verifies the publication a received PUBLISH, EVENT or GOSSIP carries,
 /// under the connection's `profile` and the verifier's clock `now_ms`: the
 /// frame is exactly version, frame_type and publication, with an EVENT's
@@ -213,7 +220,7 @@ pub fn verify_publication(
         ttl_ms,
         payload,
         publication_hash: Sha384::digest(&verified.tbs).into(),
-        expires_at: published_at + ttl_ms.unwrap_or(DEFAULT_TTL_MS) + TOLERANCE_MS,
+        expires_at: accepted_until(published_at, ttl_ms),
         key: verified.key,
     };
     let valid_from = published_at as i64 - TOLERANCE_MS as i64;

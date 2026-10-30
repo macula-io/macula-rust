@@ -153,7 +153,8 @@ impl PoolInner {
     }
 
     /// Gives a new link the node's subscriptions, then its served
-    /// procedures, as macula's pool replays them on a respawned link. A
+    /// procedures, as macula's pool replays them on a respawned link, then
+    /// the publications ended links had not delivered. A
     /// subscription the station refuses there is not on that link.
     pub(super) async fn replay(&self, link: &Link) {
         let (subs, served) = {
@@ -175,6 +176,8 @@ impl PoolInner {
         for s in served {
             s.attach(link.clone());
         }
+        // Subscribed first, so this node's own subscriptions hear them too.
+        self.send_waiting(link).await;
     }
 }
 

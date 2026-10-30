@@ -347,17 +347,23 @@ async fn probe_once(inner: &Inner) -> Result<(), LinkError> {
     // A pong that arrived after its probe's deadline must not take the place
     // of this probe's.
     while pongs.try_recv().is_ok() {}
-    inner
-        .send_control(&frame::liveness_ping_frame(&nonce))
+    let ping = inner
+        .send_control_numbered(&frame::liveness_ping_frame(&nonce))
         .await?;
     let mut done = inner.done_rx.clone();
     let answered = pong_of(&mut pongs, nonce);
-    tokio::select! {
+    let outcome = tokio::select! {
         _ = done.wait_for(|ended| *ended) => Err(LinkError::Closed),
         outcome = tokio::time::timeout(LIVENESS_TIMEOUT, answered) => {
             outcome.unwrap_or(Err(LinkError::CallTimeout))
         }
+    };
+    // The station answers its control stream in order: the pong of this ping
+    // says it read every publication sent before it (macula-rust#57).
+    if outcome.is_ok() {
+        inner.confirm_before(ping);
     }
+    outcome
 }
 
 /// Waits for the liveness_pong of `nonce`, passing over any other;

@@ -42,6 +42,9 @@ pub(super) fn length_within(length: usize, max: usize) -> Result<(), LinkError> 
 pub(super) struct FrameWriter {
     send: tokio::sync::Mutex<quinn::SendStream>,
     abandoned: tokio::sync::watch::Sender<bool>,
+    /// How many frames were handed to the stream, in stream order: a frame's
+    /// number is its place on the stream, which a peer reads in order.
+    frames: std::sync::atomic::AtomicU64,
 }
 
 impl FrameWriter {
@@ -49,12 +52,24 @@ impl FrameWriter {
         FrameWriter {
             send: tokio::sync::Mutex::new(send),
             abandoned: tokio::sync::watch::Sender::new(false),
+            frames: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Sends `payload` as one frame, refusing one over `max`; an error once
     /// the side is abandoned, the frame then partly sent or not at all.
     pub(super) async fn write(&self, payload: &[u8], max: usize) -> Result<(), LinkError> {
+        self.write_numbered(payload, max).await.map(|_| ())
+    }
+
+    /// Sends `payload` as one frame, as [`FrameWriter::write`] does, and
+    /// answers its number on the stream: a frame numbered lower went onto the
+    /// stream before it, so a peer that answered this one read those first.
+    pub(super) async fn write_numbered(
+        &self,
+        payload: &[u8],
+        max: usize,
+    ) -> Result<u64, LinkError> {
         if payload.len() > max {
             return Err(LinkError::FrameTooLarge(payload.len()));
         }
@@ -67,8 +82,13 @@ impl FrameWriter {
             send = self.send.lock() => send,
             _ = abandoned.wait_for(|a| *a) => return Err(gave_way()),
         };
+        // Numbered under the stream's lock, so the numbers follow the order
+        // the frames go onto the stream.
+        let number = self
+            .frames
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::select! {
-            written = send.write_all(&framed) => written.map_err(|e| LinkError::Io(e.to_string())),
+            written = send.write_all(&framed) => written.map(|_| number).map_err(|e| LinkError::Io(e.to_string())),
             _ = abandoned.wait_for(|a| *a) => Err(gave_way()),
         }
     }
