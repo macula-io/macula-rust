@@ -60,8 +60,54 @@ struct Held {
 }
 
 struct Forwarder {
+    /// The link it forwards from: its end is the subscription's to count,
+    /// whatever the forwarder is doing then (see [`Held::fold_ended`]).
+    link: Link,
     stop: oneshot::Sender<()>,
     unsubscribed: oneshot::Receiver<Result<(), LinkError>>,
+    /// Dropped with the forwarder, which ends the watch on its link's end.
+    _watched: oneshot::Sender<()>,
+}
+
+impl Held {
+    /// Counts every link that ended among those carrying the subscription,
+    /// sending the [`Delivery::Interrupted`] owed unless the pool is
+    /// `closing` or the subscription ended. Coverage follows the link, not
+    /// its forwarder, which may still be opening an event the ended link
+    /// heard: a link that ended no longer carries the subscription, so a
+    /// link accepted after it must find it gone.
+    fn fold_ended(&mut self, closing: bool) {
+        let ended: Vec<(u64, u64, &'static str)> = self
+            .on_links
+            .values()
+            .filter_map(|f| {
+                let e = f.link.error()?;
+                Some((f.link.serial(), f.link.last_heard_ms(), e.end_reason()))
+            })
+            .collect();
+        let notices: Vec<Delivery> = ended
+            .into_iter()
+            .filter_map(|(serial, heard, reason)| self.coverage.ended(serial, heard, reason))
+            .collect();
+        let Some(events) = self.events.as_ref().filter(|_| !closing) else {
+            return;
+        };
+        for notice in notices {
+            let _ = events.send(notice);
+        }
+    }
+}
+
+impl Held {
+    /// The subscription on the link `serial` ended, its end counted already
+    /// when the link ended; `link_up` when the link went on, its station
+    /// having ended the subscription there: the link no longer covers it.
+    fn left(&mut self, serial: u64, link_up: bool) {
+        self.on_links.remove(&serial);
+        if link_up {
+            self.coverage.left(serial);
+        }
+    }
 }
 
 impl Pool {
@@ -271,12 +317,19 @@ impl SubInner {
         Some(std::mem::take(&mut held.on_links))
     }
 
-    /// Keeps `forwarder` as the one for the link with `serial`, when the
-    /// subscription still runs and that link has none yet; whether it did.
-    /// The link covers the subscription from now: a [`Delivery::Gap`] owed
-    /// goes out here, before the forwarder delivers anything that link
-    /// heard.
-    fn keep_forwarder(&self, serial: u64, forwarder: Forwarder) -> bool {
+    /// Whether the subscription's pool is closing, when nothing is owed.
+    fn pool_closing(&self) -> bool {
+        self.pool.upgrade().is_none_or(|pool| pool.lock().closed)
+    }
+
+    /// Keeps `forwarder` as the one for its link, when the subscription still
+    /// runs and that link has none yet; whether it did. The link covers the
+    /// subscription from now: links that ended are counted first, and a
+    /// [`Delivery::Gap`] owed goes out here, before the forwarder delivers
+    /// anything this link heard.
+    fn keep_forwarder(&self, forwarder: Forwarder) -> bool {
+        let closing = self.pool_closing();
+        let serial = forwarder.link.serial();
         let mut held = self.lock();
         let Some(events) = held.events.clone() else {
             return false;
@@ -284,6 +337,7 @@ impl SubInner {
         if held.on_links.contains_key(&serial) {
             return false;
         }
+        held.fold_ended(closing);
         held.on_links.insert(serial, forwarder);
         let now = u64::try_from(now_ms()).unwrap_or(0);
         if let Some(gap) = held.coverage.covers(serial, now) {
@@ -292,26 +346,20 @@ impl SubInner {
         true
     }
 
-    /// The subscription on `link` ended: when the link did, a
-    /// [`Delivery::Interrupted`] goes out if no other link carries the
-    /// subscription, unless the subscription or its pool is ending.
+    /// Counts the links that ended, as soon as one does.
+    fn links_ended(&self) {
+        let closing = self.pool_closing();
+        self.lock().fold_ended(closing);
+    }
+
+    /// The subscription on `link` ended: when the link did, it is counted
+    /// (if its end was not already); when the link goes on, the station
+    /// ended the subscription there and no link end is there to report.
     fn left_link(&self, link: &Link) {
-        let pool_closing = self.pool.upgrade().is_none_or(|pool| pool.lock().closed);
+        let closing = self.pool_closing();
         let mut held = self.lock();
-        held.on_links.remove(&link.serial());
-        let Some(ended) = link.error() else {
-            held.coverage.left(link.serial());
-            return;
-        };
-        let notice = held
-            .coverage
-            .ended(link.serial(), link.last_heard_ms(), ended.end_reason());
-        let Some(events) = held.events.as_ref().filter(|_| !pool_closing) else {
-            return;
-        };
-        if let Some(notice) = notice {
-            let _ = events.send(notice);
-        }
+        held.fold_ended(closing);
+        held.left(link.serial(), link.error().is_none());
     }
 
     /// [`SubInner::attach`], for a task of its own.
@@ -334,11 +382,22 @@ impl SubInner {
         let on_link = link.subscribe(&self.realm, &self.topic).await?;
         let (stop, stopped) = oneshot::channel();
         let (unsubscribed_tx, unsubscribed) = oneshot::channel();
-        let kept = self.keep_forwarder(link.serial(), Forwarder { stop, unsubscribed });
+        let (watched, unwatched) = oneshot::channel();
+        let kept = self.keep_forwarder(Forwarder {
+            link: link.clone(),
+            stop,
+            unsubscribed,
+            _watched: watched,
+        });
         if !kept {
             let _ = on_link.unsubscribe().await;
             return Ok(());
         }
+        tokio::spawn(watch_link_end(
+            Arc::downgrade(self),
+            link.clone(),
+            unwatched,
+        ));
         tokio::spawn(forward(
             self.clone(),
             link.clone(),
@@ -348,6 +407,18 @@ impl SubInner {
             unsubscribed_tx,
         ));
         Ok(())
+    }
+}
+
+/// Counts `link`'s end in `sub`'s coverage as soon as the link ends, while
+/// `sub` still forwards from it (`unwatched` not yet dropped).
+async fn watch_link_end(sub: Weak<SubInner>, link: Link, unwatched: oneshot::Receiver<()>) {
+    tokio::select! {
+        _ = link.done() => {}
+        _ = unwatched => return,
+    }
+    if let Some(sub) = sub.upgrade() {
+        sub.links_ended();
     }
 }
 
@@ -396,4 +467,41 @@ async fn forward(
     // The link ended: a link dialed again gets the subscription back.
     sub.left_link(&link);
     let _ = unsubscribed.send(Ok(()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn held_on(serials: &[u64]) -> Held {
+        let mut held = Held {
+            events: None,
+            coverage: Coverage::default(),
+            on_links: HashMap::new(),
+        };
+        for &serial in serials {
+            assert_eq!(held.coverage.covers(serial, 0), None);
+        }
+        held
+    }
+
+    #[test]
+    fn a_link_that_stays_up_no_longer_covers_once_the_subscription_left_it() {
+        let mut held = held_on(&[1, 2]);
+        held.left(1, true);
+        // Link 1 does not carry it any more: link 2's end is the last.
+        assert!(matches!(
+            held.coverage.ended(2, 500, "closed_by_station"),
+            Some(Delivery::Interrupted(_))
+        ));
+        assert_eq!(held.coverage.ended(1, 600, "closed_by_station"), None);
+    }
+
+    #[test]
+    fn a_link_that_ended_is_not_left_twice() {
+        let mut held = held_on(&[1, 2]);
+        // Link 1's end was counted when it ended, or will be, by fold_ended.
+        held.left(1, false);
+        assert_eq!(held.coverage.ended(2, 500, "closed_by_station"), None);
+    }
 }

@@ -235,6 +235,9 @@ hears. Neither arrives while another link still carries the subscription,
 for an outage a link survives (QUIC retransmits; nothing is lost), at the
 first subscribe, or after `unsubscribe` or the pool's close. A re-subscribe
 every station refuses leaves the subscription interrupted, with no `Gap`.
+On a sealed group, an `Interrupted` can arrive ahead of events the ended
+link heard that are still waiting on their epoch's key: the notice follows
+the link's end, not the opening of what it already heard.
 `reason` names why the link ended, as every macula SDK names it:
 `liveness_lost`, `closed`, `goodbye`, `status_expired`, `binding_expired`,
 `malformed_frame`, `idle_timeout`, `closed_by_station`, `connection_lost`.
