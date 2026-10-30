@@ -15,6 +15,8 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.14.1] - 2026-10-30
+
 #### Added
 
 - **A publication a link lost is sent again** (macula-rust#57): a link
