@@ -265,6 +265,8 @@ async fn a_stream_that_has_sent_is_not_resealed() {
 
     // Refused after this side ended its sending: nothing is opened again,
     // so nothing it sent is lost or sent twice; the refusal ends the stream.
+    // The provider drains what the caller sent before releasing it, or the
+    // station would reset the stream ahead of the refusal.
     rotate_past_keeping(&now, &keyring);
     served.stop().await.unwrap();
     let served = serve_watch(&link, &procedure).await;
@@ -274,6 +276,7 @@ async fn a_stream_that_has_sent_is_not_resealed() {
         Err(LinkError::Stream { code, .. }) => assert_eq!(code, "sealed_refused"),
         other => panic!("{other:?}"),
     }
+    assert_eq!(link.unrouted().get("stream_refusal_drained"), Some(&1));
     served.stop().await.unwrap();
     pool.close().await;
 }

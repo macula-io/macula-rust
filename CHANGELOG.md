@@ -55,6 +55,11 @@ usually touches both, but their version numbers don't move in lockstep.
   of the link blocked its thread. A reply arriving within a millisecond after
   the caller's wait ended, as one answered at the request's deadline can, was
   enough. Present in every release from 0.4.0 through 0.14.1.
+- **A sealed stream's `sealed_refused` reaches a caller that wrote ahead**
+  (#59): the provider stopped reading right after writing the refusal, so
+  the station could reset the stream before the caller read it, and the
+  caller ended with a bare stream reset instead of resealing. The refusal is
+  now drained like `sealed_required`, within the same per-caller share.
 
 ### [0.14.1] - 2026-10-30
 

@@ -1195,9 +1195,9 @@ async fn incoming(link: Weak<Inner>, send: quinn::SendStream, mut recv: quinn::R
     };
     let (session_open, sealing) = match session_open(&inner, &open, offer.as_ref()) {
         Ok(opened) => opened,
-        Err((CODE_SEALED_REQUIRED, message)) => {
+        Err((code @ (CODE_SEALED_REQUIRED | CODE_SEALED_REFUSED), message)) => {
             let s = StreamInner::new(inner.clone(), send, open.clone(), false, None);
-            return refuse_sealed_required(&s, &message, recv, place).await;
+            return refuse_resealable(&s, code, &message, recv, place).await;
         }
         Err((code, message)) => return refuse_clear(code, &message, send, recv).await,
     };
@@ -1336,16 +1336,18 @@ async fn refuse(s: &Arc<StreamInner>, code: &str, message: &str, mut recv: quinn
     let _ = recv.stop(0u32.into());
 }
 
-/// Refuses a clear open sealed_required, then reads and drops what the
-/// caller still sends, up to the inbox and for at most five seconds, before
-/// releasing the stream: a caller that wrote ahead keeps its copy, and
-/// stopping its sending at once would have the station reset the stream and
-/// lose the refusal the caller reseals from (DESIGN_E2E_SEALED_BY_DEFAULT
-/// section 3). The drain holds the caller's session place and one of the
-/// link's [`Drains`], within the caller's share; with none left, the stream
-/// is released at once.
-async fn refuse_sealed_required(
+/// Refuses an open with a refusal the caller reseals from (`code`: a clear
+/// open's sealed_required, or a sealed open's sealed_refused when it does
+/// not open), then reads and drops what the caller still sends, up to the
+/// inbox and for at most five seconds, before releasing the stream: a caller
+/// that wrote ahead keeps its copy, and stopping its sending at once would
+/// have the station reset the stream and lose the refusal
+/// (DESIGN_E2E_SEALED_BY_DEFAULT section 3). The drain holds the caller's
+/// session place and one of the link's [`Drains`], within the caller's
+/// share; with none left, the stream is released at once.
+async fn refuse_resealable(
     s: &Arc<StreamInner>,
+    code: &str,
     message: &str,
     mut recv: quinn::RecvStream,
     place: SessionPlace,
@@ -1357,7 +1359,7 @@ async fn refuse_sealed_required(
         Some(_) => s.link.count("stream_refusal_drained"),
         None => s.link.count("stream_refusal_drains_full"),
     }
-    answer_refusal(s, CODE_SEALED_REQUIRED, message).await;
+    answer_refusal(s, code, message).await;
     if draining.is_some() {
         let _ = tokio::time::timeout(DRAIN_WAIT, drain(&mut recv)).await;
     }
