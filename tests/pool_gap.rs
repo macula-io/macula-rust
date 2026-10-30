@@ -188,6 +188,13 @@ async fn one_of_two_links_ending_is_no_notice() {
     let (a, b) = (lab.station("gap two a"), lab.station("gap two b"));
     let (listener, mut sub) = listening(&lab, &[&a, &b]).await;
     let publisher = connect(seeds(&[&a, &b])).await;
+    // connect returns with the first link up, and a publish goes only on the
+    // links up then: with b's not yet up it would reach a alone, which no
+    // longer carries the listener.
+    within(Duration::from_secs(10), "the publisher on both", || {
+        publisher.status().iter().filter(|l| l.up).count() == 2
+    })
+    .await;
 
     lab.drop_node(&a, &listener.node_id());
     publish(&publisher, "still carried").await;
