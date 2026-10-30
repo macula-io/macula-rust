@@ -79,8 +79,6 @@ async fn a_reply_after_its_call_gave_up_is_counted_and_the_link_goes_on() {
     while unmatched(&caller).await == 0 {
         assert!(calls < 300, "no reply came late in {calls} calls");
         let _ = caller.call(call()).await;
-        // The late reply's own way back.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         calls += 1;
     }
     // The link still reads and answers.

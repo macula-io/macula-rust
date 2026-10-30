@@ -143,8 +143,13 @@ async fn the_only_link_ending_is_one_interrupted_then_one_gap() {
     let subscribing = now_ms();
     let (listener, mut sub) = listening(&lab, &[&a]).await;
     let publisher = connect(seeds(&[&a])).await;
-    // An event heard on the link moves the gap's from past it.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // An event heard on the link moves the gap's from past everything heard
+    // so far.
+    let subscribed = now_ms();
+    within(Duration::from_secs(1), "the clock moves on", || {
+        now_ms() > subscribed
+    })
+    .await;
     let hearing = now_ms();
     publish(&publisher, "before").await;
     let before = delivered(&mut sub, Duration::from_secs(1)).await;
