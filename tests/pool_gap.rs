@@ -143,14 +143,21 @@ async fn the_only_link_ending_is_one_interrupted_then_one_gap() {
     let subscribing = now_ms();
     let (listener, mut sub) = listening(&lab, &[&a]).await;
     let publisher = connect(seeds(&[&a])).await;
+    // An event heard on the link moves the gap's from past it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let hearing = now_ms();
+    publish(&publisher, "before").await;
+    let before = delivered(&mut sub, Duration::from_secs(1)).await;
+    assert_eq!(heard(&before, "before"), 1);
 
     let dropped = now_ms();
     lab.drop_node(&a, &listener.node_id());
     let i = interruption(next_notice(&mut sub, Duration::from_secs(10)).await);
     assert_eq!(i.reason, "closed_by_station");
+    assert!(subscribing < hearing);
     assert!(
-        (subscribing..=dropped).contains(&i.from_ms),
-        "from {} is between the subscribe {subscribing} and the end {dropped}",
+        (hearing..=dropped).contains(&i.from_ms),
+        "from {} is between the last event heard {hearing} and the end {dropped}",
         i.from_ms
     );
     let g = gap(next_notice(&mut sub, Duration::from_secs(10)).await);

@@ -109,6 +109,19 @@ impl TestStations {
             .to_string()
     }
 
+    /// Station `i` closes `node_id`'s connection.
+    pub fn drop_node(&self, i: usize, node_id: &[u8; 32]) {
+        let reply = self.ask(&format!("drop {i} {}", hex::encode(node_id)));
+        assert_eq!(reply, "dropped");
+    }
+
+    /// How station `i` answers each registration of `kind`, as
+    /// [`lab::Lab::judge`].
+    pub fn judge(&self, i: usize, kind: &str, verdict: &str) {
+        let reply = self.ask(&format!("judge {i} {kind} {verdict}"));
+        assert_eq!(reply, "judged");
+    }
+
     /// How many streams the stations relay now.
     pub fn relayed(&self) -> u64 {
         let reply = self.ask("relayed");

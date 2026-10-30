@@ -9,6 +9,8 @@
 //	grant <node_id hex>   the org's group_keys grant for that node, a UCAN
 //	                      over mri:org:<realm_name>/<org> living an hour
 //	relayed               how many streams the stations relay now
+//	drop <i> <node_id hex>  station i closes that node's connection
+//	judge <i> <kind> <verdict>  how station i answers registrations, as in lab.go
 //
 // With a second argument "lab": no stations yet, and the commands in lab.go,
 // which start and shape stations and realms one by one.
@@ -23,6 +25,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -126,6 +129,10 @@ func command(t *helperT, stations []*teststation.Station, realm teststation.Real
 		return grantCommand(realm, fields[1])
 	case len(fields) == 1 && fields[0] == "relayed":
 		return fmt.Sprint("relayed ", stations[0].Relayed()+stations[1].Relayed())
+	case len(fields) == 3 && fields[0] == "drop":
+		return dropCommand(stations, fields[1], fields[2])
+	case len(fields) == 4 && fields[0] == "judge":
+		return judgeCommand(stations, fields[1], fields[2], fields[3])
 	}
 	return "error unknown command"
 }
@@ -140,6 +147,31 @@ func admitCommand(t *helperT, stations []*teststation.Station, realm teststation
 	copy(node[:], raw)
 	realm.Admit(t, stations[0], node)
 	return "admitted " + nodeHex
+}
+
+// judgeCommand sets how station i answers each registration of kind.
+func judgeCommand(stations []*teststation.Station, index, kind, given string) string {
+	i, err := strconv.Atoi(index)
+	if err != nil || i < 0 || i >= len(stations) {
+		return "error bad station"
+	}
+	stations[i].Judge(verdict(kind, given))
+	return "judged"
+}
+
+// dropCommand is station i closing one node's connection, as a station
+// does that ends a link.
+func dropCommand(stations []*teststation.Station, index, nodeHex string) string {
+	i, err := strconv.Atoi(index)
+	if err != nil || i < 0 || i >= len(stations) {
+		return "error bad station"
+	}
+	raw, err := hex.DecodeString(nodeHex)
+	if err != nil || len(raw) != 32 {
+		return "error bad node_id"
+	}
+	stations[i].Drop([32]byte(raw))
+	return "dropped"
 }
 
 // grantCommand is the org's group_keys grant for one node.
