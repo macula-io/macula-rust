@@ -60,6 +60,7 @@ usually touches both, but their version numbers don't move in lockstep.
   the station could reset the stream before the caller read it, and the
   caller ended with a bare stream reset instead of resealing. The refusal is
   now drained like `sealed_required`, within the same per-caller share.
+  Present since 0.9.0 (#21).
 
 ### [0.14.1] - 2026-10-30
 

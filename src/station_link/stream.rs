@@ -60,7 +60,8 @@ const STREAM_OPEN_BYTES: usize = 1024 * 1024;
 const STREAM_OPEN_WAIT: Duration = Duration::from_secs(10);
 const STREAM_INBOX: usize = 16 * 1024 * 1024;
 
-/// Streams one link drains at a time after a sealed_required refusal.
+/// Streams one link drains at a time after a resealable refusal
+/// (sealed_required or sealed_refused).
 pub(super) const DRAINS: usize = 16;
 
 /// The share of a link's drains one caller may hold: a quarter, so a caller
@@ -68,8 +69,9 @@ pub(super) const DRAINS: usize = 16;
 /// refusal to close at once.
 const DRAINS_PER_CALLER_SHARE: usize = 4;
 
-/// A link's places for streams being drained after a sealed_required
-/// refusal: `total` in all and a quarter of them, at least one, per caller.
+/// A link's places for streams being drained after a resealable refusal
+/// (sealed_required or sealed_refused): `total` in all and a quarter of
+/// them, at least one, per caller.
 pub(super) struct Drains {
     total: usize,
     per_caller: usize,
