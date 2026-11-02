@@ -136,7 +136,17 @@ pub const ANDROID_STORE_NAME: &str = "macula-rust";
 
 /// The iOS keychain access policy [`KeyringStore`] gives a node key:
 /// readable after the first unlock since boot, on this device only.
-pub const IOS_ACCESS_POLICY: &str = "after-first-unlock-this-device-only";
+pub const IOS_ACCESS_POLICY: &str = "after-first-unlock";
+
+/// The entry modifiers the iOS store builds a node key's keychain item
+/// with: [`IOS_ACCESS_POLICY`] and nothing else. Compiled on every target so
+/// a host test pins what the iOS build uses (#63): the policy is what keeps
+/// the key out of backups and off a new phone, and no host can run the iOS
+/// keychain.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+fn ios_entry_modifiers() -> std::collections::HashMap<&'static str, &'static str> {
+    std::collections::HashMap::from([("access-policy", IOS_ACCESS_POLICY)])
+}
 
 impl KeyringStore {
     #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
@@ -173,9 +183,8 @@ impl KeyringStore {
     pub fn new(service: &str, account: &str) -> Result<Self, KeyStoreError> {
         use keyring_core::api::CredentialStoreApi;
 
-        let policy = std::collections::HashMap::from([("access-policy", IOS_ACCESS_POLICY)]);
         let store = apple_native_keyring_store::protected::Store::new()?;
-        let entry = store.build(service, account, Some(&policy))?;
+        let entry = store.build(service, account, Some(&ios_entry_modifiers()))?;
         Ok(Self { entry })
     }
 
@@ -303,6 +312,24 @@ impl From<keyring::Error> for KeyStoreError {
             keyring::Error::NoEntry => KeyStoreError::NotFound,
             other => KeyStoreError::Backend(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod ios_policy_tests {
+    use super::ios_entry_modifiers;
+    use std::collections::HashMap;
+
+    /// A node key's iOS keychain item is usable after the first unlock and
+    /// on this device only: in no backup, never moved to another phone (#63).
+    /// Spelled out here, not read from the constant, so changing the policy
+    /// fails this test.
+    #[test]
+    fn the_ios_item_is_this_device_only_after_first_unlock() {
+        assert_eq!(
+            ios_entry_modifiers(),
+            HashMap::from([("access-policy", "after-first-unlock-this-device-only")])
+        );
     }
 }
 
