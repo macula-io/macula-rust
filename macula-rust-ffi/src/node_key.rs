@@ -48,10 +48,10 @@ impl From<KeyFileError> for FfiError {
         match e {
             KeyFileError::KeyStore(KeyStoreError::NotFound) => FfiError::KeystoreNotFound,
             KeyFileError::KeyStore(other) => FfiError::Keystore {
-                message: other.to_string(),
+                detail: other.to_string(),
             },
             other => FfiError::Key {
-                message: other.to_string(),
+                detail: other.to_string(),
             },
         }
     }
@@ -71,7 +71,7 @@ impl FfiNodeKey {
     pub fn generate(profile: FfiProfile) -> Result<Arc<Self>, FfiError> {
         let key = NodeKey::generate_identity(profile.into(), PUZZLE_DIFFICULTY).map_err(|e| {
             FfiError::Key {
-                message: e.to_string(),
+                detail: e.to_string(),
             }
         })?;
         Ok(Arc::new(FfiNodeKey(Arc::new(key))))

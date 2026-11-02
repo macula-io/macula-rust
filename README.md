@@ -300,9 +300,12 @@ On Android the platform keystore needs one call at app start,
 `Keyring.initializeNdkContext(applicationContext)`; see the `keystore`
 module's documentation. iOS needs nothing extra.
 
-CI generates both bindings on every push to master and every pull request;
-the apps that use them compile them. The FFI crate needs Rust 1.91, the core
-crate 1.89.
+CI generates both bindings on every push to master and every pull request,
+compiles the Kotlin with kotlinc 2.2.21 against pinned JNA and
+kotlinx-coroutines jars (`scripts/compile_kotlin_bindings.sh`), and
+type-checks the Swift with swiftc on macOS
+(`scripts/typecheck_swift_bindings.sh`): a binding that does not build fails
+CI. The FFI crate needs Rust 1.91, the core crate 1.89.
 
 ## Not yet implemented
 

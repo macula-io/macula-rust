@@ -1099,6 +1099,29 @@ did, but the two have moved at different paces ever since).
 
 ### [Unreleased]
 
+### [ffi-0.13.0] - 2026-11-02
+
+#### Breaking
+
+- **The Kotlin bindings compile** (#61). Until now uniffi generated Kotlin that
+  kotlinc refused, so no Android app could build on 0.12 or earlier. Three
+  names collided with what every Kotlin object or exception already has, and
+  are renamed in Kotlin and Swift alike:
+  - `FfiPool::close` is now `shut_down` (Kotlin `shutDown()`): the old name
+    clashed with `AutoCloseable.close()`, which frees the object.
+  - `FfiStream::close` is now `finish`: the same clash.
+  - The `message` field of every `FfiError` variant that had one
+    (`InvalidArgument`, `UnrepresentableValue`, `Key`, `Keystore`, `NoLink`,
+    `NoProvider`, `Stream`, `Handler`, `ContentUnavailable`, `Other`) is now
+    `detail`: the old name clashed with `Throwable.message`.
+
+#### Added
+
+- CI compiles the generated Kotlin with kotlinc (pinned compiler, JNA and
+  kotlinx-coroutines jars, checked by sha256) and type-checks the generated
+  Swift with swiftc on a macOS runner, so a binding that generates but does not
+  build fails here instead of in an app.
+
 ### [ffi-0.12.0] - 2026-10-30
 
 #### Breaking

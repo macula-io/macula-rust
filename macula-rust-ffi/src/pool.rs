@@ -143,7 +143,7 @@ impl TryFrom<Verified> for FfiRecord {
     fn try_from(v: Verified) -> Result<Self, FfiError> {
         let r = v.into_record();
         let wire = record::encode(&r).map_err(|e| FfiError::Other {
-            message: e.to_string(),
+            detail: e.to_string(),
         })?;
         Ok(FfiRecord {
             record_type: r.record_type.0,
@@ -229,7 +229,7 @@ impl FfiPool {
     }
 
     /// Ends every link with a GOODBYE, and every subscription.
-    pub async fn close(&self) {
+    pub async fn shut_down(&self) {
         self.0.close().await;
     }
 

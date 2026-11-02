@@ -36,7 +36,7 @@ impl TryFrom<Event> for FfiEvent {
         // by name rather than hand the app an empty event.
         if let Some(reason) = e.unopened {
             return Err(FfiError::UnrepresentableValue {
-                message: format!("an event that could not be opened: {}", reason.name()),
+                detail: format!("an event that could not be opened: {}", reason.name()),
             });
         }
         let payload = match e.payload {
@@ -47,7 +47,7 @@ impl TryFrom<Event> for FfiEvent {
             // nothing.
             Payload::Sealed(sealed) => {
                 return Err(FfiError::UnrepresentableValue {
-                    message: format!(
+                    detail: format!(
                         "a sealed group event under epoch {} (the FFI has no group API)",
                         sealed
                             .key_id
