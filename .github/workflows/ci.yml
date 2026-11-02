@@ -229,6 +229,11 @@ jobs:
   ios:
     name: builds for iOS (device and simulator)
     runs-on: macos-latest
+    env:
+      # One deployment target for the C code (aws-lc, ring) and the Rust
+      # link: without it the C objects target the SDK's newest iOS and the
+      # link targets iOS 10, and ___chkstk_darwin is missing.
+      IPHONEOS_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v4
       - name: Rust, as rust-toolchain.toml pins it

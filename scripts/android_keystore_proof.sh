@@ -32,7 +32,12 @@ mkdir -p "$jni_dir"
 # the one the SDK reads. The test must pass without it.
 find "$jni_dir" -name '*.so' ! -name 'libmacula_rust_ffi.so' -delete
 
-nm=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -name llvm-nm -type f | head -1)
+# Not `find -type f`: the NDK may ship llvm-nm as a symlink.
+nm=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -name llvm-nm | head -1)
+if [ ! -x "$nm" ]; then
+    echo "no llvm-nm under $ANDROID_NDK_HOME/toolchains/llvm/prebuilt" >&2
+    exit 1
+fi
 if ! "$nm" -D --defined-only "$jni_dir/libmacula_rust_ffi.so" | grep -q " $hook\$"; then
     echo "libmacula_rust_ffi.so does not export $hook" >&2
     exit 1
