@@ -51,7 +51,7 @@ impl FfiCallHandler for Echo {
     async fn handle(&self, request: FfiRequest) -> Result<FfiValue, FfiError> {
         if request.payload == FfiValue::Text("fail".into()) {
             return Err(FfiError::Handler {
-                message: "refused by the handler".into(),
+                detail: "refused by the handler".into(),
             });
         }
         Ok(FfiValue::Fields(vec![
@@ -202,8 +202,8 @@ async fn a_call_reaches_a_foreign_handler_in_the_provider_s_own_namespace() {
         matches!(unpinned, Err(FfiError::NoRealmKey)),
         "{unpinned:?}"
     );
-    caller.close().await;
-    provider.close().await;
+    caller.shut_down().await;
+    provider.shut_down().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -620,7 +620,7 @@ async fn a_required_call_through_the_bindings_is_sealed_end_to_end() {
 
     let unkeyed = an_unkeyed_pool_cannot_serve_required(&serving, realm).await;
     for p in [caller, provider, unkeyed] {
-        p.close().await;
+        p.shut_down().await;
     }
 }
 
@@ -682,8 +682,8 @@ async fn a_gated_procedure_answers_a_minted_ucan_and_refuses_none() {
         other => panic!("{other:?}"),
     }
     a_window_in_milliseconds_is_refused(&provider_key, &caller_key, grant, window);
-    caller.close().await;
-    provider.close().await;
+    caller.shut_down().await;
+    provider.shut_down().await;
 }
 
 /// `count` served by `provider`, only to a token rooted at its own key; the
@@ -725,7 +725,7 @@ fn a_window_in_milliseconds_is_refused(
         },
     );
     assert!(
-        matches!(&in_ms, Err(FfiError::InvalidArgument { message }) if message.contains("exp_beyond_max_lifetime")),
+        matches!(&in_ms, Err(FfiError::InvalidArgument { detail }) if detail.contains("exp_beyond_max_lifetime")),
         "{in_ms:?}"
     );
 }

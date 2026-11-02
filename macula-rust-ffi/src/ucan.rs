@@ -65,10 +65,10 @@ impl From<CreateError> for FfiError {
     fn from(e: CreateError) -> Self {
         match e {
             CreateError::Sign(k) => FfiError::Key {
-                message: k.to_string(),
+                detail: k.to_string(),
             },
             other => FfiError::InvalidArgument {
-                message: other.to_string(),
+                detail: other.to_string(),
             },
         }
     }
@@ -91,7 +91,7 @@ impl FfiNodeKey {
             .map(|text| match serde_json::from_str(&text) {
                 Ok(serde_json::Value::Object(map)) => Ok(map),
                 _ => Err(FfiError::InvalidArgument {
-                    message: "fct_json is not a JSON object".into(),
+                    detail: "fct_json is not a JSON object".into(),
                 }),
             })
             .transpose()?;

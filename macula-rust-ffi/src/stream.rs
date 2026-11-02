@@ -176,7 +176,7 @@ impl FfiStream {
     }
 
     /// Ends the session on both sides.
-    pub async fn close(&self) -> Result<(), FfiError> {
+    pub async fn finish(&self) -> Result<(), FfiError> {
         Ok(self.0.close().await?)
     }
 

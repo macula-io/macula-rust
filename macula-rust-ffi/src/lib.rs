@@ -64,32 +64,32 @@ pub fn wire_version() -> String {
 #[derive(Debug, Clone, PartialEq, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     /// An argument outside what the operation takes.
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
+    #[error("invalid argument: {detail}")]
+    InvalidArgument { detail: String },
     /// A byte string of the wrong length, where a 32-byte id belongs.
     #[error("expected exactly {expected} bytes, got {actual}")]
     WrongByteLength { expected: u32, actual: u32 },
     /// A value the FFI boundary cannot carry, such as an integer outside i64.
-    #[error("a value could not cross the FFI boundary: {message}")]
-    UnrepresentableValue { message: String },
+    #[error("a value could not cross the FFI boundary: {detail}")]
+    UnrepresentableValue { detail: String },
     /// A node key that could not be made, saved or loaded.
-    #[error("node key: {message}")]
-    Key { message: String },
+    #[error("node key: {detail}")]
+    Key { detail: String },
     /// Nothing is stored under this keystore identity.
     #[error("no key is stored under this keystore identity")]
     KeystoreNotFound,
     /// The platform's secure store failed.
-    #[error("platform secure store: {message}")]
-    Keystore { message: String },
+    #[error("platform secure store: {detail}")]
+    Keystore { detail: String },
     /// No station link came up, or none is up to carry the operation.
-    #[error("no station link: {message}")]
-    NoLink { message: String },
+    #[error("no station link: {detail}")]
+    NoLink { detail: String },
     /// A realm the pool pins no key for: nothing in it is served or trusted.
     #[error("no realm key is pinned for the realm")]
     NoRealmKey,
     /// No trusted provider advertises or answered the procedure.
-    #[error("{message}")]
-    NoProvider { message: String },
+    #[error("{detail}")]
+    NoProvider { detail: String },
     /// The provider's own ERROR: its code, detail, and who responded.
     #[error("the provider answered {code}")]
     Provider {
@@ -115,8 +115,8 @@ pub enum FfiError {
     #[error("record not found")]
     RecordNotFound,
     /// A stream ended by an error: the peer's, the station's, or this side's.
-    #[error("stream error {code}: {message}")]
-    Stream { code: String, message: String },
+    #[error("stream error {code}: {detail}")]
+    Stream { code: String, detail: String },
     /// A stream that ended normally.
     #[error("end of stream")]
     EndOfStream,
@@ -128,8 +128,8 @@ pub enum FfiError {
     #[error("not_a_caller")]
     NotACaller,
     /// A handler the foreign side implements refused, or failed.
-    #[error("handler: {message}")]
-    Handler { message: String },
+    #[error("handler: {detail}")]
+    Handler { detail: String },
     /// An operation on a closed pool, subscription, stream or serving.
     #[error("closed")]
     Closed,
@@ -139,17 +139,17 @@ pub enum FfiError {
     /// Content every announcing sharer failed to give, and why each failed:
     /// content that does not match its id, is over the fetch's bounds, or a
     /// sharer that could not be reached.
-    #[error("{message}")]
-    ContentUnavailable { message: String },
+    #[error("{detail}")]
+    ContentUnavailable { detail: String },
     /// Anything else the core crate reports, as its text.
-    #[error("{message}")]
-    Other { message: String },
+    #[error("{detail}")]
+    Other { detail: String },
 }
 
 impl From<uniffi::UnexpectedUniFFICallbackError> for FfiError {
     /// A foreign handler that threw something other than an FfiError.
     fn from(e: uniffi::UnexpectedUniFFICallbackError) -> Self {
-        FfiError::Handler { message: e.reason }
+        FfiError::Handler { detail: e.reason }
     }
 }
 
@@ -168,14 +168,17 @@ impl From<LinkError> for FfiError {
             LinkError::Relay { code, .. } => FfiError::Relay { code },
             LinkError::CallTimeout | LinkError::HandshakeTimeout => FfiError::Timeout,
             LinkError::RecordNotFound => FfiError::RecordNotFound,
-            LinkError::Stream { code, message, .. } => FfiError::Stream { code, message },
+            LinkError::Stream { code, message, .. } => FfiError::Stream {
+                code,
+                detail: message,
+            },
             LinkError::EndOfStream => FfiError::EndOfStream,
             LinkError::Closed | LinkError::StreamClosed | LinkError::Stopped => FfiError::Closed,
             e @ LinkError::KemAdvertiseDisabled => FfiError::InvalidArgument {
-                message: e.to_string(),
+                detail: e.to_string(),
             },
             other => FfiError::Other {
-                message: other.to_string(),
+                detail: other.to_string(),
             },
         }
     }
@@ -202,23 +205,23 @@ impl From<PoolError> for FfiError {
                 advertised: e.advertised.iter().map(|id| id.to_vec()).collect(),
             },
             e @ PoolError::ContentUnavailable(_) => FfiError::ContentUnavailable {
-                message: e.to_string(),
+                detail: e.to_string(),
             },
             e @ PoolError::NoProvider(_) => FfiError::NoProvider {
-                message: e.to_string(),
+                detail: e.to_string(),
             },
             e @ PoolError::NoLink(_) => FfiError::NoLink {
-                message: e.to_string(),
+                detail: e.to_string(),
             },
             e @ (PoolError::NoSeeds
             | PoolError::SeedNotPinned(_)
             | PoolError::TooManySeeds { .. }
             | PoolError::RealmTrustInvalid(_)
             | PoolError::InvalidOpts(_)) => FfiError::InvalidArgument {
-                message: e.to_string(),
+                detail: e.to_string(),
             },
             other => FfiError::Other {
-                message: other.to_string(),
+                detail: other.to_string(),
             },
         }
     }
@@ -320,7 +323,7 @@ impl TryFrom<macula_rust::cbor::Value> for FfiValue {
                 i64::try_from(n)
                     .map(FfiValue::Int)
                     .map_err(|_| FfiError::UnrepresentableValue {
-                        message: format!("integer {n} is outside i64 range"),
+                        detail: format!("integer {n} is outside i64 range"),
                     })
             }
             Value::Bytes(b) => Ok(FfiValue::Bytes(b)),
