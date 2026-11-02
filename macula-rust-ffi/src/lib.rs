@@ -52,6 +52,19 @@ use macula_rust::station_link::{LinkError, ReportError};
 
 uniffi::setup_scaffolding!();
 
+/// Keeps android-native-keyring-store's `initializeNdkContext` JNI hook in
+/// this library (macula-rust#63). The app calls it once, through this
+/// library, so the ndk-context the SDK's keystore reads is set. Nothing in
+/// Rust calls the hook, so without a reference the linker may leave its
+/// object out of the archive, and the app's call finds no symbol.
+#[cfg(target_os = "android")]
+#[used]
+static KEEP_NDK_CONTEXT_HOOK: extern "system" fn(
+    jni::JNIEnv,
+    jni::objects::JObject,
+    jni::objects::JObject,
+) = android_native_keyring_store::Java_io_crates_keyring_Keyring_00024Companion_initializeNdkContext;
+
 /// The wire this library speaks, major.minor, e.g. "1.0" (macula
 /// docs/design/WIRE_1_0.md): every wire 1.x peer shares its frozen core, so
 /// an app can show or check which wire it links.

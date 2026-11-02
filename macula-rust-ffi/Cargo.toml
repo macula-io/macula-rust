@@ -38,6 +38,13 @@ async-trait = "0.1"
 # ucan.rs: a minted token's facts arrive as a JSON object's text.
 serde_json = "1"
 
+# The initializeNdkContext JNI hook an Android app calls once (#63): kept in
+# this library by a reference in lib.rs.
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1"
+# The hook's argument types, as android-native-keyring-store 1 names them.
+jni = "0.21"
+
 [dev-dependencies]
 # tests/pool_ffi.rs drives the core crate's teststation lab
 # (../tests/common), which reads the helper's JSON and hex.

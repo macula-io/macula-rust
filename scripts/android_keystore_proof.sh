@@ -40,6 +40,9 @@ if [ ! -x "$nm" ]; then
 fi
 if ! "$nm" -D --defined-only "$jni_dir/libmacula_rust_ffi.so" | grep -q " $hook\$"; then
     echo "libmacula_rust_ffi.so does not export $hook" >&2
+    echo "llvm-nm: $nm; library: $(wc -c <"$jni_dir/libmacula_rust_ffi.so") bytes" >&2
+    echo "Java_ symbols defined: $("$nm" -D --defined-only "$jni_dir/libmacula_rust_ffi.so" | grep -c Java_ || true)" >&2
+    "$nm" -D "$jni_dir/libmacula_rust_ffi.so" | grep -i keyring | head -5 >&2 || true
     exit 1
 fi
 echo "libmacula_rust_ffi.so exports $hook"

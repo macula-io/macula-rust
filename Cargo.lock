@@ -1252,8 +1252,10 @@ dependencies = [
 name = "macula-rust-ffi"
 version = "0.13.1"
 dependencies = [
+ "android-native-keyring-store",
  "async-trait",
  "hex",
+ "jni 0.21.1",
  "macula-rust",
  "serde_json",
  "sha2",
