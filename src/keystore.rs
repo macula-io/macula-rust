@@ -39,34 +39,42 @@
 //! "overridable per target platform" is a property of the trait boundary,
 //! not something wired into this crate's own logic.
 //!
-//! ## Android setup, required once per app, not something this crate can do for you
+//! ## Android and iOS: the native store, built directly
 //!
-//! `android-native-keyring-store` (the backend `keyring` links in for
-//! Android, confirmed via its own `Cargo.toml`: `jni` + `ndk-context`)
-//! needs the embedding app to hand it a JNI `Context` once at startup,
-//! because Android's Keystore is a Java API with no NDK surface — there is
-//! no way for Rust code alone to reach it. That crate ships its own JNI
-//! export for exactly this (confirmed in its README, not assumed): once
-//! this crate is linked into an Android `.so`, that export is present
-//! automatically, and the Kotlin side calls it once, e.g. from
-//! `MainActivity.onCreate`:
+//! `keyring`'s `v1::Entry` sets a default store on macOS, Windows and
+//! desktop Unix only; on Android and iOS it has none, so every call through
+//! it fails with `NoDefaultStore` (macula-rust#63). [`KeyringStore::new`]
+//! therefore builds the native store itself on both, as it does on Windows:
+//! `android-native-keyring-store` (store [`ANDROID_STORE_NAME`]) and
+//! `apple-native-keyring-store`'s protected-data store (access policy
+//! [`IOS_ACCESS_POLICY`]). The threat model is on macula-rust#63. A missing
+//! or broken store is a [`KeyStoreError`]; nothing falls back to a key file.
+//!
+//! ## Android setup, required once per app
+//!
+//! Android's Keystore is a Java API with no NDK surface, so the store needs
+//! the app's JNI `Context` once at startup. `android-native-keyring-store`
+//! exports a JNI hook for it, `initializeNdkContext`, and the hook must be
+//! called in the same library that runs this crate: that library holds the
+//! `ndk-context` this crate reads. `macula-rust-ffi`'s
+//! `libmacula_rust_ffi.so` exports it. The class name is fixed by the JNI
+//! symbol:
 //!
 //! ```kotlin
 //! package io.crates.keyring
 //! class Keyring {
 //!     companion object {
-//!         init { System.loadLibrary("your_actual_library_name") }
+//!         init { System.loadLibrary("macula_rust_ffi") }
 //!         external fun initializeNdkContext(context: Context)
 //!     }
 //! }
-//! // in onCreate:
+//! // in onCreate, before any keystore call:
 //! Keyring.initializeNdkContext(this.applicationContext)
 //! ```
 //!
-//! No custom UniFFI foreign-trait bridge is needed for Android or iOS —
-//! both have first-party `keyring` backends, confirmed by reading
-//! `keyring` 4.2.0's own `Cargo.toml` target-cfg dependency blocks
-//! directly, not assumed from the crate's name.
+//! Do not load the separate `libandroid_native_keyring_store.so` cargo-ndk
+//! also copies out: it carries its own `ndk-context`, and initialising that
+//! one leaves this crate's unset.
 //!
 //! ## A second Linux backend, [`LinuxKeyutilsStore`]
 //!
@@ -81,6 +89,7 @@
 //! Linux — this is exactly what lets this module's own tests verify a
 //! real save/load/delete round trip in this environment.
 
+#[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
 use keyring::Entry;
 use macula_mldsa::Zeroizing;
 
@@ -120,12 +129,54 @@ pub struct KeyringStore {
     entry: keyring_core::Entry,
 }
 
+/// The Android keyring store [`KeyringStore`] keeps node keys in: its own
+/// name, so its file (`keyring-macula-rust`) and Keystore key are not the
+/// `default` store an app may use for something else.
+pub const ANDROID_STORE_NAME: &str = "macula-rust";
+
+/// The iOS keychain access policy [`KeyringStore`] gives a node key:
+/// readable after the first unlock since boot, on this device only.
+pub const IOS_ACCESS_POLICY: &str = "after-first-unlock-this-device-only";
+
 impl KeyringStore {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "android", target_os = "ios")))]
     pub fn new(service: &str, account: &str) -> Result<Self, KeyStoreError> {
         Ok(Self {
             entry: Entry::new(service, account)?.inner,
         })
+    }
+
+    /// Built against the Android Keystore directly (macula-rust#63):
+    /// keyring's `v1::Entry` sets no default store on Android, so every call
+    /// through it fails. The credential sits AES-GCM encrypted in an
+    /// app-private file, under a Keystore key that never leaves the Keystore,
+    /// in a store named for this crate ([`ANDROID_STORE_NAME`]) so it cannot
+    /// collide with an app's own keyring use. Needs the app to have called
+    /// the `initializeNdkContext` JNI hook first (see this module's doc).
+    #[cfg(target_os = "android")]
+    pub fn new(service: &str, account: &str) -> Result<Self, KeyStoreError> {
+        use keyring_core::api::CredentialStoreApi;
+
+        let config = std::collections::HashMap::from([("name", ANDROID_STORE_NAME)]);
+        let store = android_native_keyring_store::Store::new_with_configuration(&config)?;
+        let entry = store.build(service, account, None)?;
+        Ok(Self { entry })
+    }
+
+    /// Built against the iOS protected-data keychain directly
+    /// (macula-rust#63): keyring's `v1::Entry` sets no default store on iOS.
+    /// Local only, never iCloud-synced, readable after the first unlock
+    /// since boot (a node answers while the screen is locked) and on this
+    /// device only ([`IOS_ACCESS_POLICY`]), so the key is in no backup and
+    /// does not move to a new phone.
+    #[cfg(target_os = "ios")]
+    pub fn new(service: &str, account: &str) -> Result<Self, KeyStoreError> {
+        use keyring_core::api::CredentialStoreApi;
+
+        let policy = std::collections::HashMap::from([("access-policy", IOS_ACCESS_POLICY)]);
+        let store = apple_native_keyring_store::protected::Store::new()?;
+        let entry = store.build(service, account, Some(&policy))?;
+        Ok(Self { entry })
     }
 
     /// Built against Windows Credential Manager directly, persisted on this

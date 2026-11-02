@@ -65,9 +65,10 @@ tokio = { version = "1", features = ["full"] }
 # without `protected` hits apple-native-keyring-store's own
 # compile_error!("The `protected` feature is required on iOS"). Verified
 # 2026-09-05 against real iOS CI (macula-cam2me's ios.yml), not assumed.
-# `android-native-keyring-store` is added explicitly since it is NOT part
-# of `v1`'s default set either.
-keyring = { version = "4", features = ["android-native-keyring-store"] }
+# keyring's `v1` sets no default store on Android or iOS at all, so
+# KeyringStore builds the native store directly there (#63), from the
+# target dependencies below.
+keyring = "4"
 # KeyringStore names keyring_core's Entry and Error on every target, so the
 # crate is a dependency on every target (#26: Android is target_os
 # "android", not "linux", and failed to build). "1" matches keyring 4's own
@@ -94,12 +95,16 @@ linux-keyutils-keyring-store = "1"
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = "1"
 
-# Unifies apple-native-keyring-store's `protected` feature into the same
-# optional dependency keyring (v1, above) already pulls in for
-# cfg(any(macos, ios)) -- see the comment on the main `keyring` line.
-# Version constraint ("1") deliberately matches keyring 4.2.0's own exactly
-# so Cargo resolves both to the SAME crate instance and unifies features,
-# rather than risking two separate resolved versions.
+# Android: KeyringStore builds its store directly (#63). The crate also
+# exports the initializeNdkContext JNI hook an app calls once at startup;
+# linked here, the hook ships in the same library as this crate.
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1"
+
+# iOS: KeyringStore builds the protected-data store directly (#63); iOS has
+# no legacy keychain, and the crate refuses to build there without
+# `protected`. "1" matches keyring 4.2.0's own constraint, so on macOS both
+# resolve to one crate instance with unified features.
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["protected"] }
 
