@@ -187,6 +187,58 @@ jobs:
             --language swift --out-dir "$RUNNER_TEMP/bindings-swift" --no-format
       - run: scripts/typecheck_swift_bindings.sh "$RUNNER_TEMP/bindings-swift"
 
+  # An Android app keeps its node key in the Android Keystore through the FFI
+  # (#63): on an emulator, a saved key loads back as the same node, and the
+  # JNI hook the app calls is in libmacula_rust_ffi.so itself.
+  android-keystore:
+    name: Android Keystore round trip (emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          rustup target add x86_64-linux-android
+          scripts/assert_toolchain.sh
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-ndk --locked
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.7.1"
+      - name: Let the emulator use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Keystore round trip on an API 34 emulator
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" scripts/android_keystore_proof.sh x86_64
+
+  # iOS keeps the node key in the protected-data keychain (#63); the SDK
+  # builds that store itself on iOS, so the iOS build has to compile.
+  ios:
+    name: builds for iOS (device and simulator)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          scripts/assert_toolchain.sh
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p macula-rust-ffi --locked --target aarch64-apple-ios --target aarch64-apple-ios-sim
+
   # A known-vulnerable dependency fails the build (macula-codebase-checks#11).
   # The shared workflow, not a cargo audit step of our own: a step cannot be read
   # for whether it can fail, and its --ignore is an exception nobody dated.

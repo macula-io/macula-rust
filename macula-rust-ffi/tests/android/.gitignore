@@ -1,0 +1,7 @@
+# Written by scripts/android_keystore_proof.sh
+/keystore/src/main/jniLibs/
+/keystore/src/main/kotlin/io/macula/sdk/
+.gradle/
+.kotlin/
+build/
+local.properties
