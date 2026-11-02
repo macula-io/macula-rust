@@ -136,7 +136,7 @@ pub const ANDROID_STORE_NAME: &str = "macula-rust";
 
 /// The iOS keychain access policy [`KeyringStore`] gives a node key:
 /// readable after the first unlock since boot, on this device only.
-pub const IOS_ACCESS_POLICY: &str = "after-first-unlock";
+pub const IOS_ACCESS_POLICY: &str = "after-first-unlock-this-device-only";
 
 /// The entry modifiers the iOS store builds a node key's keychain item
 /// with: [`IOS_ACCESS_POLICY`] and nothing else. Compiled on every target so
