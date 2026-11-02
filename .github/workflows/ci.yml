@@ -150,8 +150,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
 
+  # The generated bindings must compile, not only generate (#61): uniffi emits
+  # Kotlin that kotlinc refuses when the Rust API collides with AutoCloseable or
+  # Throwable, and an app would find that out at its first build.
   ffi-bindings:
-    name: uniffi bindgen (kotlin + swift codegen smoke test)
+    name: uniffi bindings (kotlin generates and compiles)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -164,11 +167,25 @@ jobs:
       - run: |
           cargo run -p macula-rust-ffi --release --bin uniffi-bindgen -- generate \
             --library target/release/libmacula_rust_ffi.so \
-            --language kotlin --out-dir /tmp/bindings-kotlin --no-format
+            --language kotlin --out-dir "$RUNNER_TEMP/bindings-kotlin" --no-format
+      - run: scripts/compile_kotlin_bindings.sh "$RUNNER_TEMP/bindings-kotlin"
+
+  ffi-bindings-swift:
+    name: uniffi bindings (swift generates and type-checks)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust, as rust-toolchain.toml pins it
+        run: |
+          rustup show
+          scripts/assert_toolchain.sh
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p macula-rust-ffi --release
       - run: |
           cargo run -p macula-rust-ffi --release --bin uniffi-bindgen -- generate \
-            --library target/release/libmacula_rust_ffi.so \
-            --language swift --out-dir /tmp/bindings-swift --no-format
+            --library target/release/libmacula_rust_ffi.dylib \
+            --language swift --out-dir "$RUNNER_TEMP/bindings-swift" --no-format
+      - run: scripts/typecheck_swift_bindings.sh "$RUNNER_TEMP/bindings-swift"
 
   # A known-vulnerable dependency fails the build (macula-codebase-checks#11).
   # The shared workflow, not a cargo audit step of our own: a step cannot be read
