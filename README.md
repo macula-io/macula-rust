@@ -296,9 +296,16 @@ val token = key.mintUcan(otherNodeId, listOf(FfiCapability("mri:org:io.macula/ac
     FfiUcanOptions(exp = nowSeconds + 3600, nbf = null, nnc = null, fctJson = null, parent = null))
 ```
 
-On Android the platform keystore needs one call at app start,
-`Keyring.initializeNdkContext(applicationContext)`; see the `keystore`
-module's documentation. iOS needs nothing extra.
+On Android the platform keystore needs one call at app start, before any
+keystore use: a class `io.crates.keyring.Keyring` whose companion loads
+`macula_rust_ffi` and declares `external fun initializeNdkContext(context:
+Context)`, then `Keyring.initializeNdkContext(applicationContext)`. Load
+`macula_rust_ffi` for it, not the separate `libandroid_native_keyring_store.so`
+cargo-ndk also copies out (#63); the `keystore` module's documentation has the
+class. The key is kept AES-GCM encrypted under an Android Keystore key. iOS
+needs nothing extra: the key is a keychain item usable after the first unlock,
+on that device only, in no backup. CI proves the Android round trip on an
+emulator (`scripts/android_keystore_proof.sh`).
 
 CI generates both bindings on every push to master and every pull request,
 compiles the Kotlin with kotlinc 2.2.21 against pinned JNA and

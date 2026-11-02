@@ -15,6 +15,27 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+### [0.15.1] - 2026-11-02
+
+#### Fixed
+
+- **The platform keystore works on Android and iOS** (#63). `KeyringStore`
+  went through keyring 4.2's `v1::Entry`, which sets a default store on
+  macOS, Windows and desktop Unix only, so on a phone every
+  `NodeKey::save_to_keystore`/`load_from_keystore` failed with
+  `NoDefaultStore`. `KeyringStore::new` now builds the native store itself
+  there, as it already did on Windows:
+  - Android: `android-native-keyring-store`, store `macula-rust`
+    (`ANDROID_STORE_NAME`): the key AES-GCM encrypted in an app-private file,
+    under a Keystore key that never leaves the Keystore. Its
+    `initializeNdkContext` JNI hook now ships in the library that links this
+    crate; the app calls it once before any keystore use (module doc).
+  - iOS: the protected-data keychain, local only, access policy
+    `after-first-unlock-this-device-only` (`IOS_ACCESS_POLICY`): usable while
+    the screen is locked, in no backup, never moved to another phone.
+  A missing or broken store is a `KeyStoreError`; nothing falls back to a key
+  file. Threat model on #63.
+
 ### [0.15.0] - 2026-10-30
 
 #### Breaking
@@ -1098,6 +1119,25 @@ did, but the two have moved at different paces ever since).
 
 
 ### [Unreleased]
+
+### [ffi-0.13.1] - 2026-11-02
+
+#### Fixed
+
+- **`FfiNodeKey.saveToKeystore`/`loadFromKeystore` work on Android and iOS**
+  (#63), through macula-rust 0.15.1. On Android, `libmacula_rust_ffi.so` now
+  exports the `initializeNdkContext` JNI hook itself: the app's
+  `io.crates.keyring.Keyring` class loads `macula_rust_ffi` and calls it once
+  before any keystore use. Do not load the separate
+  `libandroid_native_keyring_store.so` cargo-ndk also copies out; its
+  ndk-context is not the one the SDK reads.
+
+#### Added
+
+- CI runs a keystore round trip on an Android emulator
+  (`scripts/android_keystore_proof.sh`: a saved key loads back as the same
+  node, a missing one is `KeystoreNotFound`, a save writes no file but the
+  store's own) and builds the FFI for iOS device and simulator.
 
 ### [ffi-0.13.0] - 2026-11-02
 
