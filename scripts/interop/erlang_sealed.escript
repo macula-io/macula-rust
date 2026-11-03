@@ -1,8 +1,15 @@
 #!/usr/bin/env escript
-%% Sealed calls and streams across macula 14 and macula-go (E2E seal scheme 1,
-%% design §5, amendment A1), through one station, for scripts/interop/gosealed
-%% and scripts/interop/tssealed. MACULA_SEALED_PEER names the peer whose texts
-%% a call expects ("kept by <peer>", ...): "go" when unset, "ts" for tssealed.
+%% Sealed calls and streams across macula (wire 1.0, 15.0.0-rc.1 on) and
+%% macula-rust (E2E seal scheme 1, design §5, amendment A1), through one
+%% station, for tests/interop_sealed.rs and tests/interop_sealed_a0.rs.
+%% MACULA_SEALED_PEER names the peer whose texts a call expects ("kept by
+%% <peer>", ...): "rust" here, "go" or "ts" in macula-go's copy.
+%%
+%% macula-go's copy at 4c357ca (macula-go#43), unchanged but for this header:
+%% the two copies are meant to stay the same program, so a case one SDK runs
+%% is a case the other can. serve_a0 is release A0's provider
+%% (DESIGN_E2E_SEALED_BY_DEFAULT.md section 8.1): required, and the refusal
+%% it sends names the key it holds.
 %%
 %%   escript erlang_sealed.escript <macula lib dir> <host> <port> <station node_id hex> <realm hex> <profile> serve <hold s>
 %%   escript erlang_sealed.escript <macula lib dir> <host> <port> <station node_id hex> <realm hex> <profile> call <provider node_id hex>
@@ -14,15 +21,14 @@
 %% does by direct dial, sealed to the key the provider's advertisement names,
 %% then calls vault at its station with confidential => off (call_station/8),
 %% which a required provider must refuse sealed_required. It prints each outcome and exits 1 on any other.
-%% The node identity is a fresh throwaway: identity_dir is a temporary directory
-%% (identity layout v1, macula#76, macula 14 on).
+%% The node identity is a fresh throwaway in a temporary directory.
 main([Lib, Host, Port, Station, Realm, Profile, Mode | Args]) ->
     [true = code:add_patha(Dir) || Dir <- filelib:wildcard(filename:join([Lib, "..", "*", "ebin"]))],
     Tmp = string:trim(os:cmd("mktemp -d")),
     P = list_to_atom(Profile),
     ok = application:load(macula),
     ok = application:set_env(macula, crypto_profile, P),
-    ok = application:set_env(macula, identity_dir, filename:join(Tmp, "identity")),
+    ok = application:set_env(macula, identity_dir, Tmp),
     ok = application:set_env(macula, kem_advertise, enabled),
     {ok, _} = application:ensure_all_started(macula),
     Seed = #{host => list_to_binary(Host), port => list_to_integer(Port),
@@ -60,6 +66,33 @@ run("serve", {Pool, _Seed}, Realm, Profile, Self, [Hold]) ->
                                  end, Required),
     ok = macula_direct_dial:publish_advertisement(Pool, Realm, Vault, Key, Required),
     ok = macula_direct_dial:publish_advertisement(Pool, Realm, Watch, Key, Required),
+    io:format("serving~n"),
+    timer:sleep(list_to_integer(Hold) * 1000),
+    0;
+run("serve_a0", {Pool, _Seed}, Realm, _Profile, Self, [Hold]) ->
+    %% Release A0 (DESIGN_E2E_SEALED_BY_DEFAULT.md section 8.1): a keyed
+    %% provider whose sealed_required names the key it holds now, so a caller
+    %% that does not know it seals again to it instead of being turned away.
+    %% `refusal_names_key' is the whole switch; `required' already refuses
+    %% every clear request. It is the test's, no service sets it yet.
+    Required = #{confidential => required, refusal_names_key => true},
+    ok = macula:advertise(Pool, Realm, own(Self, <<"vault">>),
+                          fun(_Args) -> {ok, {text, <<"kept by erlang">>}} end, Required),
+    ok = macula:advertise_stream(Pool, Realm, own(Self, <<"watch">>), server_stream,
+                                 fun(Stream, _Args) ->
+                                         ok = macula_stream:send(Stream, <<"chunk from erlang">>),
+                                         ok = macula_stream:set_reply(Stream, {text, <<"streamed by erlang">>}),
+                                         macula_stream:close(Stream)
+                                 end, Required),
+    %% Answers only after the caller's end: what a caller that wrote and closed
+    %% before the refusal replays, in order, is what this counts.
+    ok = macula:advertise_stream(Pool, Realm, own(Self, <<"count">>), client_stream,
+                                 fun(Stream, _Args) -> counted(Stream, []) end, Required),
+    %% Waits for the caller's first chunk before anything goes back: a bidi
+    %% stream that only completes if the caller's writes reached it.
+    ok = macula:advertise_stream(Pool, Realm, own(Self, <<"first">>), bidi,
+                                 fun(Stream, _Args) -> first_chunk(Stream) end, Required),
+    io:format("kem ~s~n", [named_key(Self)]),
     io:format("serving~n"),
     timer:sleep(list_to_integer(Hold) * 1000),
     0;
@@ -130,6 +163,40 @@ verdict(Peer, {ok, {text, Kept}}, {{chunk, Chunk}, {ok, {text, Streamed}}},
     0;
 verdict(_Peer, _Called, _Streamed, _Clear) ->
     1.
+
+%% The KEM key this node holds now, as a refusal names it, hex; "none" when it
+%% holds one none.
+named_key(Id) ->
+    case macula_kem_keyring:current(Id) of
+        {ok, #{key := Carried}} -> binary:encode_hex(Carried, lowercase);
+        error -> <<"none">>
+    end.
+
+%% A client stream's chunks, from its open to the caller's end, as the reply
+%% value: the order the provider read them in.
+counted(Stream, Seen) ->
+    case macula_stream:recv(Stream, 10_000) of
+        {chunk, Chunk} -> counted(Stream, [Chunk | Seen]);
+        eof ->
+            ok = macula_stream:set_reply(Stream, {text, list_to_binary(lists:join(<<",">>, lists:reverse(Seen)))}),
+            macula_stream:close(Stream);
+        {error, Reason} ->
+            macula_stream:set_error(Stream, Reason),
+            ok
+    end.
+
+%% A bidi stream that answers first_chunk's caller only once its first chunk
+%% has arrived.
+first_chunk(Stream) ->
+    case macula_stream:recv(Stream, 10_000) of
+        {chunk, Chunk} ->
+            ok = macula_stream:send(Stream, <<"echo ", Chunk/binary>>),
+            ok = macula_stream:set_reply(Stream, {text, <<"echoed">>}),
+            macula_stream:close(Stream);
+        Other ->
+            macula_stream:set_error(Stream, {no, first_chunk, Other}),
+            ok
+    end.
 
 off_verdict("1", {error, {confidentiality, off_needs_explicit_target}}, Verdict) -> Verdict;
 off_verdict("1", _Sealed, _Verdict) -> 1;

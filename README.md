@@ -40,8 +40,11 @@
 > seal scheme 1), and a node with `kem_advertise` on names its key, opens
 > sealed requests and answers them sealed, and a caller's seal report says
 > whether the exchange behind a result was sealed and to which key; both
-> directions are held to macula's vectors and run live against macula 15.6.0
-> with `confidential => required` (`scripts/interop/sealed.sh`). A call or
+> directions are held to macula's vectors and run live against macula 17.2.0
+> with `confidential => required`, and a caller that never saw the provider's
+> key recovers from a signed refusal that names it — calls and stream opens,
+> a replayed client stream and a bidi one (release A0,
+> `scripts/interop/sealed.sh`). A call or
 > an open presents a UCAN, and a procedure served under a UCAN policy answers
 > only what it authorizes, every verdict held to macula's UCAN_V1 vectors and
 > every minted token authorized by macula's own `macula_ucan`

@@ -28,7 +28,7 @@ use macula_rust::pool::{
 };
 use macula_rust::profile::Profile;
 use macula_rust::record;
-use macula_rust::station_link::{handler, stream_handler, StreamEvent};
+use macula_rust::station_link::{handler, stream_handler, LinkError, StreamEvent};
 
 fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
@@ -64,16 +64,33 @@ async fn pool(kem_advertise: bool) -> (Pool, [u8; 32]) {
     (pool, hex32("MACULA_RUST_SEALED_REALM"))
 }
 
-/// The provider's advertisement reaches the DHT in its own time.
+/// The provider's advertisement reaches the DHT in its own time, and so does
+/// the route to the link behind it: a call that found a candidate whose
+/// provider is not yet answering either times out or is relayed `unknown_next_peer`
+/// by the station. Both are a caller's first seconds against a provider still
+/// warming up, not a refusal, and both are waited out. A provider that never
+/// comes up still fails this, once the deadline passes.
 async fn until_served(pool: &Pool, c: Call) -> Result<(Value, Report), PoolError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match pool.call_report(c.clone()).await {
-            Err(PoolError::NoProvider(tried)) if tried.is_empty() && Instant::now() < deadline => {
+            Err(not_ready) if not_ready_is_a_wait(&not_ready) && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await
             }
             outcome => return outcome,
         }
+    }
+}
+
+/// Whether `e` is the provider not being ready yet, rather than an answer:
+/// no candidate at all, a candidate whose link the station cannot route to
+/// yet, or one whose provider has not answered inside the call's timeout.
+fn not_ready_is_a_wait(e: &PoolError) -> bool {
+    match e {
+        PoolError::NoProvider(tried) => tried.is_empty(),
+        PoolError::Link(LinkError::CallTimeout) => true,
+        PoolError::Link(LinkError::Relay { code, .. }) => code == "unknown_next_peer",
+        _ => false,
     }
 }
 

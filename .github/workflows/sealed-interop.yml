@@ -1,0 +1,74 @@
+name: Sealed interop
+
+# macula (Erlang) and macula-rust seal calls and streams to each other, both
+# ways, in both profiles, and a Rust caller that never saw the provider's key
+# recovers from macula's signed sealed_required refusal (release A0). This runs
+# scripts/interop/sealed.sh on every PR and master push, so a cross-SDK sealing
+# claim rests on a recorded CI run at the sha it is made about, not on a run by
+# hand (macula-rust#49, macula-rust#42).
+#
+# The Erlang side is macula from hex at MACULA_VERSION, compiled as a rebar3
+# dependency in macula's pinned CI image (the image sealed.sh runs it in), so
+# the build and the run use one toolchain. Release A0's provider needs macula
+# 17.2.0 or later: it is the release that knows `refusal_names_key`.
+#
+# workflow_dispatch takes another macula version: a release without sealing
+# (any 12.x) must turn this red, which is how the job was shown able to fail.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      macula_version:
+        description: macula release from hex to interoperate with
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # The version scripts/interop/sealed.sh records as last run; move both together.
+  MACULA_VERSION: ${{ inputs.macula_version || '17.2.0' }}
+  MACULA_CI_IMAGE: ghcr.io/macula-io/macula-ci-otp:20260923-1347@sha256:b2260d084a3d3c5e0b74932c4ee052a0cadfddddb6587d5d2214873e6bb06330
+
+jobs:
+  sealed:
+    name: sealed interop (macula ${{ inputs.macula_version || '17.2.0' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/teststation/go.mod
+          cache-dependency-path: tests/teststation/go.sum
+      # sealed.sh starts the station the script dials (tests/teststation),
+      # built to target/teststation first, as the test job does.
+      - run: ./scripts/build-teststation.sh
+      - name: Build macula ${{ env.MACULA_VERSION }} from hex in the CI image
+        run: |
+          mkdir -p "$RUNNER_TEMP/macula-build"
+          printf '{deps, [{macula, "%s"}]}.\n' "$MACULA_VERSION" > "$RUNNER_TEMP/macula-build/rebar.config"
+          podman run --rm -v "$RUNNER_TEMP/macula-build:/b" -w /b "$MACULA_CI_IMAGE" rebar3 compile
+          test -d "$RUNNER_TEMP/macula-build/_build/default/lib/macula/ebin"
+      - name: Both ways, pq_hybrid and pq_pure, and release A0
+        shell: bash
+        env:
+          MACULA_OFF_REFUSED: "1"
+          MACULA_SEAL_REPORT: "1"
+        run: |
+          export MACULA_BUILD="$RUNNER_TEMP/macula-build"
+          {
+            echo "macula-rust $GITHUB_SHA, macula $MACULA_VERSION from hex, $MACULA_CI_IMAGE"
+            scripts/interop/sealed.sh pq_hybrid
+            scripts/interop/sealed.sh pq_pure
+          } 2>&1 | tee sealed-interop.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sealed-interop-log
+          path: sealed-interop.log
