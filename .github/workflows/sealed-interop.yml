@@ -46,6 +46,9 @@ jobs:
         with:
           go-version-file: tests/teststation/go.mod
           cache-dependency-path: tests/teststation/go.sum
+      # sealed.sh starts the station the script dials (tests/teststation),
+      # built to target/teststation first, as the test job does.
+      - run: ./scripts/build-teststation.sh
       - name: Build macula ${{ env.MACULA_VERSION }} from hex in the CI image
         run: |
           mkdir -p "$RUNNER_TEMP/macula-build"
