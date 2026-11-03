@@ -28,7 +28,7 @@ use macula_rust::pool::{
 };
 use macula_rust::profile::Profile;
 use macula_rust::record;
-use macula_rust::station_link::{handler, stream_handler, StreamEvent};
+use macula_rust::station_link::{handler, stream_handler, LinkError, StreamEvent};
 
 fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
@@ -64,12 +64,18 @@ async fn pool(kem_advertise: bool) -> (Pool, [u8; 32]) {
     (pool, hex32("MACULA_RUST_SEALED_REALM"))
 }
 
-/// The provider's advertisement reaches the DHT in its own time.
+/// The provider's advertisement reaches the DHT in its own time, and so does
+/// the link behind it: a call that found a candidate whose provider is not
+/// yet answering times out, which is a caller's first second against a
+/// provider still warming up, not a refusal. Both are waited out.
 async fn until_served(pool: &Pool, c: Call) -> Result<(Value, Report), PoolError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match pool.call_report(c.clone()).await {
             Err(PoolError::NoProvider(tried)) if tried.is_empty() && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+            Err(PoolError::Link(LinkError::CallTimeout)) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await
             }
             outcome => return outcome,

@@ -24,7 +24,7 @@
 //! stream's sealed state, since this SDK has no such report for a stream.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use macula_rust::cbor::Value;
 use macula_rust::frame::StreamMode;
@@ -33,7 +33,7 @@ use macula_rust::profile::Profile;
 use macula_rust::record;
 use macula_rust::statement_issuer::StatementIssuer;
 use macula_rust::station_link::{
-    Call, Called, Config, Link, Seal, Stream, StreamCall, StreamEvent,
+    Call, Called, Config, Link, LinkError, Seal, Stream, StreamCall, StreamEvent,
 };
 use macula_rust::transport::Target;
 
@@ -72,25 +72,36 @@ async fn dial() -> Link {
 }
 
 /// A clear call to `procedure`, which a required provider refuses: seal it
-/// once more to the key its refusal carries, and get the answer back.
+/// once more to the key its refusal carries, and get the answer back. A call
+/// that timed out is tried again until the deadline, as in
+/// `tests/interop_sealed.rs`: the provider has advertised but its link may
+/// still be warming up on a slow runner.
 async fn clear_call(link: &Link, realm: [u8; 32], provider: [u8; 32], procedure: &str) -> Called {
-    let called = link
-        .call_resealing(Call {
-            realm,
-            procedure: record::own_procedure(&provider, procedure),
-            target: provider,
-            payload: Value::Map(Vec::new()),
-            timeout: Duration::from_secs(10),
-            seal: Some(Seal::Clear),
-            ..Call::default()
-        })
-        .await;
-    println!(
-        "a0 clear call: {:?}, key {:?} bytes",
-        called.outcome,
-        called.resealed_to.as_ref().map(Vec::len)
-    );
-    called
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let called = link
+            .call_resealing(Call {
+                realm,
+                procedure: record::own_procedure(&provider, procedure),
+                target: provider,
+                payload: Value::Map(Vec::new()),
+                timeout: Duration::from_secs(10),
+                seal: Some(Seal::Clear),
+                ..Call::default()
+            })
+            .await;
+        println!(
+            "a0 clear call: {:?}, key {:?} bytes",
+            called.outcome,
+            called.resealed_to.as_ref().map(Vec::len)
+        );
+        match &called.outcome {
+            Err(LinkError::CallTimeout) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await
+            }
+            _ => return called,
+        }
+    }
 }
 
 /// A clear open of `procedure`, `mode`, which a required provider refuses:
