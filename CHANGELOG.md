@@ -15,6 +15,22 @@ usually touches both, but their version numbers don't move in lockstep.
 
 ### [Unreleased]
 
+#### Added
+
+- **Release A0, proven across SDKs** (macula-rust#49, macula-rust#42). The
+  cross-SDK cases #42's done-when named now run: `scripts/interop/sealed.sh`
+  gains an Erlang provider built to name the key it holds in its signed
+  `sealed_required` refusal (`erlang_sealed.escript serve_a0`, macula 17.2.0's
+  `refusal_names_key`), and `tests/interop_sealed_a0.rs` is the Rust caller
+  that only ever learns that key there. Four clear requests — a call, a server
+  stream open, a client stream that wrote and closed before the refusal, and a
+  bidi stream the provider answers only after the caller's first chunk — each
+  come back sealed to the provider's own key. In both profiles, in CI, on every
+  PR and master push (`.github/workflows/sealed-interop.yml`).
+  The harness moves from macula 14 to macula 17.2.0 with macula-go's escript at
+  4c357ca, so the two copies of the interop program stay one program. No
+  protocol change: nothing here sends `seal.kem_key`, and no default moves.
+
 ### [0.15.1] - 2026-11-02
 
 #### Fixed
