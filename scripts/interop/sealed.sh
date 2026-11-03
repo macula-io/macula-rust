@@ -41,7 +41,28 @@ slice=${CGROUP_PARENT:+--cgroup-parent=$CGROUP_PARENT}
 work="$(mktemp -d)"
 erl_name="macula-rust-sealed-$$"
 rust_name="macula-rust-sealed-provider-$$"
+# what_failed says why a run that ends badly ended badly: every side's own
+# log, and the containers still up, before cleanup takes them away. A failing
+# CI run is the only place some of this is ever seen.
+what_failed() {
+  local f
+  for f in "$work"/*.out; do
+    [ -e "$f" ] || continue
+    echo "== $(basename "$f") ==" >&2
+    cat "$f" >&2 || true
+  done
+  for name in "$erl_name" "$rust_name"; do
+    echo "== podman logs $name ==" >&2
+    podman logs "$name" >&2 2>&1 || true
+  done
+}
+
 cleanup() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "sealed.sh: failing with $rc; the logs of every side follow" >&2
+    what_failed || true
+  fi
   podman rm -f "$erl_name" "$rust_name" > /dev/null 2>&1 || true
   exec 3>&- || true
   rm -rf "$work"

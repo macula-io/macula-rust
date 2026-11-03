@@ -65,21 +65,32 @@ async fn pool(kem_advertise: bool) -> (Pool, [u8; 32]) {
 }
 
 /// The provider's advertisement reaches the DHT in its own time, and so does
-/// the link behind it: a call that found a candidate whose provider is not
-/// yet answering times out, which is a caller's first second against a
-/// provider still warming up, not a refusal. Both are waited out.
+/// the route to the link behind it: a call that found a candidate whose
+/// provider is not yet answering either times out or is relayed `unknown_next_peer`
+/// by the station. Both are a caller's first seconds against a provider still
+/// warming up, not a refusal, and both are waited out. A provider that never
+/// comes up still fails this, once the deadline passes.
 async fn until_served(pool: &Pool, c: Call) -> Result<(Value, Report), PoolError> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match pool.call_report(c.clone()).await {
-            Err(PoolError::NoProvider(tried)) if tried.is_empty() && Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(200)).await
-            }
-            Err(PoolError::Link(LinkError::CallTimeout)) if Instant::now() < deadline => {
+            Err(not_ready) if not_ready_is_a_wait(&not_ready) && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await
             }
             outcome => return outcome,
         }
+    }
+}
+
+/// Whether `e` is the provider not being ready yet, rather than an answer:
+/// no candidate at all, a candidate whose link the station cannot route to
+/// yet, or one whose provider has not answered inside the call's timeout.
+fn not_ready_is_a_wait(e: &PoolError) -> bool {
+    match e {
+        PoolError::NoProvider(tried) => tried.is_empty(),
+        PoolError::Link(LinkError::CallTimeout) => true,
+        PoolError::Link(LinkError::Relay { code, .. }) => code == "unknown_next_peer",
+        _ => false,
     }
 }
 

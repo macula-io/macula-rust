@@ -73,9 +73,9 @@ async fn dial() -> Link {
 
 /// A clear call to `procedure`, which a required provider refuses: seal it
 /// once more to the key its refusal carries, and get the answer back. A call
-/// that timed out is tried again until the deadline, as in
-/// `tests/interop_sealed.rs`: the provider has advertised but its link may
-/// still be warming up on a slow runner.
+/// that found the provider but could not reach it yet is tried again until
+/// the deadline, as in `tests/interop_sealed.rs`: the provider has advertised,
+/// but the station's route to its link may still be settling on a slow runner.
 async fn clear_call(link: &Link, realm: [u8; 32], provider: [u8; 32], procedure: &str) -> Called {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -96,11 +96,22 @@ async fn clear_call(link: &Link, realm: [u8; 32], provider: [u8; 32], procedure:
             called.resealed_to.as_ref().map(Vec::len)
         );
         match &called.outcome {
-            Err(LinkError::CallTimeout) if Instant::now() < deadline => {
+            Err(e) if not_ready_is_a_wait(e) && Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(200)).await
             }
             _ => return called,
         }
+    }
+}
+
+/// Whether `e` is the provider not being reachable yet, rather than an answer:
+/// a call that timed out, or one the station relayed `unknown_next_peer`
+/// because its route to the provider's link had not settled.
+fn not_ready_is_a_wait(e: &LinkError) -> bool {
+    match e {
+        LinkError::CallTimeout => true,
+        LinkError::Relay { code, .. } => code == "unknown_next_peer",
+        _ => false,
     }
 }
 
