@@ -362,14 +362,25 @@ mod tests {
     /// The first retry of a down tier waits exactly the base: the schedule is
     /// read at the attempt it is at, before that retry is counted, as macula's
     /// own member does (macula#201 §9 scenario 4, "not less").
+    ///
+    /// Driven through the production wait, not `redial_delay` alone: a caller
+    /// that counted its retry before planning it still leaves the helper
+    /// right, and only the wait's own length shows the off-by-one.
     #[tokio::test]
     async fn the_first_retry_waits_exactly_the_base() {
         let inner = undialed();
         let m = member(&inner, Tier::Fallback);
         assert_eq!(m.attempts(), 0, "nothing counted yet");
-        let (delay, counted) = redial_delay(&inner, &m);
-        assert!(counted, "an inactive tier's retry is counted");
-        assert_eq!(delay, inner.opts.redial.base);
+        let base = inner.opts.redial.base;
+        let started = tokio::time::Instant::now();
+        let waiting = spawn_the_wait(&inner, &m);
+        assert!(waiting.await.expect("the wait ends"), "not retired");
+        let waited = started.elapsed();
+        assert_eq!(m.attempts(), 1, "the retry was counted, once");
+        assert!(
+            waited >= base && waited < base + Duration::from_millis(120),
+            "the first retry waits exactly the base ({base:?}), but it took {waited:?}"
+        );
     }
 
     /// Every further retry is counted, so its wait grows to the next ceiling:
