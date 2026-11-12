@@ -628,13 +628,14 @@ async fn a_returning_public_link_rearms_a_public_seed_that_is_waiting() {
         .await
         .unwrap();
     // Three refused dials — 200 ms, 1.6 s, then the 12.8 s one — and the
-    // waiting seed is asleep. A fourth arrival, or a link back inside this
-    // seed's third wait, would mean the setup says nothing: it would pass with
-    // the re-arm removed, dialing at the respawn delay or on its own timer.
+    // waiting seed is asleep. Exactly three: a fourth would mean it dialed
+    // inside a step it should be asleep for, and a link back inside its third
+    // wait would pass with the re-arm removed, on the respawn delay or on its
+    // own timer.
     let dialed = lab.arrivals(&waiting);
-    assert!(
-        dialed <= 3,
-        "the waiting seed was still dialing when the other link came up: {dialed} arrivals"
+    assert_eq!(
+        dialed, 3,
+        "the waiting seed should be asleep in its third wait after three dials, not dialing: {dialed} arrivals"
     );
     let waited = started.elapsed();
     assert!(
