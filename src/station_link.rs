@@ -466,9 +466,14 @@ impl Link {
     }
 
     /// The round trip this link has measured, once it has one: the QUIC
-    /// connection's own smoothed estimate, which is the measurement a pool
-    /// ranks the links of its active tier by (macula-io/macula#201 §4). `None`
-    /// until the connection has measured one.
+    /// connection's own estimate, which is the measurement a pool ranks the
+    /// links of its active tier by (macula-io/macula#201 §4).
+    ///
+    /// A live link always answers one. quinn hands back its smoothed estimate
+    /// once it has measured a round trip, and the transport's initial estimate
+    /// (333 ms) until then, so the number exists from the handshake on and a
+    /// fresh link is not "unmeasured"; `None` is left for a reading of zero,
+    /// which a live path's estimate never gives.
     pub fn rtt(&self) -> Option<Duration> {
         let rtt = self.inner.connection.stats().path.rtt;
         (!rtt.is_zero()).then_some(rtt)

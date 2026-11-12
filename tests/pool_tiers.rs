@@ -544,38 +544,113 @@ async fn a_redial_that_never_grows_is_accepted() {
 /// A fallback seed that was waiting out a long backoff is retried at once when
 /// the public tier dies: leaving the public tier is immediate, not a timer
 /// (§9 scenario 4, the re-arm half).
+///
+/// The draw is pinned at the ceiling of each wait, and the fallback station
+/// closes every arriving connection, so the fallback seed's dials fail at once
+/// and by three seconds it is asleep in its third wait — its whole ~12.8 s.
+/// A station that merely drops the seed's datagrams instead would leave its
+/// first dial in flight, and that dial finishes the moment the station is
+/// reachable, with no re-arm sent at all: the test then passes either way
+/// (macula-rust#68 r=2).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fallback_retry_rearms_when_the_public_tier_dies() {
     let lab = Lab::start(Profile::PqPure);
     let public = lab.station("rearm public");
     let fallback = lab.station("rearm fallback");
-    let (relay, fallback_seed) = relayed_after(&fallback, Duration::ZERO);
-    relay.close();
+    lab.refuse(&fallback, Duration::from_secs(30));
     let mut opts = opts();
-    opts.fallback_seeds = vec![fallback_seed];
+    opts.fallback_seeds = vec![fallback.seed()];
     opts.redial.base = Duration::from_millis(200);
     opts.redial.factor = 8;
     opts.redial.cap = Duration::from_secs(60);
+    opts.redial.jitter = Jitter::Ceiling;
     let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
     within(Duration::from_secs(10), "the public link up", || {
         p.status().iter().any(|l| l.up && l.tier == Tier::Public)
     })
     .await;
-    // Two failed fallback dials take ~200 ms and ~1.6 s; the third waits ~12.8 s.
+    // Two refused fallback dials take ~200 ms and ~1.6 s; the third waits
+    // ~12.8 s. Nothing arriving at the station for two seconds after three
+    // means the seed is asleep in that third wait, not looping over a shorter
+    // one.
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let dialed = lab.arrivals(&fallback);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let still = lab.arrivals(&fallback);
+    assert!(
+        still == dialed,
+        "the fallback seed dialed {still} times, not {dialed}, while it should be asleep in its third wait"
+    );
 
     lab.stop(&public);
-    within(
-        Duration::from_secs(10),
-        "the pool on the fallback tier",
-        || p.active_tier() == Tier::Fallback,
-    )
-    .await;
-    relay.open();
+    lab.allow(&fallback);
     within(
         Duration::from_secs(6),
         "the fallback link, re-armed at the floor",
         || p.status().iter().any(|l| l.up && l.tier == Tier::Fallback),
+    )
+    .await;
+}
+
+/// The re-arm the other way, from the link that comes back: a public seed
+/// asleep in its third wait is cut to the floor the moment another public
+/// seed's handshake lands, and dials then, not at its step (macula-rust#68
+/// r=2). The draw is pinned at the ceiling of each wait, so the waiting seed's
+/// third step is its whole ~12.8 s.
+///
+/// The seed that comes back is behind a relay that holds each of its datagrams
+/// a tenth of a second, so its one dial is still running when the waiting
+/// seed's third wait starts: measured, a link through that relay comes up in
+/// about 2.8 s, and the waiting seed is asleep from 1.8 s. The falling tier is
+/// what makes that seed's failed dials count; its station closes every arriving
+/// connection until the other link is up, so it is asleep, not looping, when
+/// the tier moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_returning_public_link_rearms_a_public_seed_that_is_waiting() {
+    let lab = Lab::start(Profile::PqPure);
+    let returning = lab.station("rearm returning public");
+    let waiting = lab.station("rearm waiting public");
+    let fallback = lab.station("rearm fallback");
+    // Never reachable: it is here only so that no public link up means the
+    // fallback tier, which is what makes the waiting seed's dials count.
+    let (fallback_relay, fallback_seed) = relayed_after(&fallback, Duration::ZERO);
+    fallback_relay.close();
+    let (_slow_relay, returning_seed) = relayed_after(&returning, Duration::from_millis(100));
+    lab.refuse(&waiting, Duration::from_secs(30));
+    let mut opts = opts();
+    opts.fallback_seeds = vec![fallback_seed];
+    opts.redial.base = Duration::from_millis(200);
+    opts.redial.factor = 8;
+    opts.redial.cap = Duration::from_secs(60);
+    opts.redial.jitter = Jitter::Ceiling;
+    let started = Instant::now();
+    let p = Pool::connect(vec![returning_seed, waiting.seed()], opts)
+        .await
+        .unwrap();
+    // Three refused dials — 200 ms, 1.6 s, then the 12.8 s one — and the
+    // waiting seed is asleep. A fourth arrival, or a link back inside this
+    // seed's third wait, would mean the setup says nothing: it would pass with
+    // the re-arm removed, dialing at the respawn delay or on its own timer.
+    let dialed = lab.arrivals(&waiting);
+    assert!(
+        dialed <= 3,
+        "the waiting seed was still dialing when the other link came up: {dialed} arrivals"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(10),
+        "the returning link took {waited:?}, too near the waiting seed's own 12.8 s step"
+    );
+    lab.allow(&waiting);
+    within(
+        Duration::from_secs(3),
+        "the waiting public seed up at the floor",
+        || {
+            p.status()
+                .iter()
+                .filter(|l| l.tier == Tier::Public)
+                .all(|l| l.up)
+        },
     )
     .await;
 }
