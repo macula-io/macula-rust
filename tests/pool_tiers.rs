@@ -314,6 +314,41 @@ async fn connect_comes_up_on_the_fallback_when_no_public_station_is_up() {
     );
 }
 
+/// Neither tier up: the connect fails as it always has, with `NoLink`
+/// carrying each link's own error once the connect timeout passes, rather
+/// than a pool that waits for a tier that may never come (§9 scenario 7).
+#[tokio::test(flavor = "multi_thread")]
+async fn neither_tier_up_fails_the_connect_as_it_always_has() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("nowhere public");
+    let fallback = lab.station("nowhere fallback");
+    // Both stations refuse the handshake, so each link fails on its own error
+    // rather than on a dial that waits out its timeout.
+    lab.refuse(&public, Duration::from_secs(10));
+    lab.refuse(&fallback, Duration::from_secs(10));
+    let mut opts = opts();
+    opts.connect_timeout = Duration::from_secs(1);
+    opts.fallback_seeds = vec![fallback.seed()];
+    let started = Instant::now();
+    let connecting = tokio::time::timeout(
+        Duration::from_secs(10),
+        Pool::connect(vec![public.seed()], opts),
+    );
+    match connecting
+        .await
+        .expect("the failure is the connect timeout's")
+    {
+        Err(PoolError::NoLink(errors)) => {
+            assert_eq!(errors.len(), 2, "both tiers are dialed and both failed");
+        }
+        other => panic!("expected NoLink, got {:?}", other.map(|_| ())),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the failure is the connect timeout's, not a stall"
+    );
+}
+
 /// The pool reports the tier it is on, and a pool with no fallback list is
 /// public even with every link down, so "no link up" fails as it did before
 /// there were tiers (§9 scenario 7).
