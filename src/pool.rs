@@ -336,50 +336,9 @@ impl Pool {
     /// connect timeout passes first. Links not yet up keep dialing.
     pub async fn connect(seeds: Vec<Seed>, opts: Opts) -> Result<Pool, PoolError> {
         let opts = checked(&seeds, opts)?;
-        let self_id = opts
-            .identity
-            .node_id()
-            .map_err(|e| PoolError::InvalidOpts(e.to_string()))?;
-        let issuer = StatementIssuer::with_wall_clock(opts.identity.clone())
-            .map_err(|e| PoolError::InvalidOpts(e.to_string()))?;
-        let on_error = opts.on_issuer_error.clone();
-        let ticks = issuer.spawn_ticks(move |e| match &on_error {
-            Some(f) => f(e),
-            None => eprintln!("macula-rust pool: the statement issuer failed: {e}"),
-        });
-        let admission = opts.admission.expect("checked fills the admission limits");
-        let keyring = match opts.kem_advertise {
-            true => Some(Arc::new(
-                Keyring::system(opts.identity.profile())
-                    .map_err(|e| PoolError::InvalidOpts(e.to_string()))?,
-            )),
-            false => None,
+        let pool = Pool {
+            inner: PoolInner::open(&seeds, opts)?,
         };
-        let inner = Arc::new(PoolInner {
-            self_id,
-            has_fallback: !opts.fallback_seeds.is_empty(),
-            roles: roles_of(&seeds, &opts.fallback_seeds),
-            tier_moved: tokio::sync::Notify::new(),
-            issuer,
-            publication_seq: Arc::default(),
-            admission: Arc::new(Admission::new(admission)),
-            dedup: Arc::default(),
-            keyring,
-            groups: Mutex::new(None),
-            state: Mutex::new(State {
-                members: Vec::new(),
-                subs: HashMap::new(),
-                served: HashMap::new(),
-                remember: HashMap::new(),
-                closed: false,
-                waiting: resend::Waiting::new(),
-            }),
-            ticks,
-            content: content::Sharer::default(),
-            unsent: std::sync::atomic::AtomicU64::new(0),
-            opts,
-        });
-        let pool = Pool { inner };
         for seed in &seeds {
             pool.inner
                 .start_member(pool.target(seed), false, Tier::Public);
@@ -478,6 +437,55 @@ impl fmt::Debug for Pool {
 }
 
 impl PoolInner {
+    /// Everything a pool needs before its first link is dialed: its node_id,
+    /// its statement issuer, the key it seals to when it advertises KEM, and
+    /// the state every member shares. `opts` must have been through `checked`.
+    fn open(seeds: &[Seed], opts: Opts) -> Result<Arc<PoolInner>, PoolError> {
+        let self_id = opts
+            .identity
+            .node_id()
+            .map_err(|e| PoolError::InvalidOpts(e.to_string()))?;
+        let issuer = StatementIssuer::with_wall_clock(opts.identity.clone())
+            .map_err(|e| PoolError::InvalidOpts(e.to_string()))?;
+        let on_error = opts.on_issuer_error.clone();
+        let ticks = issuer.spawn_ticks(move |e| match &on_error {
+            Some(f) => f(e),
+            None => eprintln!("macula-rust pool: the statement issuer failed: {e}"),
+        });
+        let admission = opts.admission.expect("checked fills the admission limits");
+        let keyring = match opts.kem_advertise {
+            true => Some(Arc::new(
+                Keyring::system(opts.identity.profile())
+                    .map_err(|e| PoolError::InvalidOpts(e.to_string()))?,
+            )),
+            false => None,
+        };
+        Ok(Arc::new(PoolInner {
+            self_id,
+            has_fallback: !opts.fallback_seeds.is_empty(),
+            roles: roles_of(seeds, &opts.fallback_seeds),
+            tier_moved: tokio::sync::Notify::new(),
+            issuer,
+            publication_seq: Arc::default(),
+            admission: Arc::new(Admission::new(admission)),
+            dedup: Arc::default(),
+            keyring,
+            groups: Mutex::new(None),
+            state: Mutex::new(State {
+                members: Vec::new(),
+                subs: HashMap::new(),
+                served: HashMap::new(),
+                remember: HashMap::new(),
+                closed: false,
+                waiting: resend::Waiting::new(),
+            }),
+            ticks,
+            content: content::Sharer::default(),
+            unsent: std::sync::atomic::AtomicU64::new(0),
+            opts,
+        }))
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -649,6 +657,16 @@ impl Drop for PoolInner {
 /// Refuses, before anything is dialed, what macula's pool refuses, and fills
 /// in the defaults.
 fn checked(seeds: &[Seed], mut opts: Opts) -> Result<Opts, PoolError> {
+    refuse_bad_opts(&opts)?;
+    fill_defaults(&mut opts)?;
+    fill_admission(&mut opts)?;
+    refuse_bad_seeds(seeds, &opts)?;
+    Ok(opts)
+}
+
+/// Refuses an identity that is not one, a realm key of the wrong shape, and a
+/// limit outside `1` to [`MAX_LINK_LIMIT`].
+fn refuse_bad_opts(opts: &Opts) -> Result<(), PoolError> {
     if opts.identity.purpose() != Purpose::Identity {
         return Err(PoolError::InvalidOpts("an identity key is required".into()));
     }
@@ -669,6 +687,12 @@ fn checked(seeds: &[Seed], mut opts: Opts) -> Result<Opts, PoolError> {
             )));
         }
     }
+    Ok(())
+}
+
+/// Fills a zero bound with its default, the redial schedule included: a
+/// schedule that never backs off is refused here.
+fn fill_defaults(opts: &mut Opts) -> Result<(), PoolError> {
     let or_default = |v: usize, d: usize| if v == 0 { d } else { v };
     opts.max_seeds = or_default(opts.max_seeds, DEFAULT_MAX_SEEDS);
     opts.max_direct_links = or_default(opts.max_direct_links, DEFAULT_MAX_DIRECT_LINKS);
@@ -683,15 +707,27 @@ fn checked(seeds: &[Seed], mut opts: Opts) -> Result<Opts, PoolError> {
         .redial
         .checked()
         .map_err(|why| PoolError::InvalidOpts(why.to_string()))?;
-    let admission = opts.admission.unwrap_or_else(|| {
+    Ok(())
+}
+
+/// Fills admission limits the caller left out from the link counts, and
+/// refuses a set that cannot hold them.
+fn fill_admission(opts: &mut Opts) -> Result<(), PoolError> {
+    let limits = opts.admission.unwrap_or_else(|| {
         let mut limits = AdmissionLimits::default();
         limits.cap = limits.share * (opts.max_seeds + opts.max_direct_links);
         limits
     });
-    admission
+    limits
         .validate()
         .map_err(|e| PoolError::InvalidOpts(e.to_string()))?;
-    opts.admission = Some(admission);
+    opts.admission = Some(limits);
+    Ok(())
+}
+
+/// Refuses a pool with no seed, more stations than `max_seeds` allows, a seed
+/// that names no station, and a station named in both tiers.
+fn refuse_bad_seeds(seeds: &[Seed], opts: &Opts) -> Result<(), PoolError> {
     if seeds.is_empty() {
         return Err(PoolError::NoSeeds);
     }
@@ -710,12 +746,12 @@ fn checked(seeds: &[Seed], mut opts: Opts) -> Result<Opts, PoolError> {
             )));
         }
     }
-    if let Some(seed) = named_twice(seeds, &opts.fallback_seeds) {
-        return Err(PoolError::StationInBothTiers {
+    match named_twice(seeds, &opts.fallback_seeds) {
+        Some(seed) => Err(PoolError::StationInBothTiers {
             station: seed.node_id,
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(opts)
 }
 
 /// A station named in both lists: the same node_id at any address, or the same

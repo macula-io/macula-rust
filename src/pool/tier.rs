@@ -119,16 +119,15 @@ impl Redial {
 
     /// The undrawn ceiling of the wait after `attempt` failures, never past the
     /// cap and never zero.
+    ///
+    /// Each step is clamped to the cap. [`Redial::checked`] keeps the factor at
+    /// two or more, so a step that does not grow has passed the cap and every
+    /// step after it would only pass it further: clamping is the same as
+    /// stopping there.
     fn grown(&self, attempt: u32) -> Duration {
-        let mut grown = self.base;
-        for _ in 0..attempt {
-            let next = grown.saturating_mul(self.factor);
-            if next <= grown || next >= self.cap {
-                return self.cap;
-            }
-            grown = next;
-        }
-        grown
+        (0..attempt).fold(self.base, |grown, _| {
+            grown.saturating_mul(self.factor).min(self.cap)
+        })
     }
 }
 
@@ -178,19 +177,25 @@ mod tests {
             steady_up: Duration::from_millis(50),
         };
         for attempt in 0..12 {
-            let ceiling = redial.cap.min(redial.grown(attempt));
-            for _ in 0..50 {
-                let wait = redial.wait(attempt);
-                assert!(
-                    wait >= redial.base,
-                    "attempt {attempt}: {wait:?} is below the floor {:?}",
-                    redial.base
-                );
-                assert!(
-                    wait <= ceiling,
-                    "attempt {attempt}: {wait:?} is past the ceiling {ceiling:?}"
-                );
-            }
+            assert_bounded_draws(&redial, attempt);
+        }
+    }
+
+    /// Fifty draws at one attempt are each inside the bounds that attempt
+    /// admits.
+    fn assert_bounded_draws(redial: &Redial, attempt: u32) {
+        let ceiling = redial.cap.min(redial.grown(attempt));
+        for _ in 0..50 {
+            let wait = redial.wait(attempt);
+            assert!(
+                wait >= redial.base,
+                "attempt {attempt}: {wait:?} is below the floor {:?}",
+                redial.base
+            );
+            assert!(
+                wait <= ceiling,
+                "attempt {attempt}: {wait:?} is past the ceiling {ceiling:?}"
+            );
         }
     }
 

@@ -230,25 +230,31 @@ mod tests {
         let until = tokio::time::Instant::now() + limit;
         let mut n = 0;
         while let Ok(Some(delivery)) = tokio::time::timeout_at(until, sub.recv()).await {
-            let Delivery::Event(event) = delivery else {
-                continue;
-            };
-            if event.payload == Payload::Clear(Value::text(text)) {
-                n += 1;
-            }
+            n += usize::from(hears(&delivery, text));
         }
         n
     }
 
+    /// Whether a delivery is the `text` publication, rather than an
+    /// interruption or a gap.
+    fn hears(delivery: &Delivery, text: &str) -> bool {
+        match delivery {
+            Delivery::Event(event) => event.payload == Payload::Clear(Value::text(text)),
+            Delivery::Interrupted(_) | Delivery::Gap(_) => false,
+        }
+    }
+
     async fn all_up(p: &Pool) {
         let deadline = Instant::now() + Duration::from_secs(15);
-        while Instant::now() < deadline {
-            if p.status().iter().all(|l| l.up) {
-                return;
-            }
+        while !every_link_up(p) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("not both links up: {:?}", p.status());
+        assert!(every_link_up(p), "not both links up: {:?}", p.status());
+    }
+
+    /// Whether every link the pool holds is up.
+    fn every_link_up(p: &Pool) -> bool {
+        p.status().iter().all(|l| l.up)
     }
 
     fn signed(pool: &Pool, text: &str) -> SignedPublication {

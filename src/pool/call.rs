@@ -618,16 +618,30 @@ impl PoolInner {
         let mut asked: HashSet<[u8; 32]> = HashSet::new();
         let mut errors = Vec::new();
         for _ in 0..self.member_count() {
-            let Some(link) = self.next_unasked_link(&asked) else {
-                break;
-            };
-            asked.insert(link.station_node_id());
-            match ask(link).await {
-                Err(e) if unreachable(&e) => errors.push(e),
-                answered => return answered.map_err(PoolError::Link),
+            match self.ask_one(&mut asked, &ask).await {
+                Asked::Answer(answered) => return answered.map_err(PoolError::Link),
+                Asked::Unreachable(e) => errors.push(e),
+                Asked::NoLinkLeft => break,
             }
         }
         Err(PoolError::NoLink(errors))
+    }
+
+    /// One attempt of the walk: asks the link [`PoolInner::next_unasked_link`]
+    /// picks, and says what came of it.
+    async fn ask_one<'a, T, F, Fut>(&self, asked: &mut HashSet<[u8; 32]>, ask: &F) -> Asked<T>
+    where
+        F: Fn(Link) -> Fut,
+        Fut: Future<Output = Result<T, LinkError>> + 'a,
+    {
+        let Some(link) = self.next_unasked_link(asked) else {
+            return Asked::NoLinkLeft;
+        };
+        asked.insert(link.station_node_id());
+        match ask(link).await {
+            Err(e) if unreachable(&e) => Asked::Unreachable(e),
+            answered => Asked::Answer(answered),
+        }
     }
 
     /// The link the walk asks next: the first the active tier has not asked
@@ -648,6 +662,16 @@ impl PoolInner {
     fn member_count(&self) -> usize {
         self.lock().members.len()
     }
+}
+
+/// What one attempt of a walk found.
+enum Asked<T> {
+    /// A station's answer, final whatever it said.
+    Answer(Result<T, LinkError>),
+    /// A link that could not carry the request; the walk moves on.
+    Unreachable(LinkError),
+    /// No link was left to ask.
+    NoLinkLeft,
 }
 
 /// A call that went out: the link it went on, the call, the realm key its
