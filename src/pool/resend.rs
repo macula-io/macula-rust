@@ -313,4 +313,52 @@ mod tests {
             "the fallback station carries nothing while the public tier is up"
         );
     }
+
+    /// A publication an ended link had not delivered is sent again where an
+    /// originating publish would go: the active tier only. With the public
+    /// tier up, the fallback station carries none of it (macula-io/macula#201
+    /// §9 scenario 1, the re-sent publication).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_resend_of_a_lost_publication_goes_where_an_originating_publish_would() {
+        let lab = Lab::start();
+        let public = lab.station("resend public");
+        let fallback = lab.station("resend fallback");
+        let (_public_pool, mut public_sub) = subscribed(public.seed()).await;
+        let (_fallback_pool, mut fallback_sub) = subscribed(fallback.seed()).await;
+
+        let mut tiered = opts();
+        tiered.fallback_seeds = vec![fallback.seed()];
+        let pool = Pool::connect(vec![public.seed()], tiered)
+            .await
+            .expect("connected to both tiers");
+        all_up(&pool).await;
+        assert_eq!(pool.active_tier(), Tier::Public);
+
+        // What an ended link hands back: publications the station was never
+        // known to have read.
+        pool.inner
+            .send_again(vec![signed(&pool, "an ended link lost this")])
+            .await;
+
+        assert_eq!(
+            heard(
+                &mut public_sub,
+                "an ended link lost this",
+                Duration::from_secs(5)
+            )
+            .await,
+            1,
+            "the active tier's station carries it"
+        );
+        assert_eq!(
+            heard(
+                &mut fallback_sub,
+                "an ended link lost this",
+                Duration::from_millis(500)
+            )
+            .await,
+            0,
+            "the fallback station carries nothing while the public tier is up"
+        );
+    }
 }

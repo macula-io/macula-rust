@@ -70,6 +70,9 @@ pub struct Redial {
     /// that connects and dies sooner keeps its accumulated backoff, so a
     /// connect-then-die loop escalates instead of retrying at the floor.
     pub steady_up: Duration,
+    /// Where a wait's jitter lands. [`Jitter::Random`] outside a test.
+    #[doc(hidden)]
+    pub jitter: Jitter,
 }
 
 impl Default for Redial {
@@ -79,14 +82,23 @@ impl Default for Redial {
             factor: DEFAULT_REDIAL_FACTOR,
             cap: DEFAULT_REDIAL_CAP,
             steady_up: DEFAULT_REDIAL_STEADY_UP,
+            jitter: Jitter::Random,
         }
     }
 }
 
 impl Redial {
-    /// Refuses a schedule no wait can be made from, and fills in a zero bound
-    /// with its default as the pool's other options do.
-    pub(super) fn checked(mut self) -> Result<Redial, String> {
+    /// Fills a zero bound in with its default, as the pool's other options do.
+    ///
+    /// macula's own refusal set (macula-go `pool/redial.go`, the Go step of
+    /// macula#201) takes out a non-positive base, cap or steady-up and a
+    /// factor below 1, after filling the zeros the same way. In this crate a
+    /// `Duration` cannot be negative and a zero is filled here, so of that set
+    /// only the factor is left for the fill to answer: a factor of zero
+    /// becomes the default, and one is the smallest a caller may choose —
+    /// a schedule that never grows, which `wait` answers with the floor at
+    /// every attempt. Nothing else can be refused, so nothing is.
+    pub(super) fn filled(mut self) -> Redial {
         let defaults = Redial::default();
         self.base = fill(self.base, defaults.base);
         self.factor = if self.factor == 0 {
@@ -96,13 +108,7 @@ impl Redial {
         };
         self.cap = fill(self.cap, defaults.cap);
         self.steady_up = fill(self.steady_up, defaults.steady_up);
-        if self.factor < 2 {
-            return Err(format!(
-                "a redial factor of {}, which never backs off",
-                self.factor
-            ));
-        }
-        Ok(self)
+        self
     }
 
     /// How long to wait before the retry after `attempt` failed ones, `0` being
@@ -114,16 +120,16 @@ impl Redial {
         if ceiling <= self.base {
             return self.base;
         }
-        self.base + draw(ceiling - self.base)
+        self.base + draw(ceiling - self.base, self.jitter)
     }
 
     /// The undrawn ceiling of the wait after `attempt` failures, never past the
     /// cap and never zero.
     ///
-    /// Each step is clamped to the cap. [`Redial::checked`] keeps the factor at
-    /// two or more, so a step that does not grow has passed the cap and every
-    /// step after it would only pass it further: clamping is the same as
-    /// stopping there.
+    /// Each step is clamped to the cap: for a factor of two or more a step
+    /// that does not grow has passed the cap and every step after it would
+    /// only pass it further, and for a factor of one every step is the base.
+    /// Clamping is the same as stopping in both.
     fn grown(&self, attempt: u32) -> Duration {
         (0..attempt).fold(self.base, |grown, _| {
             grown.saturating_mul(self.factor).min(self.cap)
@@ -140,9 +146,36 @@ fn fill(value: Duration, default: Duration) -> Duration {
     }
 }
 
+/// Where a wait's jitter lands in the range above the floor.
+///
+/// [`Jitter::Random`] is the only one a caller should use. The others exist so
+/// that a test can place the draw at either end of that range instead of
+/// waiting for one, which is what macula-go's `randBelow` is a variable for
+/// (`pool/redial.go`, macula#201's Go step).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Jitter {
+    /// A draw from the system's randomness: what every pool uses.
+    #[default]
+    Random,
+    /// The bottom of the range, so the wait is exactly the floor.
+    Floor,
+    /// The top of the range, a nanosecond under the ceiling.
+    Ceiling,
+}
+
+/// The draw a wait spreads over its range above the floor.
+fn draw(bound: Duration, jitter: Jitter) -> Duration {
+    match jitter {
+        Jitter::Floor => Duration::ZERO,
+        Jitter::Ceiling => bound.saturating_sub(Duration::from_nanos(1)),
+        Jitter::Random => random_draw(bound),
+    }
+}
+
 /// A random duration in `0..bound`, and zero when the system's randomness
 /// cannot be read (a draw of zero only ever waits the floor).
-fn draw(bound: Duration) -> Duration {
+fn random_draw(bound: Duration) -> Duration {
     let Ok(nanos) = u64::try_from(bound.as_nanos()) else {
         return Duration::ZERO;
     };
@@ -175,6 +208,7 @@ mod tests {
             factor: 2,
             cap: Duration::from_millis(200),
             steady_up: Duration::from_millis(50),
+            ..Redial::default()
         };
         for attempt in 0..12 {
             assert_bounded_draws(&redial, attempt);
@@ -206,6 +240,7 @@ mod tests {
             factor: 3,
             cap: Duration::from_millis(1000),
             steady_up: Duration::from_millis(50),
+            ..Redial::default()
         };
         assert_eq!(redial.grown(0), Duration::from_millis(100));
         assert_eq!(redial.grown(1), Duration::from_millis(300));
@@ -221,19 +256,27 @@ mod tests {
             factor: 2,
             cap: Duration::from_millis(100),
             steady_up: Duration::from_millis(50),
+            ..Redial::default()
         };
         assert_eq!(redial.wait(0), redial.base);
         assert_eq!(redial.wait(3), redial.base);
     }
 
+    /// A factor of one is the smallest macula's own refusal set allows
+    /// (macula-go `pool/redial.go` refuses below one, not at one): a schedule
+    /// that never grows, and every wait is exactly the floor.
     #[test]
-    fn a_schedule_no_wait_can_be_made_from_is_refused() {
+    fn a_factor_of_one_never_grows_and_waits_the_floor() {
         let flat = Redial {
             factor: 1,
             ..Redial::default()
-        };
-        let refused = flat.checked().expect_err("a factor of 1 never grows");
-        assert!(refused.contains("factor"), "{refused}");
+        }
+        .filled();
+        assert_eq!(flat.factor, 1, "the fill leaves a one alone");
+        assert_eq!(flat.grown(0), flat.base);
+        assert_eq!(flat.grown(9), flat.base);
+        assert_eq!(flat.wait(0), flat.base);
+        assert_eq!(flat.wait(9), flat.base);
     }
 
     #[test]
@@ -243,9 +286,39 @@ mod tests {
             factor: 0,
             cap: Duration::ZERO,
             steady_up: Duration::ZERO,
+            ..Redial::default()
         }
-        .checked()
-        .expect("every zero bound takes its default");
+        .filled();
         assert_eq!(filled, Redial::default());
+    }
+
+    /// The two pinned draws a test uses instead of waiting for a random one:
+    /// the floor exactly, and a nanosecond under the ceiling.
+    #[test]
+    fn the_draw_can_be_pinned_to_either_end_of_its_range() {
+        let base = Duration::from_millis(100);
+        let cap = Duration::from_millis(800);
+        let floor = Redial {
+            base,
+            factor: 2,
+            cap,
+            jitter: Jitter::Floor,
+            ..Redial::default()
+        };
+        let ceiling = Redial {
+            jitter: Jitter::Ceiling,
+            ..floor
+        };
+        assert_eq!(floor.wait(2), base, "the floor draw waits the floor");
+        assert_eq!(
+            ceiling.wait(2),
+            Duration::from_millis(400) - Duration::from_nanos(1),
+            "the ceiling draw waits a nanosecond under min(cap, base x factor^2)"
+        );
+        assert_eq!(
+            ceiling.wait(9),
+            cap - Duration::from_nanos(1),
+            "and a nanosecond under the cap once the growth passes it"
+        );
     }
 }

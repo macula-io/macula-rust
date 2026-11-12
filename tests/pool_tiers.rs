@@ -16,10 +16,12 @@ use common::lab::{Lab, LabStation};
 use macula_rust::cbor::Value;
 use macula_rust::frame::Payload;
 use macula_rust::node_key::{NodeKey, PUZZLE_DIFFICULTY};
-use macula_rust::pool::{Delivery, Opts, Pool, PoolError, Seed, Subscription, Tier};
+use macula_rust::pool::{
+    Call, Delivery, Jitter, LinkSelection, Offer, Opts, Pool, PoolError, Seed, Subscription, Tier,
+};
 use macula_rust::profile::Profile;
 use macula_rust::record;
-use macula_rust::station_link::Publication;
+use macula_rust::station_link::{handler, Publication};
 
 const TOPIC: &str = "mcl-craft/wire/edit_made_v1";
 const REALM: [u8; 32] = [7; 32];
@@ -96,6 +98,38 @@ fn edit(text: &str) -> Publication {
 /// `up all` once every link the pool holds is up.
 fn all_up(p: &Pool) -> bool {
     p.status().iter().all(|l| l.up)
+}
+
+/// How many events `sub` hears before `limit` passes, whatever they say.
+async fn heard_any(sub: &mut Subscription, limit: Duration) -> usize {
+    let until = tokio::time::Instant::now() + limit;
+    let mut n = 0;
+    while let Ok(Some(_)) = tokio::time::timeout_at(until, sub.recv()).await {
+        n += 1;
+    }
+    n
+}
+
+/// When each connection reached `s`, sampled every few milliseconds for `d`:
+/// a test's read of the redial schedule as the station saw it.
+async fn arrivals_over(lab: &Lab, s: &LabStation, d: Duration) -> Vec<Instant> {
+    let mut seen = 0;
+    let mut at = Vec::new();
+    let deadline = Instant::now() + d;
+    while Instant::now() < deadline {
+        let arrived = lab.arrivals(s) as usize;
+        while seen < arrived {
+            seen += 1;
+            at.push(Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    at
+}
+
+/// The gaps between one arrival and the next.
+fn gaps(at: &[Instant]) -> Vec<Duration> {
+    at.windows(2).map(|w| w[1].duration_since(w[0])).collect()
 }
 
 /// A relay in front of `s`, and `s` as a seed reached through it, with every
@@ -399,17 +433,24 @@ async fn the_fastest_measured_link_takes_the_first_replica() {
     );
 }
 
-/// A redial schedule that cannot back off is a malformed option.
+/// A factor of one is a schedule that never grows, not a malformed option:
+/// macula's own refusal set takes out a factor below one, not one itself
+/// (macula-go `pool/redial.go`). The connect succeeds and the schedule stays
+/// at the floor (§9 scenario 4, the shape of the schedule).
 #[tokio::test(flavor = "multi_thread")]
-async fn an_impossible_redial_override_is_refused() {
+async fn a_redial_that_never_grows_is_accepted() {
     let lab = Lab::start(Profile::PqPure);
-    let s = lab.station("redial refused");
+    let s = lab.station("redial flat");
     let mut opts = opts();
     opts.redial.factor = 1;
-    let refused = Pool::connect(vec![s.seed()], opts)
+    opts.redial.base = Duration::from_millis(100);
+    let p = Pool::connect(vec![s.seed()], opts)
         .await
-        .expect_err("a factor of 1 never backs off");
-    assert!(matches!(refused, PoolError::InvalidOpts(_)), "{refused:?}");
+        .expect("a factor of one connects");
+    assert!(
+        p.status().iter().any(|l| l.up),
+        "the link is up, so nothing about the schedule was refused"
+    );
 }
 
 /// A fallback seed that was waiting out a long backoff is retried at once when
@@ -460,8 +501,9 @@ struct StationRecord {
 }
 
 impl StationRecord {
-    /// Puts one node's advertisement of `procedure` at `s` alone.
-    fn put_only_at(lab: &Lab, s: &LabStation, procedure: &str) -> StationRecord {
+    /// A signed advertisement of `procedure`, and its wire bytes: the record a
+    /// test puts itself, at whichever station the assertion is about.
+    fn signed(procedure: &str) -> (StationRecord, Vec<u8>) {
         let owner = key();
         let advertised = record::new_procedure_advertisement(
             &owner.node_id().unwrap(),
@@ -472,10 +514,519 @@ impl StationRecord {
         )
         .expect("an advertisement to put");
         let signed = record::sign(&advertised, &owner).expect("signed by its advertiser");
-        lab.put(s, &record::encode(&signed).expect("its wire"));
-        StationRecord {
-            key: record::procedure_key(&REALM, procedure),
-            procedure: procedure.to_string(),
-        }
+        let wire = record::encode(&signed).expect("its wire");
+        (
+            StationRecord {
+                key: record::procedure_key(&REALM, procedure),
+                procedure: procedure.to_string(),
+            },
+            wire,
+        )
     }
+
+    /// Puts one node's advertisement of `procedure` at `s` alone.
+    fn put_only_at(lab: &Lab, s: &LabStation, procedure: &str) -> StationRecord {
+        let (found, wire) = StationRecord::signed(procedure);
+        lab.put(s, &wire);
+        found
+    }
+}
+
+/// A station procedure — a DHT put, then a DHT find — reaches the active
+/// tier's links only: the fallback station is never asked (§9 scenario 1, the
+/// station-procedure half).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_station_procedure_reaches_only_the_active_tier() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("procedure public");
+    let fallback = lab.station("procedure fallback");
+    let p = connect_tiered(&[public.seed()], &[fallback.seed()]).await;
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+    let them = p.node_id();
+
+    let (found, wire) = StationRecord::signed("tier/procedure/lookup");
+    p.put_record(&wire)
+        .await
+        .expect("the put lands on the active tier");
+    assert_eq!(
+        lab.asked(&public, &them, "_dht.put_record"),
+        1,
+        "the active tier's station kept it"
+    );
+    assert_eq!(
+        lab.asked(&fallback, &them, "_dht.put_record"),
+        0,
+        "the fallback station was never asked to keep anything"
+    );
+
+    let record = p
+        .find_record(&found.key)
+        .await
+        .expect("the active tier answers the find");
+    assert_eq!(
+        record::read_procedure_advertisement(record.record())
+            .expect("an advertisement")
+            .procedure,
+        found.procedure
+    );
+    assert_eq!(
+        lab.asked(&fallback, &them, "_dht.find_record"),
+        0,
+        "the fallback station was never asked to look anything up"
+    );
+}
+
+/// A content announcement reaches the active tier only: the announcement
+/// record is under the content id's key at the public station alone. The
+/// content *procedure's* advertisement is standing state and is on both links;
+/// the announcement of the content id is not (§9 scenario 1, the content
+/// half).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_content_announcement_reaches_only_the_active_tier() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("content public");
+    let fallback = lab.station("content fallback");
+    let p = connect_tiered(&[public.seed()], &[fallback.seed()]).await;
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+
+    let mcid = p
+        .share_content(&REALM, b"the smallest content there is", "tiny")
+        .await
+        .expect("shared");
+    let key = record::content_key(&mcid).expect("a content key");
+
+    // The active tier's station holds the announcement...
+    let on_public = p
+        .link_to(&public.node_id)
+        .await
+        .expect("a direct link to the public station");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut announced = false;
+    while !announced && Instant::now() < deadline {
+        announced = on_public.find_record(&key).await.is_ok();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        announced,
+        "the active tier's station holds the content announcement"
+    );
+
+    // ...and the fallback station holds nothing under that key.
+    let on_fallback = p
+        .link_to(&fallback.node_id)
+        .await
+        .expect("a direct link to the fallback station");
+    assert!(
+        on_fallback.find_record(&key).await.is_err(),
+        "the fallback station carries no announcement"
+    );
+}
+
+/// Replication is a maximum within the active tier, never a reason to reach
+/// into the other one: `replication_factor` 2 with one live public link sends
+/// one copy, and the fallback station carries none (§9 scenario 1, the case
+/// that catches a copy count padded from the fallback).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_copy_is_not_taken_from_the_fallback() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("copy public");
+    let fallback = lab.station("copy fallback");
+    let (_public_listener, mut public_sub) = listener(&lab, &public, public.seed()).await;
+    let (_fallback_listener, mut fallback_sub) = listener(&lab, &fallback, fallback.seed()).await;
+    let mut opts = opts();
+    opts.replication_factor = 2;
+    opts.fallback_seeds = vec![fallback.seed()];
+    let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+
+    p.publish(edit("one public link, two copies"))
+        .await
+        .unwrap();
+    assert_eq!(
+        heard(
+            &mut public_sub,
+            "one public link, two copies",
+            Duration::from_secs(5)
+        )
+        .await,
+        1,
+        "the one live public link carries the copy"
+    );
+    assert_eq!(
+        heard(
+            &mut fallback_sub,
+            "one public link, two copies",
+            Duration::from_millis(500)
+        )
+        .await,
+        0,
+        "the second replica is not taken from the fallback"
+    );
+}
+
+/// The walk of a station procedure re-reads the tier at each attempt and
+/// reaches the other tier when the active one has nothing unasked left: a
+/// public station that answers nothing on the link it holds sends the find to
+/// the fallback, which answers (§9 scenario 3, the mid-walk half). Go's "the
+/// active tier is empty" condition stops the walk here instead — the dead
+/// link is still the one the tier lists.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_walk_reaches_the_fallback_when_the_public_station_stops_answering() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("walk public");
+    let fallback = lab.station("walk fallback");
+    let found = StationRecord::put_only_at(&lab, &fallback, "tier/walk/lookup");
+    let p = connect_tiered(&[public.seed()], &[fallback.seed()]).await;
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+    let them = p.node_id();
+
+    // The station holds the link open and answers nothing on it for longer
+    // than a call waits: the ask fails there while the active tier still
+    // lists that link as the one to use.
+    lab.silence(&public, &them, Duration::from_secs(12));
+
+    let record = p
+        .find_record(&found.key)
+        .await
+        .expect("the walk reaches the fallback station");
+    assert_eq!(
+        record::read_procedure_advertisement(record.record())
+            .expect("an advertisement")
+            .procedure,
+        found.procedure
+    );
+    assert_eq!(
+        lab.asked(&fallback, &them, "_dht.find_record"),
+        1,
+        "the fallback station answered the walk"
+    );
+    assert_eq!(
+        lab.asked(&public, &them, "_dht.find_record"),
+        0,
+        "the station that answered nothing answered nothing"
+    );
+}
+
+/// A body signed on a public link names no fallback station: the
+/// advertisement the public station holds names the station it was signed on
+/// and no other (§9 scenario 8, the first half). The registration is standing
+/// state, so the fallback station holds an advertisement of its own — and each
+/// names one station only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_body_names_no_fallback_station() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("body public");
+    let fallback = lab.station("body fallback");
+    let p = connect_tiered(&[public.seed()], &[fallback.seed()]).await;
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+
+    let procedure = record::own_procedure(&p.node_id(), "tier_body");
+    let _served = p
+        .serve(Offer::unary(
+            REALM,
+            &procedure,
+            handler(|_| async move { Ok(Value::text("served")) }),
+        ))
+        .await
+        .expect("served on both tiers");
+
+    let key = record::procedure_key(&REALM, &procedure);
+    let link = p
+        .link_to(&public.node_id)
+        .await
+        .expect("a direct link to the public station");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut advert = None;
+    while advert.is_none() && Instant::now() < deadline {
+        advert = link.find_record(&key).await.ok();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let verified = advert.expect("the public station holds the advertisement");
+    let read = record::read_procedure_advertisement(verified.record()).expect("an advertisement");
+    assert_eq!(
+        read.serving_stations,
+        vec![public.node_id],
+        "the body names the station it was signed on, and no fallback station"
+    );
+}
+
+/// Scenario 8's other half: with the public tier down, a LAN caller resolves
+/// the provider through the fallback station's advertisement and its call
+/// completes, dialled through that station (§9 scenario 8).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lan_caller_reaches_a_provider_through_the_fallback_station() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("lan public");
+    let fallback = lab.station("lan fallback");
+    let provider = connect_tiered(&[public.seed()], &[fallback.seed()]).await;
+    within(Duration::from_secs(15), "both links up", || {
+        all_up(&provider)
+    })
+    .await;
+
+    let procedure = record::own_procedure(&provider.node_id(), "tier_lan_answer");
+    let _served = provider
+        .serve(Offer::unary(
+            REALM,
+            &procedure,
+            handler(|_| async move { Ok(Value::text("the LAN answer")) }),
+        ))
+        .await
+        .expect("served on both tiers");
+    within(
+        Duration::from_secs(10),
+        "the advertisement at the fallback station",
+        || lab.advertised(&fallback, &REALM, &procedure),
+    )
+    .await;
+
+    // The provider's public station goes away: it is on its LAN fallback now,
+    // and that station's advertisement is all a LAN caller has to find it by.
+    lab.stop(&public);
+    within(
+        Duration::from_secs(10),
+        "the provider on the fallback tier",
+        || provider.active_tier() == Tier::Fallback,
+    )
+    .await;
+
+    let caller = connect_tiered(&[fallback.seed()], &[]).await;
+    let answer = caller
+        .call(Call {
+            realm: REALM,
+            procedure: procedure.clone(),
+            ..Call::default()
+        })
+        .await
+        .expect("the call completes through the fallback station");
+    assert_eq!(answer, Value::text("the LAN answer"));
+    assert!(
+        lab.asked(&fallback, &caller.node_id(), "_dht.find_records") >= 1,
+        "the caller resolved the provider through the fallback station's advertisement"
+    );
+}
+
+/// `random` is still there for a caller who asks for it: with the selection
+/// set, the RTT order is discarded and both public links take a share (§9
+/// scenario 6, the second half).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_random_selection_the_caller_asks_for_still_shuffles() {
+    let lab = Lab::start(Profile::PqPure);
+    let first = lab.station("random first");
+    let second = lab.station("random second");
+    let (_first_listener, mut first_sub) = listener(&lab, &first, first.seed()).await;
+    let (_second_listener, mut second_sub) = listener(&lab, &second, second.seed()).await;
+    let mut opts = opts();
+    opts.replication_factor = 1;
+    opts.link_selection = LinkSelection::Random;
+    let p = Pool::connect(vec![first.seed(), second.seed()], opts)
+        .await
+        .unwrap();
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+
+    // One copy each, twenty-four times: an order that never shuffles puts
+    // every one of them on the same station (a chance of 2^-23).
+    for i in 0..24 {
+        p.publish(edit(&format!("shuffled {i}"))).await.unwrap();
+    }
+    let on_first = heard_any(&mut first_sub, Duration::from_secs(2)).await;
+    let on_second = heard_any(&mut second_sub, Duration::from_secs(2)).await;
+    assert!(
+        on_first >= 1 && on_second >= 1,
+        "random reaches both links: {on_first} and {on_second}"
+    );
+}
+
+/// The schedule as the station sees it: a failed retry waits further along
+/// the backoff each time, from a first retry that is the base, up to the cap.
+/// The draw is pinned at the ceiling, so what is measured is the schedule
+/// rather than luck (§9 scenario 4).
+///
+/// The first arrival is the dial `connect` made, sampled a little after it
+/// happened, so the first gap can read slightly short of the base but never
+/// long; the gaps after it are between two sampled arrivals and are exact to
+/// the sampler's few milliseconds.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_redial_waits_the_base_and_each_after_it_waits_longer() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("schedule public");
+    let fallback = lab.station("schedule fallback");
+    let base = Duration::from_millis(400);
+    let mut opts = opts();
+    opts.fallback_seeds = vec![fallback.seed()];
+    opts.redial.base = base;
+    opts.redial.factor = 2;
+    opts.redial.jitter = Jitter::Ceiling;
+    // Every dial of the public member arrives at, and is refused by, a station
+    // that is up but takes no connection: the arrivals are the schedule.
+    lab.refuse(&public, Duration::from_secs(10));
+    let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
+    assert_eq!(p.active_tier(), Tier::Fallback, "no public link is up");
+
+    let at = arrivals_over(&lab, &public, Duration::from_millis(4600)).await;
+    let gaps = gaps(&at);
+    assert!(gaps.len() >= 3, "three redials, got {gaps:?}");
+    let slack = Duration::from_millis(150);
+    assert!(
+        gaps[0] <= base + slack,
+        "the first redial waits at most the base, not {:?}",
+        gaps[0]
+    );
+    assert!(
+        gaps[1] >= base * 2 - slack && gaps[1] <= base * 2 + slack,
+        "the second redial waits the next ceiling, got {:?}",
+        gaps[1]
+    );
+    assert!(
+        gaps[2] >= base * 4 - slack && gaps[2] <= base * 4 + slack,
+        "the third waits the ceiling after that, got {:?}",
+        gaps[2]
+    );
+}
+
+/// A link that completes a handshake and dies before the steady-up window
+/// does not reset its backoff: the retry after it waits longer than the one
+/// before (§9 scenario 4, connect-then-die).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_that_dies_before_the_steady_up_waits_longer_each_time() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("dies public");
+    let fallback = lab.station("dies fallback");
+    let base = Duration::from_millis(400);
+    let mut opts = opts();
+    opts.fallback_seeds = vec![fallback.seed()];
+    opts.redial.base = base;
+    opts.redial.factor = 2;
+    opts.redial.steady_up = Duration::from_secs(30);
+    opts.redial.jitter = Jitter::Ceiling;
+    let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
+    within(Duration::from_secs(15), "the public link up", || {
+        p.status().iter().any(|l| l.up && l.tier == Tier::Public)
+    })
+    .await;
+    let me = p.node_id();
+
+    let mut waits = Vec::new();
+    for _ in 0..2 {
+        let before = lab.arrivals(&public);
+        let died = Instant::now();
+        lab.drop_node(&public, &me);
+        within(Duration::from_secs(10), "the redial", || {
+            lab.arrivals(&public) > before
+        })
+        .await;
+        waits.push(died.elapsed());
+        within(Duration::from_secs(10), "the public link up again", || {
+            p.status().iter().any(|l| l.up && l.tier == Tier::Public)
+        })
+        .await;
+    }
+    let slack = Duration::from_millis(150);
+    assert!(
+        waits[0] >= base && waits[0] <= base + slack,
+        "the retry after the first death waits the base, got {:?}",
+        waits[0]
+    );
+    assert!(
+        waits[1] > base + slack && waits[1] <= base * 2 + slack,
+        "the retry after a death before the steady-up window waits further along, got {:?}",
+        waits[1]
+    );
+}
+
+/// A link that stays up the steady-up window proves itself: its count resets,
+/// so a later failure starts again from the base (§9 scenario 4, steady-up).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_that_proves_itself_starts_again_from_the_base() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("steady public");
+    let fallback = lab.station("steady fallback");
+    let base = Duration::from_millis(400);
+    let steady_up = Duration::from_millis(200);
+    let mut opts = opts();
+    opts.fallback_seeds = vec![fallback.seed()];
+    opts.redial.base = base;
+    opts.redial.factor = 2;
+    opts.redial.steady_up = steady_up;
+    opts.redial.jitter = Jitter::Ceiling;
+    let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
+    within(Duration::from_secs(15), "the public link up", || {
+        p.status().iter().any(|l| l.up && l.tier == Tier::Public)
+    })
+    .await;
+    let me = p.node_id();
+
+    // A death at once leaves the count where it was: the retry waits the base.
+    let before = lab.arrivals(&public);
+    lab.drop_node(&public, &me);
+    within(Duration::from_secs(10), "the redial", || {
+        lab.arrivals(&public) > before
+    })
+    .await;
+    within(Duration::from_secs(10), "the public link up again", || {
+        p.status().iter().any(|l| l.up && l.tier == Tier::Public)
+    })
+    .await;
+
+    // That one stays up past the window, so its count resets: the death after
+    // it waits the base again, not two steps along the schedule.
+    tokio::time::sleep(steady_up + Duration::from_millis(200)).await;
+    let before = lab.arrivals(&public);
+    let died = Instant::now();
+    lab.drop_node(&public, &me);
+    within(Duration::from_secs(10), "the redial after it proved itself", || {
+        lab.arrivals(&public) > before
+    })
+    .await;
+    let waited = died.elapsed();
+    assert!(
+        waited >= base && waited <= base + Duration::from_millis(150),
+        "a link that proved itself starts again from the base, but the retry waited {waited:?}"
+    );
+}
+
+/// The tier returns on the handshake and not before: while the public station
+/// refuses connections the pool is on its fallback, and the moment a public
+/// link completes its handshake the next operation takes it (§9 scenario 4,
+/// the handshake half).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tier_returns_on_the_handshake_and_not_before() {
+    let lab = Lab::start(Profile::PqPure);
+    let public = lab.station("handshake public");
+    let fallback = lab.station("handshake fallback");
+    let (_fallback_listener, mut fallback_sub) = listener(&lab, &fallback, fallback.seed()).await;
+    let mut opts = opts();
+    opts.fallback_seeds = vec![fallback.seed()];
+    opts.redial.base = Duration::from_millis(200);
+    lab.refuse(&public, Duration::from_secs(2));
+    let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
+    assert_eq!(
+        p.active_tier(),
+        Tier::Fallback,
+        "no public link completed a handshake yet"
+    );
+
+    within(
+        Duration::from_secs(15),
+        "the public tier back on the handshake",
+        || p.active_tier() == Tier::Public,
+    )
+    .await;
+    assert!(
+        p.status().iter().any(|l| l.up && l.tier == Tier::Public),
+        "the tier moved on the link that completed it"
+    );
+    p.publish(edit("back on the public tier"))
+        .await
+        .expect("the next operation takes the public link");
+    assert_eq!(
+        heard(
+            &mut fallback_sub,
+            "back on the public tier",
+            Duration::from_millis(500)
+        )
+        .await,
+        0,
+        "the fallback carries nothing once the public tier is back"
+    );
 }

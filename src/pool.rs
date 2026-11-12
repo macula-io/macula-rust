@@ -34,7 +34,7 @@ pub use delivery::{Delivery, Gap, Interruption};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};
 pub use tier::{
-    Redial, Tier, DEFAULT_REDIAL_BASE, DEFAULT_REDIAL_CAP, DEFAULT_REDIAL_FACTOR,
+    Jitter, Redial, Tier, DEFAULT_REDIAL_BASE, DEFAULT_REDIAL_CAP, DEFAULT_REDIAL_FACTOR,
     DEFAULT_REDIAL_STEADY_UP,
 };
 
@@ -703,10 +703,7 @@ fn fill_defaults(opts: &mut Opts) -> Result<(), PoolError> {
     if opts.connect_timeout.is_zero() {
         opts.connect_timeout = DEFAULT_CONNECT_TIMEOUT;
     }
-    opts.redial = opts
-        .redial
-        .checked()
-        .map_err(|why| PoolError::InvalidOpts(why.to_string()))?;
+    opts.redial = opts.redial.filled();
     Ok(())
 }
 
@@ -798,4 +795,21 @@ fn roles_of(public: &[Seed], fallback: &[Seed]) -> HashMap<[u8; 32], Tier> {
         roles.insert(seed.node_id, Tier::Fallback);
     }
     roles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unmeasured link sorts after every measured one, however slow the
+    /// measured one was: macula's `rank_compare/2` rule, which the RTT sort
+    /// keeps (macula#201 §4, §9 scenario 6).
+    #[test]
+    fn an_unmeasured_link_sorts_after_a_measured_one() {
+        let fastest = rtt_key(Some(Duration::from_millis(1)));
+        let slowest = rtt_key(Some(Duration::from_secs(5)));
+        let unmeasured = rtt_key(None);
+        assert!(fastest < slowest, "measured links come by their round trip");
+        assert!(slowest < unmeasured, "a link with no measurement sorts last");
+    }
 }
