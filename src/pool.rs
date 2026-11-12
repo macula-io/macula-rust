@@ -810,6 +810,9 @@ mod tests {
         let slowest = rtt_key(Some(Duration::from_secs(5)));
         let unmeasured = rtt_key(None);
         assert!(fastest < slowest, "measured links come by their round trip");
-        assert!(slowest < unmeasured, "a link with no measurement sorts last");
+        assert!(
+            slowest < unmeasured,
+            "a link with no measurement sorts last"
+        );
     }
 }

@@ -182,10 +182,7 @@ impl Lab {
 
     /// Station `s` refuses every connection that arrives in the next `d`.
     pub fn refuse(&self, s: &LabStation, d: std::time::Duration) {
-        self.expect(
-            &format!("refuse {} {}", s.index, d.as_millis()),
-            "refusing",
-        );
+        self.expect(&format!("refuse {} {}", s.index, d.as_millis()), "refusing");
     }
 
     /// Station `s` accepts connections again.

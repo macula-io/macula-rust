@@ -59,6 +59,22 @@ async fn listener(lab: &Lab, s: &LabStation, seed: Seed) -> (Pool, Subscription)
     (pool, sub)
 }
 
+/// Waits until the pool reports a link up on the public tier.
+async fn until_a_public_link_is_up(p: &Pool) {
+    within(Duration::from_secs(15), "the public link up", || {
+        p.status().iter().any(|l| l.up && l.tier == Tier::Public)
+    })
+    .await;
+}
+
+/// Waits until `s` takes an arrival past `before`: the redial landing there.
+async fn until_the_redial(lab: &Lab, s: &LabStation, before: u64) {
+    within(Duration::from_secs(10), "the redial", || {
+        lab.arrivals(s) > before
+    })
+    .await;
+}
+
 /// Waits until `ok` holds, or fails the test naming what was awaited.
 async fn within(limit: Duration, what: &str, mut ok: impl FnMut() -> bool) {
     let deadline = Instant::now() + limit;
@@ -622,6 +638,48 @@ async fn a_content_announcement_reaches_only_the_active_tier() {
     );
 }
 
+/// The announcement names a station of the active tier, and the tier's order
+/// is the measurement's, not the seed list's: with the slower public station
+/// seeded first, the announcement names the faster one (§9 scenario 1's
+/// content half, read off §4's RTT order). A selection that took the links in
+/// seed order — `links()` rather than `targets()` — names the slow station.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_content_announcement_names_the_fastest_public_station() {
+    let lab = Lab::start(Profile::PqPure);
+    let slow = lab.station("content rtt slow");
+    let fast = lab.station("content rtt fast");
+    let (_relay, slow_seed) = relayed_after(&slow, Duration::from_millis(40));
+    let p = Pool::connect(vec![slow_seed, fast.seed()], opts())
+        .await
+        .unwrap();
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+    // A handshake measures the path; a moment more lets both estimates settle.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mcid = p
+        .share_content(&REALM, b"the announcement names a station", "tiny")
+        .await
+        .expect("shared");
+    let key = record::content_key(&mcid).expect("a content key");
+    let link = p
+        .link_to(&fast.node_id)
+        .await
+        .expect("a direct link to the fast station");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut announced = None;
+    while announced.is_none() && Instant::now() < deadline {
+        announced = link.find_record(&key).await.ok();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let verified = announced.expect("the active tier's station holds the announcement");
+    let read = record::read_content_announcement(verified.record()).expect("an announcement");
+    assert_eq!(
+        read.serving_station,
+        fast.node_id,
+        "the announcement names the fastest station of the active tier"
+    );
+}
+
 /// Replication is a maximum within the active tier, never a reason to reach
 /// into the other one: `replication_factor` 2 with one live public link sends
 /// one copy, and the fallback station carries none (§9 scenario 1, the case
@@ -900,10 +958,7 @@ async fn a_link_that_dies_before_the_steady_up_waits_longer_each_time() {
     opts.redial.steady_up = Duration::from_secs(30);
     opts.redial.jitter = Jitter::Ceiling;
     let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
-    within(Duration::from_secs(15), "the public link up", || {
-        p.status().iter().any(|l| l.up && l.tier == Tier::Public)
-    })
-    .await;
+    until_a_public_link_is_up(&p).await;
     let me = p.node_id();
 
     let mut waits = Vec::new();
@@ -911,15 +966,9 @@ async fn a_link_that_dies_before_the_steady_up_waits_longer_each_time() {
         let before = lab.arrivals(&public);
         let died = Instant::now();
         lab.drop_node(&public, &me);
-        within(Duration::from_secs(10), "the redial", || {
-            lab.arrivals(&public) > before
-        })
-        .await;
+        until_the_redial(&lab, &public, before).await;
         waits.push(died.elapsed());
-        within(Duration::from_secs(10), "the public link up again", || {
-            p.status().iter().any(|l| l.up && l.tier == Tier::Public)
-        })
-        .await;
+        until_a_public_link_is_up(&p).await;
     }
     let slack = Duration::from_millis(150);
     assert!(
@@ -974,9 +1023,11 @@ async fn a_link_that_proves_itself_starts_again_from_the_base() {
     let before = lab.arrivals(&public);
     let died = Instant::now();
     lab.drop_node(&public, &me);
-    within(Duration::from_secs(10), "the redial after it proved itself", || {
-        lab.arrivals(&public) > before
-    })
+    within(
+        Duration::from_secs(10),
+        "the redial after it proved itself",
+        || lab.arrivals(&public) > before,
+    )
     .await;
     let waited = died.elapsed();
     assert!(

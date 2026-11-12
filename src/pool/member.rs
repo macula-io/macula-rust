@@ -351,6 +351,14 @@ mod tests {
         })
     }
 
+    /// Runs the production redial wait on `m` in the background, so a test can
+    /// move the tier out from under it while it sleeps.
+    fn spawn_the_wait(inner: &Arc<PoolInner>, m: &Arc<Member>) -> tokio::task::JoinHandle<bool> {
+        let (inner, m) = (Arc::clone(inner), Arc::clone(m));
+        let mut retired = m.retired.subscribe();
+        tokio::spawn(async move { wait_before_redial(&inner, &m, &mut retired).await })
+    }
+
     /// The first retry of a down tier waits exactly the base: the schedule is
     /// read at the attempt it is at, before that retry is counted, as macula's
     /// own member does (macula#201 §9 scenario 4, "not less").
@@ -375,8 +383,16 @@ mod tests {
         let (second, _) = redial_delay(&inner, &m);
         m.set_attempts(2);
         let (third, _) = redial_delay(&inner, &m);
-        assert_eq!(second, base * 2 - Duration::from_nanos(1), "the ceiling at 2");
-        assert_eq!(third, base * 4 - Duration::from_nanos(1), "the ceiling at 4");
+        assert_eq!(
+            second,
+            base * 2 - Duration::from_nanos(1),
+            "the ceiling at 2"
+        );
+        assert_eq!(
+            third,
+            base * 4 - Duration::from_nanos(1),
+            "the ceiling at 4"
+        );
         assert!(second > base && third > second, "each retry waits longer");
     }
 
@@ -404,11 +420,7 @@ mod tests {
         let inner = undialed();
         let m = member(&inner, Tier::Public);
         m.set_attempts(5);
-        let mut retired = m.retired.subscribe();
-        let waiting = tokio::spawn({
-            let (inner, m) = (Arc::clone(&inner), Arc::clone(&m));
-            async move { wait_before_redial(&inner, &m, &mut retired).await }
-        });
+        let waiting = spawn_the_wait(&inner, &m);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(m.attempts(), 5, "still on the schedule it arrived with");
 
