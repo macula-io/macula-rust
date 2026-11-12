@@ -449,6 +449,43 @@ async fn the_fastest_measured_link_takes_the_first_replica() {
     );
 }
 
+/// The fastest measured link goes first for a station procedure too, not only
+/// for a publish: the first call of a walk reaches the lower round trip
+/// whatever the seed order says, and its answer is final (§9 scenario 6, the
+/// call half — macula#201's contract names the first call, not only the
+/// replica).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fastest_measured_link_takes_the_first_call() {
+    let lab = Lab::start(Profile::PqPure);
+    let slow = lab.station("call rtt slow");
+    let fast = lab.station("call rtt fast");
+    let found = StationRecord::put_only_at(&lab, &slow, "tier/call/lookup");
+    StationRecord::put_only_at(&lab, &fast, "tier/call/lookup");
+    let (_relay, slow_seed) = relayed_after(&slow, Duration::from_millis(40));
+    // The slow station first, so seed order alone would ask it.
+    let p = Pool::connect(vec![slow_seed, fast.seed()], opts())
+        .await
+        .unwrap();
+    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+    // A handshake measures the path; a moment more lets both estimates settle.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let them = p.node_id();
+
+    p.find_record(&found.key)
+        .await
+        .expect("the find is answered");
+    assert_eq!(
+        lab.asked(&fast, &them, "_dht.find_record"),
+        1,
+        "the lower round trip is asked first, and its answer is final"
+    );
+    assert_eq!(
+        lab.asked(&slow, &them, "_dht.find_record"),
+        0,
+        "seed order would have asked the slow station"
+    );
+}
+
 /// A factor of one is a schedule that never grows, not a malformed option:
 /// macula's own refusal set takes out a factor below one, not one itself
 /// (macula-go `pool/redial.go`). The connect succeeds and the schedule stays
@@ -674,8 +711,7 @@ async fn the_content_announcement_names_the_fastest_public_station() {
     let verified = announced.expect("the active tier's station holds the announcement");
     let read = record::read_content_announcement(verified.record()).expect("an announcement");
     assert_eq!(
-        read.serving_station,
-        fast.node_id,
+        read.serving_station, fast.node_id,
         "the announcement names the fastest station of the active tier"
     );
 }
