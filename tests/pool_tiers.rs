@@ -995,19 +995,27 @@ async fn the_first_redial_waits_the_base_and_each_after_it_waits_longer() {
     let at = arrivals_over(&lab, &public, Duration::from_millis(4600)).await;
     let gaps = gaps(&at);
     assert!(gaps.len() >= 3, "three redials, got {gaps:?}");
-    let slack = Duration::from_millis(150);
+    // The schedule's own shape, as §9 states it: every wait at or above the
+    // base, longer each attempt, and not past the step after it. A measured
+    // gap carries the dial and the handshake on top of the wait, so a whole
+    // base of room is allowed above each step — CI measures these in a
+    // coverage build, where that overhead is not the one of a fast laptop.
+    // The first gap has no floor here: the arrival `connect` made is already
+    // in the station's count when sampling starts, so that gap reads short by
+    // however long the sampling missed. The floor is pinned in-crate, on the
+    // wait itself (pool::member::tests::the_first_retry_waits_exactly_the_base).
     assert!(
-        gaps[0] <= base + slack,
-        "the first redial waits at most the base, not {:?}",
+        gaps[0] <= base * 2,
+        "the first redial waits at most the base, got {:?}",
         gaps[0]
     );
     assert!(
-        gaps[1] >= base * 2 - slack && gaps[1] <= base * 2 + slack,
+        gaps[1] > gaps[0] && gaps[1] >= base * 2 && gaps[1] <= base * 3,
         "the second redial waits the next ceiling, got {:?}",
         gaps[1]
     );
     assert!(
-        gaps[2] >= base * 4 - slack && gaps[2] <= base * 4 + slack,
+        gaps[2] > gaps[1] && gaps[2] >= base * 4 && gaps[2] <= base * 5,
         "the third waits the ceiling after that, got {:?}",
         gaps[2]
     );
@@ -1041,14 +1049,16 @@ async fn a_link_that_dies_before_the_steady_up_waits_longer_each_time() {
         waits.push(died.elapsed());
         until_a_public_link_is_up(&p).await;
     }
-    let slack = Duration::from_millis(150);
+    // Same bound as the schedule test: at or above each step of the schedule,
+    // longer each time, and short of the step after it (the gap carries the
+    // dial and the handshake as well as the wait).
     assert!(
-        waits[0] >= base && waits[0] <= base + slack,
+        waits[0] >= base && waits[0] <= base * 2,
         "the retry after the first death waits the base, got {:?}",
         waits[0]
     );
     assert!(
-        waits[1] > base + slack && waits[1] <= base * 2 + slack,
+        waits[1] > waits[0] && waits[1] >= base * 2 && waits[1] <= base * 3,
         "the retry after a death before the steady-up window waits further along, got {:?}",
         waits[1]
     );
@@ -1101,8 +1111,10 @@ async fn a_link_that_proves_itself_starts_again_from_the_base() {
     )
     .await;
     let waited = died.elapsed();
+    // A reset count waits the base; one that kept its count waits the next
+    // step, which no amount of dial overhead brings back under this bound.
     assert!(
-        waited >= base && waited <= base + Duration::from_millis(150),
+        waited >= base && waited <= base * 2,
         "a link that proved itself starts again from the base, but the retry waited {waited:?}"
     );
 }

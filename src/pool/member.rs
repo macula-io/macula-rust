@@ -315,12 +315,17 @@ mod tests {
     /// state, and nothing here starts a member. Its tier is public, since it
     /// has no fallback list.
     fn undialed() -> Arc<PoolInner> {
+        undialed_at(Duration::from_millis(200))
+    }
+
+    /// The same, on a base a test can space its waits out on.
+    fn undialed_at(base: Duration) -> Arc<PoolInner> {
         let identity = Arc::new(
             NodeKey::generate_identity(Profile::PqPure, PUZZLE_DIFFICULTY).expect("a key"),
         );
         let mut opts = Opts::new(identity);
         opts.realm_trust = HashMap::new();
-        opts.redial.base = Duration::from_millis(200);
+        opts.redial.base = base;
         opts.redial.factor = 2;
         opts.redial.cap = Duration::from_secs(60);
         opts.redial.jitter = Jitter::Ceiling;
@@ -368,17 +373,19 @@ mod tests {
     /// right, and only the wait's own length shows the off-by-one.
     #[tokio::test]
     async fn the_first_retry_waits_exactly_the_base() {
-        let inner = undialed();
+        let base = Duration::from_secs(1);
+        let inner = undialed_at(base);
         let m = member(&inner, Tier::Fallback);
         assert_eq!(m.attempts(), 0, "nothing counted yet");
-        let base = inner.opts.redial.base;
         let started = tokio::time::Instant::now();
         let waiting = spawn_the_wait(&inner, &m);
         assert!(waiting.await.expect("the wait ends"), "not retired");
         let waited = started.elapsed();
         assert_eq!(m.attempts(), 1, "the retry was counted, once");
+        // The base, with half of it of room for the timer: a retry counted
+        // before it was planned waits the next step, twice the base.
         assert!(
-            waited >= base && waited < base + Duration::from_millis(120),
+            waited >= base && waited < base * 3 / 2,
             "the first retry waits exactly the base ({base:?}), but it took {waited:?}"
         );
     }
