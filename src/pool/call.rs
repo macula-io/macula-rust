@@ -31,7 +31,7 @@ use crate::station_link::{
 use crate::transport::Target;
 
 use super::member::Member;
-use super::{Pool, PoolError, PoolInner};
+use super::{Pool, PoolError, PoolInner, Tier};
 
 /// No candidate gets less than a second of a call's time.
 const MIN_CANDIDATE_SHARE: Duration = Duration::from_secs(1);
@@ -569,7 +569,7 @@ impl PoolInner {
             return Err(PoolError::DirectLinksFull);
         }
         let target = bounded(deadline, self.station_target(station)).await?;
-        Ok(self.start_member(target, true))
+        Ok(self.start_member(target, true, Tier::Public))
     }
 
     async fn station_target(&self, station: &[u8; 32]) -> Result<Target, PoolError> {
@@ -598,26 +598,55 @@ impl PoolInner {
         }
     }
 
-    /// Runs `ask` on the links in selection order and returns the first
-    /// answer, moving on only when a link could not carry the request: a
-    /// station's own answer, not_found included, is final.
+    /// Runs `ask` on the pool's links and returns the first answer, moving on
+    /// only when a link could not carry the request: a station's own answer,
+    /// not_found included, is final.
+    ///
+    /// The walk follows the tier (macula-io/macula#201 §3a). It re-reads the
+    /// active tier before each attempt, asks each station at most once —
+    /// keyed by node_id, since a member that redials gets a new link — and
+    /// asks no more stations than the pool has members. Only while the active
+    /// tier has no *unasked* link left does it take the other tier's: a link
+    /// that has just failed stays `current()` until its member notices, so a
+    /// walk that read the tier alone would stop there, where today's snapshot
+    /// of every link walks on to the fallback and answers.
     pub(super) async fn first_answer<'a, T, F, Fut>(&self, ask: F) -> Result<T, PoolError>
     where
         F: Fn(Link) -> Fut,
         Fut: Future<Output = Result<T, LinkError>> + 'a,
     {
-        let links = self.links();
-        if links.is_empty() {
-            return Err(PoolError::NoLink(Vec::new()));
-        }
+        let mut asked: HashSet<[u8; 32]> = HashSet::new();
         let mut errors = Vec::new();
-        for link in links {
+        for _ in 0..self.member_count() {
+            let Some(link) = self.next_unasked_link(&asked) else {
+                break;
+            };
+            asked.insert(link.station_node_id());
             match ask(link).await {
                 Err(e) if unreachable(&e) => errors.push(e),
                 answered => return answered.map_err(PoolError::Link),
             }
         }
         Err(PoolError::NoLink(errors))
+    }
+
+    /// The link the walk asks next: the first the active tier has not asked
+    /// yet, and when the active tier has none left, the first any tier has
+    /// not.
+    fn next_unasked_link(&self, asked: &HashSet<[u8; 32]>) -> Option<Link> {
+        let active = self.targets();
+        let any = self.links();
+        let ids = |links: &[Link]| links.iter().map(Link::station_node_id).collect::<Vec<_>>();
+        let station = next_unasked(&ids(&active), &ids(&any), asked)?;
+        active
+            .into_iter()
+            .chain(any)
+            .find(|link| link.station_node_id() == station)
+    }
+
+    /// How many members the pool holds: the most stations one walk can ask.
+    fn member_count(&self) -> usize {
+        self.lock().members.len()
     }
 }
 
@@ -812,6 +841,29 @@ fn unreachable(e: &LinkError) -> bool {
     )
 }
 
+/// The station a walk asks next: the first of `active` it has not asked yet,
+/// and — when the active tier has none left unasked, because the only one it
+/// still lists is the link that just failed — the first of `any` it has not.
+///
+/// The condition is "no unasked link", not Go's "the active tier is empty":
+/// a link that has just failed stays `current()` here until its member's
+/// `hold` sees `link.done()`, so under "empty" the walk would re-read a tier
+/// that still lists only the dead, already-asked link and stop.
+fn next_unasked(
+    active: &[[u8; 32]],
+    any: &[[u8; 32]],
+    asked: &HashSet<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    unasked(active, asked)
+        .or_else(|| unasked(any, asked))
+        .copied()
+}
+
+/// The first of `stations` this walk has not asked.
+fn unasked<'a>(stations: &'a [[u8; 32]], asked: &HashSet<[u8; 32]>) -> Option<&'a [u8; 32]> {
+    stations.iter().find(|station| !asked.contains(*station))
+}
+
 /// One candidate's part of what is left before `deadline` with `left`
 /// candidates to try, at least a second, as macula shares it, and never past
 /// `deadline` itself.
@@ -884,6 +936,43 @@ fn callable(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walk reaches the other tier exactly when the active tier has no
+    /// unasked link left: the window in which a link that just failed still
+    /// counts as current. Go's "the active tier is empty" condition stops
+    /// here instead, and the walk fails although the fallback is up and
+    /// answered nothing yet.
+    #[test]
+    fn the_walk_reaches_the_other_tier_when_the_active_one_has_nothing_unasked() {
+        let dead_public = [1_u8; 32];
+        let live_fallback = [2_u8; 32];
+        let asked: HashSet<[u8; 32]> = [dead_public].into();
+        assert_eq!(
+            next_unasked(&[dead_public], &[dead_public, live_fallback], &asked),
+            Some(live_fallback)
+        );
+    }
+
+    /// While the active tier has an unasked link, the walk never leaves it: a
+    /// publication's first replica and a station procedure stay there.
+    #[test]
+    fn the_walk_stays_on_the_active_tier_while_it_has_an_unasked_link() {
+        let (first, second, fallback) = ([1_u8; 32], [2_u8; 32], [3_u8; 32]);
+        let asked: HashSet<[u8; 32]> = [first].into();
+        assert_eq!(
+            next_unasked(&[first, second], &[first, second, fallback], &asked),
+            Some(second)
+        );
+    }
+
+    /// A station is asked at most once, whichever tier it is on: with every
+    /// link asked, the walk has nowhere left to go.
+    #[test]
+    fn a_walk_that_has_asked_every_station_answers_none() {
+        let (public, fallback) = ([1_u8; 32], [2_u8; 32]);
+        let asked: HashSet<[u8; 32]> = [public, fallback].into();
+        assert_eq!(next_unasked(&[public], &[public, fallback], &asked), None);
+    }
 
     fn cand(node: u8, kem_key: Option<u8>) -> Candidate {
         Candidate {

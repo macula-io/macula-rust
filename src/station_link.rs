@@ -465,6 +465,15 @@ impl Link {
         self.inner.station_capabilities
     }
 
+    /// The round trip this link has measured, once it has one: the QUIC
+    /// connection's own smoothed estimate, which is the measurement a pool
+    /// ranks the links of its active tier by (macula-io/macula#201 §4). `None`
+    /// until the connection has measured one.
+    pub fn rtt(&self) -> Option<Duration> {
+        let rtt = self.inner.connection.stats().path.rtt;
+        (!rtt.is_zero()).then_some(rtt)
+    }
+
     /// The profile the link runs.
     pub fn profile(&self) -> Profile {
         self.inner.profile

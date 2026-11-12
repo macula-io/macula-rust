@@ -23,6 +23,7 @@ mod member;
 mod pubsub;
 mod resend;
 mod serve;
+mod tier;
 
 pub use crate::station_link::Confidentiality;
 use crate::station_link::SignedPublication;
@@ -32,6 +33,10 @@ pub use content::{content_procedure_bound, ContentOptions, CONTENT_PROCEDURE};
 pub use delivery::{Delivery, Gap, Interruption};
 pub use pubsub::Subscription;
 pub use serve::{Offer, Served};
+pub use tier::{
+    Redial, Tier, DEFAULT_REDIAL_BASE, DEFAULT_REDIAL_CAP, DEFAULT_REDIAL_FACTOR,
+    DEFAULT_REDIAL_STEADY_UP,
+};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -69,6 +74,9 @@ pub enum PoolError {
     /// A realm key that is not a well-formed key of the pool's profile, and
     /// its realm.
     RealmTrustInvalid([u8; 32]),
+    /// A station named in both the public and the fallback list, which has no
+    /// defined role.
+    StationInBothTiers { station: [u8; 32] },
     /// An option out of its range, or a key that is no identity key.
     InvalidOpts(String),
     /// No link came up within the connect timeout, or none is up to carry an
@@ -190,6 +198,9 @@ pub enum LinkSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkEvent {
     pub station: [u8; 32],
+    /// The tier the station was named in: [`Tier::Public`] for a seed and for
+    /// a station dialed directly, [`Tier::Fallback`] for a fallback seed.
+    pub tier: Tier,
     pub direct: bool,
     pub up: bool,
     pub error: Option<LinkError>,
@@ -207,6 +218,13 @@ pub struct Opts {
     pub realm_trust: HashMap<[u8; 32], Vec<u8>>,
     pub replication_factor: usize,
     pub respawn_delay: Duration,
+    /// The stations of the fallback tier: the LAN stations a node keeps for
+    /// when no public station is up. Empty — the default — means one tier, and
+    /// the pool behaves exactly as it did before there were tiers.
+    pub fallback_seeds: Vec<Seed>,
+    /// How a link whose tier is not active is redialed, and how long a link
+    /// must stay up before its counter resets.
+    pub redial: Redial,
     pub max_seeds: usize,
     pub max_direct_links: usize,
     /// How long [`Pool::connect`] waits for a first link.
@@ -237,6 +255,8 @@ impl Opts {
             realm_trust: HashMap::new(),
             replication_factor: DEFAULT_REPLICATION_FACTOR,
             respawn_delay: DEFAULT_RESPAWN_DELAY,
+            fallback_seeds: Vec::new(),
+            redial: Redial::default(),
             max_seeds: DEFAULT_MAX_SEEDS,
             max_direct_links: DEFAULT_MAX_DIRECT_LINKS,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -259,6 +279,16 @@ pub struct Pool {
 pub(crate) struct PoolInner {
     opts: Opts,
     self_id: [u8; 32],
+    /// Whether a fallback list was configured at all: what tells a tier of
+    /// "no public link up" from a pool that never had two tiers.
+    has_fallback: bool,
+    /// Each configured seed's role, by the station's node_id. A station not
+    /// here — one dialed directly — is public.
+    roles: HashMap<[u8; 32], Tier>,
+    /// Tells every member waiting out a backoff that the active tier may have
+    /// moved, so a retry of the tier that just became active can restart at
+    /// the floor.
+    tier_moved: tokio::sync::Notify,
     issuer: StatementIssuer,
     publication_seq: Arc<PublicationSeq>,
     admission: Arc<Admission>,
@@ -292,6 +322,8 @@ type Closing = (Vec<Arc<Member>>, HashMap<u64, Arc<pubsub::SubInner>>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkStatus {
     pub station: [u8; 32],
+    /// The tier the station was named in.
+    pub tier: Tier,
     pub host: String,
     pub port: u16,
     pub direct: bool,
@@ -325,6 +357,9 @@ impl Pool {
         };
         let inner = Arc::new(PoolInner {
             self_id,
+            has_fallback: !opts.fallback_seeds.is_empty(),
+            roles: roles_of(&seeds, &opts.fallback_seeds),
+            tier_moved: tokio::sync::Notify::new(),
             issuer,
             publication_seq: Arc::default(),
             admission: Arc::new(Admission::new(admission)),
@@ -346,7 +381,12 @@ impl Pool {
         });
         let pool = Pool { inner };
         for seed in &seeds {
-            pool.inner.start_member(pool.target(seed), false);
+            pool.inner
+                .start_member(pool.target(seed), false, Tier::Public);
+        }
+        for seed in &pool.inner.opts.fallback_seeds {
+            pool.inner
+                .start_member(pool.target(seed), false, Tier::Fallback);
         }
         let deadline = tokio::time::Instant::now() + pool.inner.opts.connect_timeout;
         if let Err(e) = pool.inner.await_up(deadline).await {
@@ -377,12 +417,26 @@ impl Pool {
             .iter()
             .map(|m| LinkStatus {
                 station: m.target.expected_node_id,
+                tier: m.tier,
                 host: m.target.host.clone(),
                 port: m.target.port,
                 direct: m.direct,
                 up: m.current().is_some(),
             })
             .collect()
+    }
+
+    /// The tier the pool's originating traffic belongs to: public the moment
+    /// any public link is up, fallback only when none is and a fallback list
+    /// was configured. A pool with no fallback list is public even with every
+    /// link down, so "no link up" fails exactly as it did before there were
+    /// tiers.
+    ///
+    /// A caller reads it to say which tier it is on — "offline: on the LAN
+    /// fallback" — rather than failing silently. It decides nothing itself: an
+    /// operation already selects from the active tier.
+    pub fn active_tier(&self) -> Tier {
+        self.inner.active_tier()
     }
 
     /// Ends every link with a GOODBYE and every subscription. It withdraws
@@ -443,10 +497,13 @@ impl PoolInner {
         ))
     }
 
-    /// Sends a signed publication on the first `replication_factor` links, in
-    /// the pool's selection order, succeeding when one of them takes it.
+    /// Sends a signed publication on the first `replication_factor` links of
+    /// the active tier, in the pool's selection order, succeeding when one of
+    /// them takes it. One live public link with a factor of two publishes to
+    /// one station: the fan-out is a maximum *within* the active tier, never a
+    /// reason to reach into the other one.
     pub(super) async fn send_signed(&self, signed: &SignedPublication) -> Result<(), PoolError> {
-        let links = self.links();
+        let links = self.targets();
         if links.is_empty() {
             return Err(PoolError::NoLink(Vec::new()));
         }
@@ -464,14 +521,70 @@ impl PoolInner {
         Ok(())
     }
 
-    /// The links up now, in the pool's selection order.
+    /// The links up now, in the pool's selection order: every tier's, for a
+    /// standing registration, which is state and belongs on every link.
     fn links(&self) -> Vec<Link> {
-        let members = self.lock().members.clone();
-        let mut up: Vec<Link> = members.iter().filter_map(|m| m.current()).collect();
+        let mut up = self.links_up();
         if self.opts.link_selection == LinkSelection::Random {
             shuffle(&mut up);
         }
         up
+    }
+
+    /// The links up now, in the order the members were started.
+    fn links_up(&self) -> Vec<Link> {
+        let members = self.lock().members.clone();
+        members.iter().filter_map(|m| m.current()).collect()
+    }
+
+    /// The links up now on the pool's active tier, fastest first: what an
+    /// originating operation — a publication, a station procedure, a content
+    /// announcement, a re-sent publication — selects from. Never a standing
+    /// registration, which takes every link of both tiers and never this.
+    fn targets(&self) -> Vec<Link> {
+        let active = self.active_tier();
+        let links: Vec<Link> = self
+            .links_up()
+            .into_iter()
+            .filter(|link| self.tier_of(&link.station_node_id()) == active)
+            .collect();
+        self.ordered(links)
+    }
+
+    /// The tier `station` was named in: its configured role, or public for a
+    /// station dialed directly or already forgotten.
+    fn tier_of(&self, station: &[u8; 32]) -> Tier {
+        self.roles.get(station).copied().unwrap_or(Tier::Public)
+    }
+
+    /// The tier the pool's originating traffic belongs to. See
+    /// [`Pool::active_tier`].
+    fn active_tier(&self) -> Tier {
+        let members = self.lock().members.clone();
+        let public_up = members
+            .iter()
+            .any(|m| m.tier == Tier::Public && m.current().is_some());
+        match public_up || !self.has_fallback {
+            true => Tier::Public,
+            false => Tier::Fallback,
+        }
+    }
+
+    /// `links` in the pool's selection order: fastest measured round trip
+    /// first, and the order they came in for `Random`, which discards the
+    /// measurement by definition.
+    fn ordered(&self, mut links: Vec<Link>) -> Vec<Link> {
+        match self.opts.link_selection {
+            LinkSelection::Random => shuffle(&mut links),
+            LinkSelection::FirstSuccess => links.sort_by_key(|l| rtt_key(l.rtt())),
+        }
+        links
+    }
+
+    /// Tells every member waiting out a backoff that the active tier may have
+    /// moved: the newly active tier's pending retries restart at the floor.
+    fn tier_may_have_moved(&self) {
+        self.tier_moved.notify_waiters();
     }
 
     /// Waits until a link is up, or `deadline` passes.
@@ -566,6 +679,10 @@ fn checked(seeds: &[Seed], mut opts: Opts) -> Result<Opts, PoolError> {
     if opts.connect_timeout.is_zero() {
         opts.connect_timeout = DEFAULT_CONNECT_TIMEOUT;
     }
+    opts.redial = opts
+        .redial
+        .checked()
+        .map_err(|why| PoolError::InvalidOpts(why.to_string()))?;
     let admission = opts.admission.unwrap_or_else(|| {
         let mut limits = AdmissionLimits::default();
         limits.cap = limits.share * (opts.max_seeds + opts.max_direct_links);
@@ -578,19 +695,38 @@ fn checked(seeds: &[Seed], mut opts: Opts) -> Result<Opts, PoolError> {
     if seeds.is_empty() {
         return Err(PoolError::NoSeeds);
     }
-    if seeds.len() > opts.max_seeds {
+    let stations = seeds.len() + opts.fallback_seeds.len();
+    if stations > opts.max_seeds {
         return Err(PoolError::TooManySeeds {
-            given: seeds.len(),
+            given: stations,
             max: opts.max_seeds,
         });
     }
-    if let Some(unpinned) = seeds.iter().find(|s| s.node_id == [0; 32]) {
-        return Err(PoolError::SeedNotPinned(format!(
-            "{}:{}",
-            unpinned.host, unpinned.port
-        )));
+    for list in [seeds, opts.fallback_seeds.as_slice()] {
+        if let Some(unpinned) = list.iter().find(|s| s.node_id == [0; 32]) {
+            return Err(PoolError::SeedNotPinned(format!(
+                "{}:{}",
+                unpinned.host, unpinned.port
+            )));
+        }
+    }
+    if let Some(seed) = named_twice(seeds, &opts.fallback_seeds) {
+        return Err(PoolError::StationInBothTiers {
+            station: seed.node_id,
+        });
     }
     Ok(opts)
+}
+
+/// A station named in both lists: the same node_id at any address, or the same
+/// address under any node_id. One station holding two roles has no defined
+/// behaviour, so the pool refuses it rather than picking one.
+fn named_twice<'a>(public: &'a [Seed], fallback: &'a [Seed]) -> Option<&'a Seed> {
+    fallback.iter().find(|f| {
+        public
+            .iter()
+            .any(|p| p.node_id == f.node_id || (p.host == f.host && p.port == f.port))
+    })
 }
 
 /// Fisher-Yates over the system's randomness.
@@ -603,4 +739,27 @@ fn shuffle<T>(items: &mut [T]) {
         let j = (u64::from_le_bytes(r) % (i as u64 + 1)) as usize;
         items.swap(i, j);
     }
+}
+
+/// A link's sort key: measured links by their round trip, ascending, and a
+/// link with no measurement after every measured one (macula's
+/// `rank_compare/2`).
+fn rtt_key(rtt: Option<Duration>) -> (bool, Duration) {
+    match rtt {
+        Some(rtt) => (false, rtt),
+        None => (true, Duration::ZERO),
+    }
+}
+
+/// Each seed's role, by the station's node_id: the public list, then the
+/// fallback one. A station in both is refused before this is called.
+fn roles_of(public: &[Seed], fallback: &[Seed]) -> HashMap<[u8; 32], Tier> {
+    let mut roles: HashMap<[u8; 32], Tier> = HashMap::new();
+    for seed in public {
+        roles.insert(seed.node_id, Tier::Public);
+    }
+    for seed in fallback {
+        roles.insert(seed.node_id, Tier::Fallback);
+    }
+    roles
 }

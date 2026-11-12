@@ -327,7 +327,7 @@ impl PoolInner {
         root: &Root,
     ) -> Result<Record, PoolError> {
         let station = self
-            .links()
+            .targets()
             .first()
             .map(Link::station_node_id)
             .ok_or(PoolError::NoLink(Vec::new()))?;
