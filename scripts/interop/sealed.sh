@@ -41,6 +41,10 @@ slice=${CGROUP_PARENT:+--cgroup-parent=$CGROUP_PARENT}
 work="$(mktemp -d)"
 erl_name="macula-rust-sealed-$$"
 rust_name="macula-rust-sealed-provider-$$"
+# The two caller tests, named once: the pre-build compiles the first and each
+# case runs its own, so a file renamed here is renamed everywhere it is used.
+sealed_test=interop_sealed
+a0_test=interop_sealed_a0
 # what_failed says why a run that ends badly ended badly: every side's own
 # log, and the containers still up, before cleanup takes them away. A failing
 # CI run is the only place some of this is ever seen.
@@ -103,6 +107,39 @@ stop_erl() {
   podman rm -f "$erl_name" > /dev/null 2>&1 || true
 }
 
+# rust_cargo ARGS runs cargo in the CI image in this checkout, against the
+# target dir the caller tests are built in and run from.
+rust_cargo() {
+  mkdir -p "$root/target/interop-cargo"
+  # shellcheck disable=SC2086 # slice is a list of flags, empty when unset.
+  podman run --rm --init --network host $slice \
+    -e CARGO_HOME=/w/target/interop-cargo -e CARGO_TARGET_DIR=/w/target/interop \
+    -v "$root:/w:Z" -w /w "$image" \
+    cargo "$@"
+}
+
+# build_the_caller compiles the caller test whose compile is long, before any
+# provider starts.
+#
+# A provider serves for a fixed hold counted from the moment it prints
+# `serving` (erlang_sealed.escript), and a cold compile of the caller outlasts
+# that hold on a loaded runner: two CI runs of one commit compiled the same
+# test in 2m33s and 3m16s against a 180 s hold. With the compile inside the
+# window, the first call reaches a provider that has already exited, and every
+# retry times out until the test's own deadline -- the flake is
+# `NoLink([CallTimeout])` at tests/interop_sealed.rs:119 (macula-rust#66).
+# Building here leaves each provider's window covering the calls alone.
+#
+# Only this test is built. The A0 caller is a second binary, but once this one
+# has built the dependencies the A0 one compiles in under a second, well
+# inside its own window: it compiled in 0.78 s in run 43347796356 on the
+# unfixed script. A pre-build for it would guard a case that does not arise, so
+# it is not built here.
+build_the_caller() {
+  echo "== building the caller $sealed_test, before a provider is started"
+  rust_cargo test --locked --test "$sealed_test" --no-run
+}
+
 # rust_test FILE NAME runs one ignored test of FILE in the CI image, with the
 # interop variables every test here reads; EXTRA_ENV is passed through as-is.
 rust_test() {
@@ -118,11 +155,13 @@ rust_test() {
     cargo test --locked --test "$file" -- --ignored --nocapture --exact "$name"
 }
 
+build_the_caller
+
 echo "== $profile: an Erlang provider, a Rust caller"
 erl serve 180 > "$work/erlang.out" 2>&1 &
 first_line "$work/erlang.out" '^serving' > /dev/null
 provider="$(first_line "$work/erlang.out" '^node ' | awk '{print $2}')"
-rust_test interop_sealed a_sealed_call_and_stream_reach_a_required_macula_provider \
+rust_test "$sealed_test" a_sealed_call_and_stream_reach_a_required_macula_provider \
   "-e MACULA_RUST_SEALED_PROVIDER=$provider"
 stop_erl
 
@@ -135,7 +174,7 @@ erl serve_a0 180 > "$work/erlang-a0.out" 2>&1 &
 first_line "$work/erlang-a0.out" '^serving' > /dev/null
 provider="$(first_line "$work/erlang-a0.out" '^node ' | awk '{print $2}')"
 carried="$(first_line "$work/erlang-a0.out" '^kem ' | awk '{print $2}')"
-rust_test interop_sealed_a0 a_clear_request_reaches_a_keyed_macula_provider_sealed \
+rust_test "$a0_test" a_clear_request_reaches_a_keyed_macula_provider_sealed \
   "-e MACULA_RUST_SEALED_PROVIDER=$provider -e MACULA_RUST_SEALED_KEM=$carried"
 stop_erl
 
@@ -147,7 +186,7 @@ podman run --rm --init --name "$rust_name" --network host $slice \
   -e MACULA_RUST_SEALED_HOLD=240 \
   -e CARGO_HOME=/w/target/interop-cargo -e CARGO_TARGET_DIR=/w/target/interop \
   -v "$root:/w:Z" -w /w "$image" \
-  cargo test --locked --test interop_sealed -- --ignored --nocapture --exact \
+  cargo test --locked --test "$sealed_test" -- --ignored --nocapture --exact \
   a_required_rust_provider_serves_a_macula_caller_sealed > "$work/rust.out" 2>&1 &
 first_line "$work/rust.out" '^serving' > /dev/null
 provider="$(first_line "$work/rust.out" '^node ' | awk '{print $2}')"
