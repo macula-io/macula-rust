@@ -323,9 +323,14 @@ async fn neither_tier_up_fails_the_connect_as_it_always_has() {
     let public = lab.station("nowhere public");
     let fallback = lab.station("nowhere fallback");
     // Both stations refuse the handshake, so each link fails on its own error
-    // rather than on a dial that waits out its timeout.
-    lab.refuse(&public, Duration::from_secs(10));
-    lab.refuse(&fallback, Duration::from_secs(10));
+    // rather than on a dial that waits out its timeout. The window is a minute
+    // of the lab's clock, not of this process's: the station stops refusing on
+    // its own timer, and the coverage job runs this whole binary in parallel
+    // under llvm-cov, where a second of dialing can take ten of the machine's.
+    // At ten seconds the window lapsed before the dial on 2026-11-13 and the
+    // pool connected, which is the one outcome this test exists to refuse.
+    lab.refuse(&public, Duration::from_secs(60));
+    lab.refuse(&fallback, Duration::from_secs(60));
     let mut opts = opts();
     opts.connect_timeout = Duration::from_secs(1);
     opts.fallback_seeds = vec![fallback.seed()];
