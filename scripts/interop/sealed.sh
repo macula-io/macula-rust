@@ -41,8 +41,8 @@ slice=${CGROUP_PARENT:+--cgroup-parent=$CGROUP_PARENT}
 work="$(mktemp -d)"
 erl_name="macula-rust-sealed-$$"
 rust_name="macula-rust-sealed-provider-$$"
-# The two caller tests, named once: the build compiles both and each case runs
-# its own, so a file renamed here is renamed everywhere it is used.
+# The two caller tests, named once: the pre-build compiles the first and each
+# case runs its own, so a file renamed here is renamed everywhere it is used.
 sealed_test=interop_sealed
 a0_test=interop_sealed_a0
 # what_failed says why a run that ends badly ended badly: every side's own
@@ -133,8 +133,8 @@ rust_cargo() {
 # Only this test is built. The A0 caller is a second binary, but once this one
 # has built the dependencies the A0 one compiles in under a second, well
 # inside its own window: it compiled in 0.78 s in run 43347796356 on the
-# unfixed script (Uranus, macula-rust#66 r=1). A pre-build for it would guard
-# a case that does not arise, so it is not built here.
+# unfixed script. A pre-build for it would guard a case that does not arise, so
+# it is not built here.
 build_the_caller() {
   echo "== building the caller $sealed_test, before a provider is started"
   rust_cargo test --locked --test "$sealed_test" --no-run
