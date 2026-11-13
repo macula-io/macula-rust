@@ -438,8 +438,23 @@ async fn a_link_event_names_the_tier() {
             event.up,
         ));
     }));
-    let p = Pool::connect(vec![public.seed()], opts).await.unwrap();
-    within(Duration::from_secs(15), "both links up", || all_up(&p)).await;
+    // Held to the end of the test: the links, and the events they raise, end
+    // with the pool.
+    let _p = Pool::connect(vec![public.seed()], opts).await.unwrap();
+    // The callback runs in its own task, so a link is up before the recorder has
+    // heard of it: wait for the records, and not for the links.
+    let heard_from_both = || {
+        let events = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        [public.node_id, fallback.node_id]
+            .iter()
+            .all(|station| events.iter().any(|(s, _, up)| s == station && *up))
+    };
+    within(
+        Duration::from_secs(15),
+        "a link-up event from each station",
+        heard_from_both,
+    )
+    .await;
     let events = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
     assert!(
         events.contains(&(public.node_id, Tier::Public, true)),
