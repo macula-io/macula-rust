@@ -143,6 +143,53 @@ impl Lab {
         reply.split_whitespace().nth(1).unwrap().parse().unwrap()
     }
 
+    /// How many calls `node` made to `procedure` this station answered: the
+    /// count a tier test takes at the station the traffic must not reach.
+    pub fn asked(&self, s: &LabStation, node: &[u8; 32], procedure: &str) -> u64 {
+        let command = format!("asked {} {} {procedure}", s.index, hex::encode(node));
+        self.expect(&command, "asked")
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// How many connections have reached the station, refused or not: the
+    /// count of the dials made against it.
+    pub fn arrivals(&self, s: &LabStation) -> u64 {
+        self.expect(&format!("arrivals {}", s.index), "arrivals")
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// Station `s` ignores `node`'s frames for `d`: its link stays up and
+    /// carries nothing, so a request on it fails rather than being answered.
+    pub fn silence(&self, s: &LabStation, node: &[u8; 32], d: std::time::Duration) {
+        self.expect(
+            &format!(
+                "silence {} {} {}",
+                s.index,
+                hex::encode(node),
+                d.as_millis()
+            ),
+            "silenced",
+        );
+    }
+
+    /// Station `s` refuses every connection that arrives in the next `d`.
+    pub fn refuse(&self, s: &LabStation, d: std::time::Duration) {
+        self.expect(&format!("refuse {} {}", s.index, d.as_millis()), "refusing");
+    }
+
+    /// Station `s` accepts connections again.
+    pub fn allow(&self, s: &LabStation) {
+        self.expect(&format!("allow {}", s.index), "allowed");
+    }
+
     /// A realm named `name` with the org `org`.
     pub fn realm(&self, name: &str, org: &str) -> LabRealm {
         assert!(

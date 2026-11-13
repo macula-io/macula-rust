@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/macula-io/macula-go/profile"
 	"github.com/macula-io/macula-go/teststation"
@@ -21,6 +22,11 @@ import (
 //	connected <i> <node hex>                 yes | no
 //	advertised <i> <realm hex> <procedure>   yes | no
 //	subscribed <i> <node hex> <realm hex> <topic>   yes | no
+//	asked <i> <node hex> <procedure>         asked <n>
+//	arrivals <i>                             arrivals <n>
+//	silence <i> <node hex> <millis>          silenced
+//	refuse <i> <millis>                      refusing
+//	allow <i>                                allowed
 //	share <i> <j> ...                        shared
 //	put <i> <wire hex>                       put
 //	forge <i> <key hex> <wire hex>           forged
@@ -29,6 +35,14 @@ import (
 //	impostor <r>                             realm <r2> <realm_id hex> <realm_key hex>
 //	admit <r> <i> <node hex> ...             admitted
 //	judge <i> <kind> <verdict>               judged
+//
+// asked counts the CALLs node made to procedure that station i answered, so a
+// test can assert at the fallback that no station procedure, DHT operation or
+// content announcement reached it. arrivals counts every connection that
+// reached station i, refused or not: a test's count of the dials made against
+// it. silence makes station i ignore node's frames for millis, so an
+// established link carries nothing while it lasts; refuse makes station i
+// close arriving connections without a handshake for millis, allow ends it.
 //
 // judge sets how station i answers each registration of kind (advertise,
 // unadvertise, subscribe, unsubscribe): verdict is a refusal reason
@@ -112,6 +126,16 @@ func lab(t *helperT, p profile.Profile, f []string, stations *[]*teststation.Sta
 		return c.advertised()
 	case "subscribed":
 		return c.subscribed()
+	case "asked":
+		return c.asked()
+	case "arrivals":
+		return c.arrivals()
+	case "silence":
+		return c.silence()
+	case "refuse":
+		return c.refuse()
+	case "allow":
+		return c.allow()
 	case "share":
 		return c.share()
 	case "put":
@@ -198,6 +222,71 @@ func (c labCommand) subscribed() (string, error) {
 		return "", err
 	}
 	return yes(s.Subscribed(node, realm, c.f[4])), nil
+}
+
+func (c labCommand) asked() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	node, err := id32(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	if err := c.need(4); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("asked %d", s.Asked(node, c.f[3])), nil
+}
+
+func (c labCommand) arrivals() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("arrivals %d", s.Arrivals()), nil
+}
+
+func (c labCommand) silence() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	node, err := id32(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	if err := c.need(4); err != nil {
+		return "", err
+	}
+	d, err := millis(c.f, 3)
+	if err != nil {
+		return "", err
+	}
+	s.Silence(node, d)
+	return "silenced", nil
+}
+
+func (c labCommand) refuse() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	d, err := millis(c.f, 2)
+	if err != nil {
+		return "", err
+	}
+	s.Refuse(d)
+	return "refusing", nil
+}
+
+func (c labCommand) allow() (string, error) {
+	s, err := c.pick(1)
+	if err != nil {
+		return "", err
+	}
+	s.Allow()
+	return "allowed", nil
 }
 
 func (c labCommand) share() (string, error) {
@@ -339,6 +428,18 @@ func bytesAt(f []string, i int) ([]byte, error) {
 		return nil, fmt.Errorf("%s needs argument %d", f[0], i)
 	}
 	return hex.DecodeString(f[i])
+}
+
+// millis reads the millisecond count at f[i].
+func millis(f []string, i int) (time.Duration, error) {
+	if len(f) <= i {
+		return 0, fmt.Errorf("%s needs a millisecond count", f[0])
+	}
+	ms, err := strconv.Atoi(f[i])
+	if err != nil || ms < 0 {
+		return 0, fmt.Errorf("%s takes a non-negative millisecond count, not %q", f[0], f[i])
+	}
+	return time.Duration(ms) * time.Millisecond, nil
 }
 
 func id32(f []string, i int) ([32]byte, error) {

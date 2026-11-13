@@ -24,6 +24,9 @@ struct Shared {
     stop: AtomicBool,
     /// Datagrams the node sent while the relay was dropping them.
     lost_to_station: AtomicU64,
+    /// How long each of the node's datagrams is held before it crosses: what
+    /// gives the link behind this relay a longer measured round trip.
+    delay_ms: AtomicU64,
     /// The node's address, learnt from what it sends: one node per relay.
     node: Mutex<Option<SocketAddr>>,
 }
@@ -38,10 +41,21 @@ pub struct BlackHole {
 impl BlackHole {
     /// A relay that forwards to `station` and listens for the node.
     pub fn in_front_of(station: SocketAddr) -> BlackHole {
+        BlackHole::in_front_of_after(station, Duration::ZERO)
+    }
+
+    /// A relay that forwards to `station` and listens for the node, holding
+    /// each of the node's datagrams for `delay`: the node's link measures a
+    /// round trip that much longer than one dialed directly.
+    pub fn in_front_of_after(station: SocketAddr, delay: Duration) -> BlackHole {
         let front = Arc::new(bind_loopback());
         let up = Arc::new(bind_loopback());
         let addr = front.local_addr().expect("the relay's front socket");
         let shared = Arc::new(Shared::default());
+        shared.delay_ms.store(
+            u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let threads = vec![
             spawn(&shared, &front, &up, Some(station)),
             spawn(&shared, &up, &front, None),
@@ -115,7 +129,20 @@ fn forward_one(shared: &Shared, from: &UdpSocket, to: &UdpSocket, station: Optio
     }
     let dest = station.or(*shared.node.lock().expect("the node address"));
     if let (false, Some(dest)) = (dropping, dest) {
+        hold_for(shared, station.is_some());
         let _ = to.send_to(&buffer[..len], dest);
+    }
+}
+
+/// Holds the node's datagrams for the relay's delay; the station's own are
+/// forwarded at once, so one direction per round trip is slowed.
+fn hold_for(shared: &Shared, from_node: bool) {
+    if !from_node {
+        return;
+    }
+    match shared.delay_ms.load(Ordering::Relaxed) {
+        0 => {}
+        ms => thread::sleep(Duration::from_millis(ms)),
     }
 }
 

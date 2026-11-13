@@ -177,7 +177,7 @@ impl PoolInner {
             s.attach(link.clone());
         }
         // Subscribed first, so this node's own subscriptions hear them too.
-        self.send_waiting(link).await;
+        self.send_waiting().await;
     }
 }
 
