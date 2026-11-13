@@ -118,22 +118,26 @@ rust_cargo() {
     cargo "$@"
 }
 
-# build_the_callers compiles the two caller tests, before any provider starts.
+# build_the_caller compiles the caller test whose compile is long, before any
+# provider starts.
 #
 # A provider serves for a fixed hold counted from the moment it prints
-# `serving` (erlang_sealed.escript), and a cold compile of a caller test
-# outlasts that hold on a loaded runner: two CI runs of one commit compiled the
-# same test in 2m33s and 3m16s against a 180 s hold. With the compile inside
-# the window, the first call reaches a provider that has already exited, and
-# every retry times out until the test's own deadline -- the flake is
+# `serving` (erlang_sealed.escript), and a cold compile of the caller outlasts
+# that hold on a loaded runner: two CI runs of one commit compiled the same
+# test in 2m33s and 3m16s against a 180 s hold. With the compile inside the
+# window, the first call reaches a provider that has already exited, and every
+# retry times out until the test's own deadline -- the flake is
 # `NoLink([CallTimeout])` at tests/interop_sealed.rs:119 (macula-rust#66).
 # Building here leaves each provider's window covering the calls alone.
-build_the_callers() {
-  local file
-  for file in "$sealed_test" "$a0_test"; do
-    echo "== building the caller $file, before a provider is started"
-    rust_cargo test --locked --test "$file" --no-run
-  done
+#
+# Only this test is built. The A0 caller is a second binary, but once this one
+# has built the dependencies the A0 one compiles in under a second, well
+# inside its own window: it compiled in 0.78 s in run 43347796356 on the
+# unfixed script (Uranus, macula-rust#66 r=1). A pre-build for it would guard
+# a case that does not arise, so it is not built here.
+build_the_caller() {
+  echo "== building the caller $sealed_test, before a provider is started"
+  rust_cargo test --locked --test "$sealed_test" --no-run
 }
 
 # rust_test FILE NAME runs one ignored test of FILE in the CI image, with the
@@ -151,7 +155,7 @@ rust_test() {
     cargo test --locked --test "$file" -- --ignored --nocapture --exact "$name"
 }
 
-build_the_callers
+build_the_caller
 
 echo "== $profile: an Erlang provider, a Rust caller"
 erl serve 180 > "$work/erlang.out" 2>&1 &
